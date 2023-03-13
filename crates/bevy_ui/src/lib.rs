@@ -16,9 +16,13 @@ pub mod node_bundles;
 pub mod update;
 pub mod widget;
 
+use std::marker::PhantomData;
+
+use bevy_asset::HandleUntyped;
+use bevy_reflect::TypeUuid;
 #[cfg(feature = "bevy_text")]
 use bevy_render::camera::CameraUpdateSystem;
-use bevy_render::extract_component::ExtractComponentPlugin;
+use bevy_render::{extract_component::ExtractComponentPlugin, render_resource::AsBindGroup};
 pub use flex::*;
 pub use focus::*;
 pub use geometry::*;
@@ -73,6 +77,25 @@ impl Default for UiScale {
         Self { scale: 1.0 }
     }
 }
+
+
+
+#[derive(AsBindGroup, Clone, Copy, Default, TypeUuid, Resource)]
+#[uuid = "15789298-5723-8944-8325-329755215812"]
+pub struct DefaultUiMaterial {
+    test: bool,
+}
+
+impl UiMaterial for DefaultUiMaterial {
+    fn fragment_shader() -> bevy_render::render_resource::ShaderRef {
+        bevy_render::render_resource::ShaderRef::Default
+    }
+
+    fn specialize(descriptor: &mut bevy_render::render_resource::RenderPipelineDescriptor, key: UiPipelineKey<Self>) -> () {
+        ()
+    }
+}
+
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
@@ -151,8 +174,10 @@ impl Plugin for UiPlugin {
             update_clipping_system
                 .after(TransformSystem::TransformPropagate)
                 .in_base_set(CoreSet::PostUpdate),
-        );
-
-        crate::render::build_ui_render(app);
+        )
+        .insert_resource(DefaultUiMaterial{ test: true })
+        
+        .add_plugin(crate::render::UiRenderPlugin)
+        .add_plugin(crate::render::UiMaterialPlugin::<DefaultUiMaterial>(PhantomData));
     }
 }

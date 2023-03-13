@@ -1,8 +1,11 @@
+use std::marker::PhantomData;
+
 use super::{UiBatch, UiImageBindGroups, UiMeta};
-use crate::{prelude::UiCameraConfig, DefaultCameraView};
+use crate::{prelude::UiCameraConfig, DefaultCameraView, UiMaterial, RenderUiMaterials};
+use bevy_asset::Handle;
 use bevy_ecs::{
     prelude::*,
-    system::{lifetimeless::*, SystemParamItem},
+    system::{lifetimeless::*, SystemParamItem}, query::ROQueryItem,
 };
 use bevy_render::{
     render_graph::*,
@@ -11,6 +14,7 @@ use bevy_render::{
     renderer::*,
     view::*,
 };
+use bevy_log::{warn, debug};
 use bevy_utils::FloatOrd;
 
 pub struct UiPassNode {
@@ -52,6 +56,8 @@ impl Node for UiPassNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), NodeRunError> {
+        // get the ViewTarget and the RenderPhase<TransparentUi> from the world
+        // then actually calls through to render the queried phase
         let input_view_entity = graph.get_input_entity(Self::IN_VIEW)?;
 
         let Ok((transparent_phase, target, camera_ui)) =
@@ -91,6 +97,8 @@ impl Node for UiPassNode {
     }
 }
 
+// TransparentUi is a SINGLE ui entity in the render world to be rendered
+// Noting that they have their own pipelines and draw functions? Hmmm
 pub struct TransparentUi {
     pub sort_key: FloatOrd,
     pub entity: Entity,
@@ -124,11 +132,17 @@ impl CachedRenderPipelinePhaseItem for TransparentUi {
     }
 }
 
-pub type DrawUi = (
-    SetItemPipeline,
+// This is a _render command tuple_
+// Each element of it is a render command
+// This is exported and consumed by app.add_render_command
+// It is then available from the DrawFunctions resource and 
+    // it is added to the render graph in mod.queue_uinodes
+pub type DrawUi<M> = (
+    SetItemPipeline,    // provided, configures our PhaseItem (TransparentUi)
     SetUiViewBindGroup<0>,
-    SetUiTextureBindGroup<1>,
-    DrawUiNode,
+    SetUiTextureBindGroup<M, 1>,
+    SetUiMaterialBindGroup<M, 2>,
+    DrawUiNode<M>,
 );
 
 pub struct SetUiViewBindGroup<const I: usize>;
@@ -152,8 +166,8 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiViewBindGroup<I> {
         RenderCommandResult::Success
     }
 }
-pub struct SetUiTextureBindGroup<const I: usize>;
-impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiTextureBindGroup<I> {
+pub struct SetUiTextureBindGroup<M: UiMaterial, const I: usize>(PhantomData<M>);
+impl<M: UiMaterial, P: PhaseItem, const I: usize> RenderCommand<P> for SetUiTextureBindGroup<M, I> {
     type Param = SRes<UiImageBindGroups>;
     type ViewWorldQuery = ();
     type ItemWorldQuery = Read<UiBatch>;
@@ -166,13 +180,38 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiTextureBindGroup<I>
         image_bind_groups: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
+
         let image_bind_groups = image_bind_groups.into_inner();
         pass.set_bind_group(I, image_bind_groups.values.get(&batch.image).unwrap(), &[]);
         RenderCommandResult::Success
     }
 }
-pub struct DrawUiNode;
-impl<P: PhaseItem> RenderCommand<P> for DrawUiNode {
+
+pub struct SetUiMaterialBindGroup<M: UiMaterial, const I: usize>(PhantomData<M>);
+impl<P: PhaseItem, M: UiMaterial, const I: usize> RenderCommand<P>
+    for SetUiMaterialBindGroup<M, I>
+{
+    type Param = SRes<RenderUiMaterials<M>>;
+    type ViewWorldQuery = ();
+    type ItemWorldQuery = Read<UiBatch>;
+
+    #[inline]
+    fn render<'w>(
+        _item: &P,
+        _view: (),
+        ui_batch: ROQueryItem<'_, Self::ItemWorldQuery>,
+        materials: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        // guaranteed to be the correct material by the submitting plugin
+        let ui_material = materials.into_inner().get(&ui_batch.material.clone_weak().typed::<M>()).unwrap();
+        pass.set_bind_group(I, &ui_material.bind_group, &[]);
+        RenderCommandResult::Success
+    }
+}
+
+pub struct DrawUiNode<M: UiMaterial>(PhantomData<M>);
+impl<M: UiMaterial, P: PhaseItem> RenderCommand<P> for DrawUiNode<M> {
     type Param = SRes<UiMeta>;
     type ViewWorldQuery = ();
     type ItemWorldQuery = Read<UiBatch>;
@@ -185,7 +224,10 @@ impl<P: PhaseItem> RenderCommand<P> for DrawUiNode {
         ui_meta: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
+        // set the vertex buffer to the _entire_ vertex buffer in ui meta
         pass.set_vertex_buffer(0, ui_meta.into_inner().vertices.buffer().unwrap().slice(..));
+        
+        // submit our specific range to be drawn
         pass.draw(batch.range.clone(), 0..1);
         RenderCommandResult::Success
     }

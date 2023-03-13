@@ -1756,6 +1756,10 @@ category = "UI (User Interface)"
 wasm = true
 
 [[example]]
+name = "ui_shader"
+path = "examples/ui/ui_shader.rs"
+
+[[example]]
 name = "ui"
 path = "examples/ui/ui.rs"
 

@@ -1,4 +1,4 @@
-use crate::{Size, UiRect};
+use crate::{Size, UiRect, UiMaterial};
 use bevy_asset::Handle;
 use bevy_ecs::{prelude::Component, reflect::ReflectComponent};
 use bevy_math::{Rect, Vec2};

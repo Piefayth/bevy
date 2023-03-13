@@ -1,3 +1,6 @@
+use std::marker::PhantomData;
+use std::hash::Hash;
+use bevy_asset::{Handle, AssetServer};
 use bevy_ecs::prelude::*;
 use bevy_render::{
     render_resource::*,
@@ -6,14 +9,20 @@ use bevy_render::{
     view::{ViewTarget, ViewUniform},
 };
 
+use crate::UiMaterial;
+
 #[derive(Resource)]
-pub struct UiPipeline {
+pub struct UiPipeline<M: UiMaterial> {
     pub view_layout: BindGroupLayout,
-    pub image_layout: BindGroupLayout,
+    pub image_layout: BindGroupLayout,  // TODO: Remove in favor of material layout
+    pub material_layout: BindGroupLayout,
+    pub fragment_shader: Option<Handle<Shader>>,
+    marker: PhantomData<M>,
 }
 
-impl FromWorld for UiPipeline {
+impl<M: UiMaterial> FromWorld for UiPipeline<M> {
     fn from_world(world: &mut World) -> Self {
+        let asset_server = world.resource::<AssetServer>();
         let render_device = world.resource::<RenderDevice>();
 
         let view_layout = render_device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -52,20 +61,68 @@ impl FromWorld for UiPipeline {
             label: Some("ui_image_layout"),
         });
 
+        let material_layout = M::bind_group_layout(render_device);
+        
+        let fragment_shader = match M::fragment_shader() {
+            ShaderRef::Default => None,
+            ShaderRef::Handle(handle) => Some(handle),
+            ShaderRef::Path(path) => Some(asset_server.load(path)),
+        };
+
         UiPipeline {
             view_layout,
             image_layout,
+            material_layout,
+            fragment_shader,
+            marker: PhantomData::<M>
         }
     }
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub struct UiPipelineKey {
+// A cache key and discriminant - i.e. there are different settings per key, thus different PIPELINES per key?
+// Cannot derive impls here because we need them to apply to M::Data as well?
+pub struct UiPipelineKey<M: UiMaterial> {
     pub hdr: bool,
+    pub bind_group_data: M::Data,
 }
 
-impl SpecializedRenderPipeline for UiPipeline {
-    type Key = UiPipelineKey;
+impl<M: UiMaterial> Eq for UiPipelineKey<M> where M::Data: PartialEq {}
+
+impl<M: UiMaterial> PartialEq for UiPipelineKey<M>
+where
+    M::Data: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.hdr == other.hdr && self.bind_group_data == other.bind_group_data
+    }
+}
+
+impl<M: UiMaterial> Clone for UiPipelineKey<M>
+where
+    M::Data: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            hdr: self.hdr,
+            bind_group_data: self.bind_group_data.clone(),
+        }
+    }
+}
+
+impl<M: UiMaterial> Hash for UiPipelineKey<M>
+where
+    M::Data: Hash,
+{
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.hdr.hash(state);
+        self.bind_group_data.hash(state);
+    }
+}
+
+impl<M: UiMaterial> SpecializedRenderPipeline for UiPipeline<M>
+where
+    M::Data: PartialEq + Eq + Hash + Clone {
+    type Key = UiPipelineKey<M>;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let vertex_layout = VertexBufferLayout::from_vertex_formats(
@@ -79,9 +136,15 @@ impl SpecializedRenderPipeline for UiPipeline {
                 VertexFormat::Float32x4,
             ],
         );
-        let shader_defs = Vec::new();
 
-        RenderPipelineDescriptor {
+        let shader_defs = Vec::new();
+        let fragment_shader = if let Some(fragment_shader) = &self.fragment_shader {
+            fragment_shader.clone()
+        } else {
+            super::UI_SHADER_HANDLE.typed::<Shader>()
+        };
+
+        let mut descriptor = RenderPipelineDescriptor {
             vertex: VertexState {
                 shader: super::UI_SHADER_HANDLE.typed::<Shader>(),
                 entry_point: "vertex".into(),
@@ -89,7 +152,7 @@ impl SpecializedRenderPipeline for UiPipeline {
                 buffers: vec![vertex_layout],
             },
             fragment: Some(FragmentState {
-                shader: super::UI_SHADER_HANDLE.typed::<Shader>(),
+                shader: fragment_shader,
                 shader_defs,
                 entry_point: "fragment".into(),
                 targets: vec![Some(ColorTargetState {
@@ -102,7 +165,7 @@ impl SpecializedRenderPipeline for UiPipeline {
                     write_mask: ColorWrites::ALL,
                 })],
             }),
-            layout: vec![self.view_layout.clone(), self.image_layout.clone()],
+            layout: vec![self.view_layout.clone(), self.image_layout.clone(), self.material_layout.clone()],
             push_constant_ranges: Vec::new(),
             primitive: PrimitiveState {
                 front_face: FrontFace::Ccw,
@@ -120,6 +183,10 @@ impl SpecializedRenderPipeline for UiPipeline {
                 alpha_to_coverage_enabled: false,
             },
             label: Some("ui_pipeline".into()),
-        }
+        };
+
+        M::specialize(&mut descriptor, key);
+
+        descriptor
     }
 }
