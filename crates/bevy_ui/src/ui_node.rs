@@ -155,7 +155,7 @@ impl Default for Node {
 #[derive(Component, Debug, Clone, Reflect)]
 #[reflect(Component, Default)]
 pub struct ScrollPosition {
-    /// How far accross the node is scrolled (0 = not scrolled / scrolled to right)
+    /// How far across the node is scrolled (0 = not scrolled / scrolled to right)
     pub offset_x: f32,
     /// How far down the node is scrolled (0 = not scrolled / scrolled to top)
     pub offset_y: f32,
@@ -177,6 +177,15 @@ impl Default for ScrollPosition {
 impl From<&ScrollPosition> for Vec2 {
     fn from(scroll_pos: &ScrollPosition) -> Self {
         Vec2::new(scroll_pos.offset_x, scroll_pos.offset_y)
+    }
+}
+
+impl From<&Vec2> for ScrollPosition {
+    fn from(vec: &Vec2) -> Self {
+        ScrollPosition {
+            offset_x: vec.x,
+            offset_y: vec.y,
+        }
     }
 }
 

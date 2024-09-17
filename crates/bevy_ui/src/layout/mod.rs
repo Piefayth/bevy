@@ -394,32 +394,20 @@ pub fn ui_layout_system(
                 .unwrap_or_else(Vec2::default);
 
             if let Ok(children) = children_query.get(entity) {
-                let effective_child_bounds = if scroll_position != Vec2::ZERO {
-                    children.iter()
+                let effective_child_bounds = children.iter()
                     .map(|child| {
                         calc_effective_node_size(*child, &ui_surface, inverse_target_scale_factor, Vec2::ZERO)
                     })
-                    .fold(Vec2::ZERO, |acc, size| Vec2::new(
+                    .fold(scroll_position, |acc, size| Vec2::new(
                         acc.x.max(size.x),
                         acc.y.max(size.y)
-                    ))
-                } else {
-                    scroll_position
-                };
+                    ));
 
-                let max_x_offset = (effective_child_bounds.x - rounded_size.x).max(0.0);
-                let max_y_offset = (effective_child_bounds.y - rounded_size.y).max(0.0);
-
-                let clamped_scroll_position = Vec2::new(
-                    scroll_position.x.clamp(0.0, max_x_offset), 
-                    scroll_position.y.clamp(0.0, max_y_offset),
-                );
+                let max_offset = (effective_child_bounds - rounded_size).max(Vec2::ZERO);
+                let clamped_scroll_position = scroll_position.clamp(Vec2::ZERO, max_offset);
 
                 if clamped_scroll_position != scroll_position {
-                    commands.entity(entity).insert(ScrollPosition {
-                        offset_x: clamped_scroll_position.x,
-                        offset_y: clamped_scroll_position.y,
-                    });
+                    commands.entity(entity).insert(ScrollPosition::from(&clamped_scroll_position));
                 }
                 
                 for &child_uinode in children {

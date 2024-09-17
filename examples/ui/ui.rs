@@ -173,7 +173,9 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                                             trigger: Trigger<Pointer<Down>>,
                                             mut commands: Commands
                                         | {
-                                            commands.entity(trigger.entity()).despawn_recursive();
+                                            if trigger.event().button == PointerButton::Primary {
+                                                commands.entity(trigger.entity()).despawn_recursive();
+                                            }
                                         });
                                     }
                         });
