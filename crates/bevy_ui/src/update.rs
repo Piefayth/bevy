@@ -8,7 +8,7 @@ use bevy_ecs::{
 };
 use bevy_hierarchy::{Children, Parent};
 use bevy_input::mouse::{MouseScrollUnit, MouseWheel};
-use bevy_math::{Rect, Vec2};
+use bevy_math::Rect;
 use bevy_picking::focus::HoverMap;
 use bevy_transform::components::GlobalTransform;
 use bevy_utils::HashSet;
@@ -185,8 +185,7 @@ fn update_children_target_camera(
 pub fn update_scroll_position(
     mut mouse_wheel_events: EventReader<MouseWheel>,
     hover_map: Res<HoverMap>,
-    mut scrolled_node_query: Query<(&mut ScrollPosition, &Style, &Children, &Node)>,
-    just_node_query: Query<&Node>,
+    mut scrolled_node_query: Query<&mut ScrollPosition>,
 ) {
     for mouse_wheel_event in mouse_wheel_events.read() {
         // TODO: 90% sure this should be user-configurable, bevy shouldn't own scroll speed
@@ -197,30 +196,9 @@ pub fn update_scroll_position(
 
         for (_pointer, pointer_map) in hover_map.iter() {
             for (entity, _hit) in pointer_map.iter() {
-                if let Ok((mut scroll_position, style, children, scrolled_node)) = scrolled_node_query.get_mut(*entity) {
-                    let Vec2 {
-                        x: container_width,
-                        y: container_height,
-                    } = scrolled_node.size();
-
-                    let (items_width, items_height): (f32, f32) =
-                        children.iter().fold((0.0, 0.0), |sum, child| {
-                            let size = just_node_query.get(*child).unwrap().size();
-                            (sum.0 + size.x, sum.1 + size.y)
-                        });
-    
-                    if style.overflow.x == OverflowAxis::Scroll {
-                        let max_scroll_x = (items_width - container_width).max(0.);
-                        scroll_position.offset_x =
-                            (scroll_position.offset_x + dx).clamp(-max_scroll_x, 0.);
-                    }
-                    if style.overflow.y == OverflowAxis::Scroll {
-                        let max_scroll_y = (items_height - container_height).max(0.);
-                        scroll_position.offset_y =
-                            (scroll_position.offset_y + dy).clamp(-max_scroll_y, 0.);
-                    }
-
-                    println!("new scroll possy: {:?} | scroll node size {:?} | items_w {:?} items_h {:?}", scroll_position, scrolled_node.size(), items_width, items_height);
+                if let Ok(mut scroll_position) = scrolled_node_query.get_mut(*entity) {
+                    scroll_position.offset_x += dx;
+                    scroll_position.offset_y -= dy;
                 }
             }
         }

@@ -151,23 +151,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                             ..default()
                         })
                         .with_children(|parent| {
-                            // Moving panel
-                            parent
-                                .spawn((
-                                    NodeBundle {
-                                        style: Style {
-                                            flex_direction: FlexDirection::Column,
-                                            align_items: AlignItems::Center,
-                                            ..default()
-                                        },
-                                        ..default()
-                                    },
-                                    AccessibilityNode(NodeBuilder::new(Role::List)),
-                                ))
-                                .insert(Pickable::IGNORE)
-                                .with_children(|parent| {
                                     // List items
-                                    for i in 0..100 {
+                                    for i in 0..25 {
                                         parent.spawn((
                                             TextBundle::from_section(
                                                 format!("Item {i}"),
@@ -179,9 +164,18 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                                             ),
                                             Label,
                                             AccessibilityNode(NodeBuilder::new(Role::ListItem)),
-                                        ));
+                                        ))
+                                        .insert(Pickable {
+                                            should_block_lower: false,
+                                            ..default()
+                                        })
+                                        .observe(|
+                                            trigger: Trigger<Pointer<Down>>,
+                                            mut commands: Commands
+                                        | {
+                                            commands.entity(trigger.entity()).despawn_recursive();
+                                        });
                                     }
-                                });
                         });
                 });
 

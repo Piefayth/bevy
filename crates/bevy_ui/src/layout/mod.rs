@@ -7,7 +7,7 @@ use bevy_ecs::{
     event::EventReader,
     query::{With, Without},
     removal_detection::RemovedComponents,
-    system::{Local, Query, Res, ResMut, SystemParam},
+    system::{Commands, Local, Query, Res, ResMut, SystemParam},
     world::Ref,
 };
 use bevy_hierarchy::{Children, Parent};
@@ -91,10 +91,13 @@ struct CameraLayoutInfo {
 /// Updates the UI's layout tree, computes the new layout geometry and then updates the sizes and transforms of all the UI nodes.
 #[allow(clippy::too_many_arguments)]
 pub fn ui_layout_system(
+    mut commands: Commands,
     mut buffers: Local<UiLayoutSystemBuffers>,
     primary_window: Query<(Entity, &Window), With<PrimaryWindow>>,
-    cameras: Query<(Entity, &Camera)>,
-    default_ui_camera: DefaultUiCamera,
+    camera_data: (
+        Query<(Entity, &Camera)>,
+        DefaultUiCamera
+    ),
     ui_scale: Res<UiScale>,
     mut scale_factor_events: EventReader<WindowScaleFactorChanged>,
     mut resize_events: EventReader<bevy_window::WindowResized>,
@@ -127,6 +130,8 @@ pub fn ui_layout_system(
         resized_windows,
         camera_layout_info,
     } = &mut *buffers;
+
+    let (cameras, default_ui_camera) = camera_data;
 
     let default_camera = default_ui_camera.get();
     let camera_with_default = |target_camera: Option<&TargetCamera>| {
@@ -267,8 +272,10 @@ pub fn ui_layout_system(
             #[cfg(feature = "bevy_text")]
             font_system,
         );
+        
         for root in &camera.root_nodes {
             update_uinode_geometry_recursive(
+                &mut commands,
                 *root,
                 &ui_surface,
                 None,
@@ -285,7 +292,34 @@ pub fn ui_layout_system(
         interned_root_nodes.push(camera.root_nodes);
     }
 
+    fn calc_effective_node_size (
+        entity: Entity,
+        ui_surface: &UiSurface,
+        inverse_target_scale_factor: f32,
+        absolute_location: Vec2,
+    ) -> Vec2 {
+        let Ok(layout) = ui_surface.get_layout(entity) else {
+            return Vec2::ZERO;
+        };
+
+        let layout_size =
+            inverse_target_scale_factor * Vec2::new(layout.size.width, layout.size.height);
+        let layout_location =
+            inverse_target_scale_factor * Vec2::new(layout.location.x, layout.location.y);
+
+        let rounded_size = approx_round_layout_coords(absolute_location + layout_size)
+            - approx_round_layout_coords(absolute_location);
+        
+        let node_size_in_scroll_container = Vec2::new(
+            rounded_size.x + approx_round_ties_up(layout_location.x),
+            rounded_size.y + approx_round_ties_up(layout_location.y),
+        );
+
+        node_size_in_scroll_container
+    }
+
     fn update_uinode_geometry_recursive(
+        commands: &mut Commands,
         entity: Entity,
         ui_surface: &UiSurface,
         root_size: Option<Vec2>,
@@ -319,7 +353,7 @@ pub fn ui_layout_system(
                 - approx_round_layout_coords(absolute_location);
 
             let rounded_location =
-                approx_round_layout_coords(layout_location + parent_scroll_position) + 0.5 * (rounded_size - parent_size);
+                approx_round_layout_coords(layout_location - parent_scroll_position) + 0.5 * (rounded_size - parent_size);
 
             // only trigger change detection when the new values are different
             if node.calculated_size != rounded_size || node.unrounded_size != layout_size {
@@ -360,8 +394,37 @@ pub fn ui_layout_system(
                 .unwrap_or_else(Vec2::default);
 
             if let Ok(children) = children_query.get(entity) {
+                let effective_child_bounds = if scroll_position != Vec2::ZERO {
+                    children.iter()
+                    .map(|child| {
+                        calc_effective_node_size(*child, &ui_surface, inverse_target_scale_factor, Vec2::ZERO)
+                    })
+                    .fold(Vec2::ZERO, |acc, size| Vec2::new(
+                        acc.x.max(size.x),
+                        acc.y.max(size.y)
+                    ))
+                } else {
+                    scroll_position
+                };
+
+                let max_x_offset = (effective_child_bounds.x - rounded_size.x).max(0.0);
+                let max_y_offset = (effective_child_bounds.y - rounded_size.y).max(0.0);
+
+                let clamped_scroll_position = Vec2::new(
+                    scroll_position.x.clamp(0.0, max_x_offset), 
+                    scroll_position.y.clamp(0.0, max_y_offset),
+                );
+
+                if clamped_scroll_position != scroll_position {
+                    commands.entity(entity).insert(ScrollPosition {
+                        offset_x: clamped_scroll_position.x,
+                        offset_y: clamped_scroll_position.y,
+                    });
+                }
+                
                 for &child_uinode in children {
                     update_uinode_geometry_recursive(
+                        commands,
                         child_uinode,
                         ui_surface,
                         Some(viewport_size),
@@ -369,7 +432,7 @@ pub fn ui_layout_system(
                         children_query,
                         inverse_target_scale_factor,
                         rounded_size,
-                        scroll_position,
+                        clamped_scroll_position,
                         absolute_location,
                     );
                 }
