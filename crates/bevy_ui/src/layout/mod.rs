@@ -292,32 +292,7 @@ pub fn ui_layout_system(
         interned_root_nodes.push(camera.root_nodes);
     }
 
-    fn calc_effective_node_size (
-        entity: Entity,
-        ui_surface: &UiSurface,
-        inverse_target_scale_factor: f32,
-        absolute_location: Vec2,
-    ) -> Vec2 {
-        let Ok(layout) = ui_surface.get_layout(entity) else {
-            return Vec2::ZERO;
-        };
-
-        let layout_size =
-            inverse_target_scale_factor * Vec2::new(layout.size.width, layout.size.height);
-        let layout_location =
-            inverse_target_scale_factor * Vec2::new(layout.location.x, layout.location.y);
-
-        let rounded_size = approx_round_layout_coords(absolute_location + layout_size)
-            - approx_round_layout_coords(absolute_location);
-        
-        let node_size_in_scroll_container = Vec2::new(
-            rounded_size.x + approx_round_ties_up(layout_location.x),
-            rounded_size.y + approx_round_ties_up(layout_location.y),
-        );
-
-        node_size_in_scroll_container
-    }
-
+    // Returns the node's rounded size + rounded location
     fn update_uinode_geometry_recursive(
         commands: &mut Commands,
         entity: Entity,
@@ -335,12 +310,12 @@ pub fn ui_layout_system(
         parent_size: Vec2,
         parent_scroll_position: Vec2,
         mut absolute_location: Vec2,
-    ) {
+    ) -> Vec2 {
         if let Ok((mut node, mut transform, maybe_border_radius, maybe_outline, maybe_scroll_position)) =
             node_transform_query.get_mut(entity)
         {
             let Ok(layout) = ui_surface.get_layout(entity) else {
-                return;
+                return Vec2::ZERO;
             };
             let layout_size =
                 inverse_target_scale_factor * Vec2::new(layout.size.width, layout.size.height);
@@ -394,37 +369,52 @@ pub fn ui_layout_system(
                 .unwrap_or_else(Vec2::default);
 
             if let Ok(children) = children_query.get(entity) {
-                let effective_child_bounds = children.iter()
-                    .map(|child| {
-                        calc_effective_node_size(*child, &ui_surface, inverse_target_scale_factor, Vec2::ZERO)
-                    })
-                    .fold(scroll_position, |acc, size| Vec2::new(
-                        acc.x.max(size.x),
-                        acc.y.max(size.y)
-                    ));
-
-                let max_offset = (effective_child_bounds - rounded_size).max(Vec2::ZERO);
-                let clamped_scroll_position = scroll_position.clamp(Vec2::ZERO, max_offset);
-
-                if clamped_scroll_position != scroll_position {
-                    commands.entity(entity).insert(ScrollPosition::from(&clamped_scroll_position));
-                }
-                
-                for &child_uinode in children {
+                let effective_children_bounds = children.iter().map(|child_uinode| {
                     update_uinode_geometry_recursive(
                         commands,
-                        child_uinode,
+                        *child_uinode,
                         ui_surface,
                         Some(viewport_size),
                         node_transform_query,
                         children_query,
                         inverse_target_scale_factor,
                         rounded_size,
-                        clamped_scroll_position,
+                        scroll_position,
                         absolute_location,
-                    );
+                    )
+                }).fold(scroll_position, |acc, size| Vec2::new(
+                    acc.x.max(size.x),
+                    acc.y.max(size.y)
+                ));
+
+                let max_possible_offset = (effective_children_bounds - rounded_size).max(Vec2::ZERO);
+                let clamped_scroll_position = scroll_position.clamp(Vec2::ZERO, max_possible_offset);
+
+                // If the size of the bounding box containing all children changed in a way that impacts the scroll position of the parent
+                // Re-run the layout for all children 
+                if clamped_scroll_position != scroll_position {
+                    commands.entity(entity).insert(ScrollPosition::from(&clamped_scroll_position));
+
+                    for child_uinode in children.iter() {
+                        update_uinode_geometry_recursive(
+                            commands,
+                            *child_uinode,
+                            ui_surface,
+                            Some(viewport_size),
+                            node_transform_query,
+                            children_query,
+                            inverse_target_scale_factor,
+                            rounded_size,
+                            clamped_scroll_position,
+                            absolute_location,
+                        );
+                    }
                 }
             }
+
+            rounded_size + approx_round_layout_coords(layout_location)
+        } else { 
+            Vec2::ZERO
         }
     }
 }
