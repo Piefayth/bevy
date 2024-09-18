@@ -415,6 +415,7 @@ pub fn ui_layout_system(
                     });
 
                 if children_bounding_box != Vec2::ZERO && scroll_position != Vec2::ZERO {
+                    // Cannot scroll further than the edge of the furthest child
                     let max_possible_offset =
                         (children_bounding_box - rounded_size).max(Vec2::ZERO);
                     let clamped_scroll_position =
@@ -452,7 +453,8 @@ pub fn ui_layout_system(
                 // If overflow is visible, the bounds of the children must be considered.
                 // A parent of this node could scroll the overflowing children.
                 if overflow.x.is_visible() {
-                    node_scrollable_bounds.x = node_scrollable_bounds.x.max(children_bounding_box.x)
+                    node_scrollable_bounds.x =
+                        node_scrollable_bounds.x.max(children_bounding_box.x);
                 }
 
                 if overflow.y.is_visible() {

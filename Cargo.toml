@@ -2856,7 +2856,7 @@ path = "examples/ui/scroll.rs"
 doc-scrape-examples = true
 
 [package.metadata.example.scroll]
-name = "Overflow: Scroll"
+name = "Scroll"
 description = "Demonstrates scrolling UI containers"
 category = "UI (User Interface)"
 wasm = true
