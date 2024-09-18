@@ -449,7 +449,7 @@ pub fn ui_layout_system(
                     }
                 }
 
-                // If overflow is visible, the bounds of the children must be considered
+                // If overflow is visible, the bounds of the children must be considered.
                 // A parent of this node could scroll the overflowing children.
                 if overflow.x.is_visible() {
                     node_scrollable_bounds.x = node_scrollable_bounds.x.max(children_bounding_box.x)
