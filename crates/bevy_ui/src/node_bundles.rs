@@ -3,7 +3,9 @@
 #[cfg(feature = "bevy_text")]
 use crate::widget::TextFlags;
 use crate::{
-    widget::{Button, UiImageSize}, BackgroundColor, BorderColor, BorderRadius, ContentSize, FocusPolicy, Interaction, Node, ScrollPosition, Style, UiImage, UiMaterial, ZIndex
+    widget::{Button, UiImageSize},
+    BackgroundColor, BorderColor, BorderRadius, ContentSize, FocusPolicy, Interaction, Node,
+    ScrollPosition, Style, UiImage, UiMaterial, ZIndex,
 };
 use bevy_asset::Handle;
 #[cfg(feature = "bevy_text")]

@@ -4,7 +4,11 @@ use bevy::{
     a11y::{
         accesskit::{NodeBuilder, Role},
         AccessibilityNode,
-    }, input::mouse::{MouseScrollUnit, MouseWheel}, picking::focus::HoverMap, prelude::*, winit::WinitSettings
+    },
+    input::mouse::{MouseScrollUnit, MouseWheel},
+    picking::focus::HoverMap,
+    prelude::*,
+    winit::WinitSettings,
 };
 
 fn main() {
@@ -12,10 +16,7 @@ fn main() {
     app.add_plugins(DefaultPlugins)
         .insert_resource(WinitSettings::desktop_app())
         .add_systems(Startup, setup)
-        .add_systems(
-            Update,
-            update_scroll_position
-        );
+        .add_systems(Update, update_scroll_position);
 
     app.run();
 }
@@ -366,7 +367,8 @@ pub fn update_scroll_position(
             MouseScrollUnit::Pixel => (mouse_wheel_event.x, mouse_wheel_event.y),
         };
 
-        if keyboard_input.pressed(KeyCode::ShiftLeft) || keyboard_input.pressed(KeyCode::ShiftRight) {
+        if keyboard_input.pressed(KeyCode::ShiftLeft) || keyboard_input.pressed(KeyCode::ShiftRight)
+        {
             std::mem::swap(&mut dx, &mut dy);
         }
 

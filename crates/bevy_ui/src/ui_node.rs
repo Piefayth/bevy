@@ -150,7 +150,6 @@ impl Default for Node {
     }
 }
 
-
 /// The scroll position on the node
 #[derive(Component, Debug, Clone, Reflect)]
 #[reflect(Component, Default)]

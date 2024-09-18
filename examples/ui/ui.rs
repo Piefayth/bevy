@@ -4,7 +4,12 @@ use bevy::{
     a11y::{
         accesskit::{NodeBuilder, Role},
         AccessibilityNode,
-    }, color::palettes::basic::LIME, input::mouse::{MouseScrollUnit, MouseWheel}, picking::focus::HoverMap, prelude::*, winit::WinitSettings
+    },
+    color::palettes::basic::LIME,
+    input::mouse::{MouseScrollUnit, MouseWheel},
+    picking::focus::HoverMap,
+    prelude::*,
+    winit::WinitSettings,
 };
 
 fn main() {
@@ -13,10 +18,7 @@ fn main() {
         // Only run the app when there is user input. This will significantly reduce CPU/GPU use.
         .insert_resource(WinitSettings::desktop_app())
         .add_systems(Startup, setup)
-        .add_systems(
-            Update,
-            update_scroll_position
-        );
+        .add_systems(Update, update_scroll_position);
 
     #[cfg(feature = "bevy_dev_tools")]
     {
@@ -151,25 +153,25 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                             ..default()
                         })
                         .with_children(|parent| {
-                                    // List items
-                                    for i in 0..25 {
-                                        parent.spawn((
-                                            TextBundle::from_section(
-                                                format!("Item {i}"),
-                                                TextStyle {
-                                                    font: asset_server
-                                                        .load("fonts/FiraSans-Bold.ttf"),
-                                                    ..default()
-                                                },
-                                            ),
-                                            Label,
-                                            AccessibilityNode(NodeBuilder::new(Role::ListItem)),
-                                        ))
-                                        .insert(Pickable {
-                                            should_block_lower: false,
-                                            ..default()
-                                        });
-                                    }
+                            // List items
+                            for i in 0..25 {
+                                parent
+                                    .spawn((
+                                        TextBundle::from_section(
+                                            format!("Item {i}"),
+                                            TextStyle {
+                                                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                                                ..default()
+                                            },
+                                        ),
+                                        Label,
+                                        AccessibilityNode(NodeBuilder::new(Role::ListItem)),
+                                    ))
+                                    .insert(Pickable {
+                                        should_block_lower: false,
+                                        ..default()
+                                    });
+                            }
                         });
                 });
 
@@ -351,7 +353,8 @@ pub fn update_scroll_position(
             MouseScrollUnit::Pixel => (mouse_wheel_event.x, mouse_wheel_event.y),
         };
 
-        if keyboard_input.pressed(KeyCode::ShiftLeft) || keyboard_input.pressed(KeyCode::ShiftRight) {
+        if keyboard_input.pressed(KeyCode::ShiftLeft) || keyboard_input.pressed(KeyCode::ShiftRight)
+        {
             std::mem::swap(&mut dx, &mut dy);
         }
 
