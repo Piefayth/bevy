@@ -4,11 +4,7 @@ use bevy::{
     a11y::{
         accesskit::{NodeBuilder, Role},
         AccessibilityNode,
-    },
-    color::palettes::basic::LIME,
-    input::mouse::{MouseScrollUnit, MouseWheel},
-    prelude::*,
-    winit::WinitSettings,
+    }, color::palettes::basic::LIME, input::mouse::{MouseScrollUnit, MouseWheel}, picking::focus::HoverMap, prelude::*, winit::WinitSettings
 };
 
 fn main() {
@@ -16,7 +12,11 @@ fn main() {
     app.add_plugins(DefaultPlugins)
         // Only run the app when there is user input. This will significantly reduce CPU/GPU use.
         .insert_resource(WinitSettings::desktop_app())
-        .add_systems(Startup, setup);
+        .add_systems(Startup, setup)
+        .add_systems(
+            Update,
+            update_scroll_position
+        );
 
     #[cfg(feature = "bevy_dev_tools")]
     {
@@ -168,14 +168,6 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
                                         .insert(Pickable {
                                             should_block_lower: false,
                                             ..default()
-                                        })
-                                        .observe(|
-                                            trigger: Trigger<Pointer<Down>>,
-                                            mut commands: Commands
-                                        | {
-                                            if trigger.event().button == PointerButton::Primary {
-                                                commands.entity(trigger.entity()).despawn_recursive();
-                                            }
                                         });
                                     }
                         });
@@ -343,5 +335,37 @@ fn toggle_overlay(
     if input.just_pressed(KeyCode::Space) {
         // The toggle method will enable the debug_overlay if disabled and disable if enabled
         options.toggle();
+    }
+}
+
+/// Updates the scroll position of scrollable nodes in response to mouse input
+pub fn update_scroll_position(
+    mut mouse_wheel_events: EventReader<MouseWheel>,
+    hover_map: Res<HoverMap>,
+    mut scrolled_node_query: Query<(&mut ScrollPosition, &Style)>,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+) {
+    for mouse_wheel_event in mouse_wheel_events.read() {
+        let (mut dx, mut dy) = match mouse_wheel_event.unit {
+            MouseScrollUnit::Line => (mouse_wheel_event.x * 20., mouse_wheel_event.y * 20.),
+            MouseScrollUnit::Pixel => (mouse_wheel_event.x, mouse_wheel_event.y),
+        };
+
+        if keyboard_input.pressed(KeyCode::ShiftLeft) || keyboard_input.pressed(KeyCode::ShiftRight) {
+            std::mem::swap(&mut dx, &mut dy);
+        }
+
+        for (_pointer, pointer_map) in hover_map.iter() {
+            for (entity, _hit) in pointer_map.iter() {
+                if let Ok((mut scroll_position, style)) = scrolled_node_query.get_mut(*entity) {
+                    if style.overflow.x == OverflowAxis::Scroll {
+                        scroll_position.offset_x -= dx;
+                    }
+                    if style.overflow.y == OverflowAxis::Scroll {
+                        scroll_position.offset_y -= dy;
+                    }
+                }
+            }
+        }
     }
 }

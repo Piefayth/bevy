@@ -1,15 +1,15 @@
 //! This module contains systems that update the UI when something changes
 
-use crate::{CalculatedClip, Display, OverflowAxis, ScrollPosition, Style, TargetCamera};
+use crate::{CalculatedClip, Display, OverflowAxis, Style, TargetCamera};
 
 use super::Node;
 use bevy_ecs::{
-    entity::Entity, event::EventReader, query::{Changed, With, Without}, system::{Commands, Query, Res}
+    entity::Entity,
+    query::{Changed, With, Without},
+    system::{Commands, Query},
 };
 use bevy_hierarchy::{Children, Parent};
-use bevy_input::{keyboard::KeyCode, mouse::{MouseScrollUnit, MouseWheel}, ButtonInput};
 use bevy_math::Rect;
-use bevy_picking::focus::HoverMap;
 use bevy_transform::components::GlobalTransform;
 use bevy_utils::HashSet;
 
@@ -179,37 +179,5 @@ fn update_children_target_camera(
             commands,
             updated_entities,
         );
-    }
-}
-
-pub fn update_scroll_position(
-    mut mouse_wheel_events: EventReader<MouseWheel>,
-    hover_map: Res<HoverMap>,
-    mut scrolled_node_query: Query<(&mut ScrollPosition, &Style)>,
-    keyboard_input: Res<ButtonInput<KeyCode>>,
-) {
-    for mouse_wheel_event in mouse_wheel_events.read() {
-        // TODO: 90% sure this should be user-configurable, bevy shouldn't own scroll speed
-        let (mut dx, mut dy) = match mouse_wheel_event.unit {
-            MouseScrollUnit::Line => (mouse_wheel_event.x * 20., mouse_wheel_event.y * 20.),
-            MouseScrollUnit::Pixel => (mouse_wheel_event.x, mouse_wheel_event.y),
-        };
-
-        if keyboard_input.pressed(KeyCode::ShiftLeft) || keyboard_input.pressed(KeyCode::ShiftRight) {
-            std::mem::swap(&mut dx, &mut dy);
-        }
-
-        for (_pointer, pointer_map) in hover_map.iter() {
-            for (entity, _hit) in pointer_map.iter() {
-                if let Ok((mut scroll_position, style)) = scrolled_node_query.get_mut(*entity) {
-                    if style.overflow.x == OverflowAxis::Scroll {
-                        scroll_position.offset_x -= dx;
-                    }
-                    if style.overflow.y == OverflowAxis::Scroll {
-                        scroll_position.offset_y -= dy;
-                    }
-                }
-            }
-        }
     }
 }

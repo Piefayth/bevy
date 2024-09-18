@@ -1,5 +1,5 @@
 use crate::{
-    BorderRadius, ContentSize, DefaultUiCamera, Node, Outline, Overflow, OverflowAxis, ScrollPosition, Style, TargetCamera, UiScale
+    BorderRadius, ContentSize, DefaultUiCamera, Node, Outline, OverflowAxis, ScrollPosition, Style, TargetCamera, UiScale
 };
 use bevy_ecs::{
     change_detection::{DetectChanges, DetectChangesMut},
@@ -293,8 +293,7 @@ pub fn ui_layout_system(
         interned_root_nodes.push(camera.root_nodes);
     }
 
-    // Returns the bounding box of the node and its children, including overflow
-    // Unless the node was scrollable, in which case it only reports its own bounds
+    // Returns the combined bounding box of the node and any of its overflowing children.
     fn update_uinode_geometry_recursive(
         commands: &mut Commands,
         entity: Entity,
@@ -328,7 +327,7 @@ pub fn ui_layout_system(
                 inverse_target_scale_factor * Vec2::new(layout.location.x, layout.location.y);
 
             absolute_location += layout_location;
-            
+
             let rounded_size = approx_round_layout_coords(absolute_location + layout_size)
                 - approx_round_layout_coords(absolute_location);
 
@@ -368,12 +367,15 @@ pub fn ui_layout_system(
             if transform.translation.truncate() != rounded_location {
                 transform.translation = rounded_location.extend(0.);
             }
-
+            
             let scroll_position: Vec2 = maybe_scroll_position
-                .map(|scroll_pos| scroll_pos.into())
-                .unwrap_or_else(Vec2::default);
+                .map(|scroll_pos| Vec2::new(
+                    if overflow.x == OverflowAxis::Scroll { scroll_pos.offset_x } else { 0.0 },
+                    if overflow.y == OverflowAxis::Scroll { scroll_pos.offset_y } else { 0.0 }
+                ))
+                .unwrap_or_default();
 
-            let mut node_bounds = rounded_size + approx_round_layout_coords(layout_location);
+            let mut node_scrollable_bounds = rounded_size + approx_round_layout_coords(layout_location);
 
             if let Ok(children) = children_query.get(entity) {
                 let mut children_bounding_box = children.iter().map(|child_uinode| {
@@ -423,19 +425,20 @@ pub fn ui_layout_system(
                     }
                 }
 
-                // If overflow is visible, the size of the children must be considered for the scrollable bounds
+                // If overflow is visible, the bounds of the children must be considered
+                // A parent of this node could scroll the overflowing children.
                 if overflow.x.is_visible() {
-                    node_bounds.x = node_bounds.x.max(children_bounding_box.x)
+                    node_scrollable_bounds.x = node_scrollable_bounds.x.max(children_bounding_box.x)
                 } 
                 
                 if overflow.y.is_visible() {
-                    node_bounds.y = node_bounds.y.max(children_bounding_box.y);
+                    node_scrollable_bounds.y = node_scrollable_bounds.y.max(children_bounding_box.y);
                 }
 
-                node_bounds
+                node_scrollable_bounds
 
             } else {
-                node_bounds
+                node_scrollable_bounds
             }
         } else { 
             Vec2::ZERO
