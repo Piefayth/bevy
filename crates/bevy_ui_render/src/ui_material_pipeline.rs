@@ -1,9 +1,13 @@
+use crate::retained::{
+    batch_retained_ui, remove_owner, RemovedUiNode, RetainedBatchItem, RetainedUiBatch,
+    UiInstanceArena,
+};
 use crate::ui_material::{MaterialNode, UiMaterial, UiMaterialKey};
 use crate::*;
 use bevy_asset::*;
 use bevy_ecs::{
-    prelude::{Component, With},
-    query::ROQueryItem,
+    entity::EntityHashMap,
+    prelude::With,
     system::{
         lifetimeless::{Read, SRes},
         *,
@@ -13,11 +17,12 @@ use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::{
     globals::{GlobalsBuffer, GlobalsUniform},
+    impl_atomic_pod,
     render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
     render_phase::*,
     render_resource::{binding_types::uniform_buffer, *},
     renderer::{RenderDevice, RenderQueue},
-    sync_world::{MainEntity, TemporaryRenderEntity},
+    sync_world::MainEntity,
     view::*,
     Extract, ExtractSchedule, Render, RenderSystems,
 };
@@ -27,7 +32,7 @@ use bevy_sprite::BorderRect;
 use bevy_ui::ComputedStackIndex;
 use bevy_utils::default;
 use bytemuck::{Pod, Zeroable};
-use core::{hash::Hash, marker::PhantomData, ops::Range};
+use core::{hash::Hash, marker::PhantomData};
 
 /// Adds the necessary ECS resources and render logic to enable rendering entities using the given
 /// [`UiMaterial`] asset type (which includes [`UiMaterial`] types).
@@ -76,38 +81,65 @@ where
 
 #[derive(Resource)]
 pub struct UiMaterialMeta<M: UiMaterial> {
-    vertices: RawBufferVec<UiMaterialVertex>,
+    vertices: AtomicSparseBufferVec<UiMaterialVertex>,
     view_bind_group: Option<BindGroup>,
+    batches: Vec<RetainedUiBatch<UiMaterialBatchKey<M>>>,
+    arena: UiInstanceArena,
+    camera_states: EntityHashMap<UiMaterialCameraState>,
+    material_keys: HashMap<AssetId<M>, M::Data>,
+    pending_queue: MainEntityHashSet,
     marker: PhantomData<M>,
 }
 
 impl<M: UiMaterial> Default for UiMaterialMeta<M> {
     fn default() -> Self {
         Self {
-            vertices: RawBufferVec::new(BufferUsages::VERTEX),
+            vertices: AtomicSparseBufferVec::new(
+                BufferUsages::VERTEX | BufferUsages::STORAGE,
+                0,
+                "retained UI material vertices".into(),
+            ),
             view_bind_group: Default::default(),
+            batches: Vec::new(),
+            arena: UiInstanceArena::default(),
+            camera_states: EntityHashMap::default(),
+            material_keys: HashMap::default(),
+            pending_queue: MainEntityHashSet::default(),
             marker: PhantomData,
         }
     }
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
+#[derive(Copy, Clone, Default, Pod, Zeroable)]
 pub struct UiMaterialVertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
     pub size: [f32; 2],
     pub border: [f32; 4],
-    pub radius: [f32; 4],
+    pub radius: [[f32; 4]; 2],
 }
 
-// in this [`UiMaterialPipeline`] there is (currently) no batching going on.
-// Therefore the [`UiMaterialBatch`] is more akin to a draw call.
-#[derive(Component)]
-pub struct UiMaterialBatch<M: UiMaterial> {
-    /// The range of vertices inside the [`UiMaterialMeta`]
-    pub range: Range<u32>,
-    pub material: AssetId<M>,
+impl_atomic_pod!(UiMaterialVertex, UiMaterialVertexBlob);
+
+#[derive(Debug)]
+struct UiMaterialBatchKey<M: UiMaterial> {
+    pipeline: CachedRenderPipelineId,
+    material: AssetId<M>,
+}
+
+impl<M: UiMaterial> Clone for UiMaterialBatchKey<M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M: UiMaterial> Copy for UiMaterialBatchKey<M> {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UiMaterialCameraState {
+    retained_view_entity: RetainedViewEntity,
+    target_format: TextureFormat,
 }
 
 /// Render pipeline data for a given [`UiMaterial`]
@@ -138,7 +170,9 @@ where
                 VertexFormat::Float32x2,
                 // border widths
                 VertexFormat::Float32x4,
-                // border radius
+                // border radius x values (top left, top right, bottom right, bottom left)
+                VertexFormat::Float32x4,
+                // border radius y values (top left, top right, bottom right, bottom left)
                 VertexFormat::Float32x4,
             ],
         );
@@ -230,34 +264,37 @@ impl<P: PhaseItem, M: UiMaterial, const I: usize> RenderCommand<P> for SetMatUiV
         ui_meta: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        pass.set_bind_group(
-            I,
-            ui_meta.into_inner().view_bind_group.as_ref().unwrap(),
-            &[view_uniform.offset],
-        );
+        let Some(view_bind_group) = ui_meta.into_inner().view_bind_group.as_ref() else {
+            return RenderCommandResult::Failure("UI material view bind group not available");
+        };
+        pass.set_bind_group(I, view_bind_group, &[view_uniform.offset]);
         RenderCommandResult::Success
     }
 }
 
 pub struct SetUiMaterialBindGroup<M: UiMaterial, const I: usize>(PhantomData<M>);
-impl<P: PhaseItem, M: UiMaterial, const I: usize> RenderCommand<P>
-    for SetUiMaterialBindGroup<M, I>
-{
-    type Param = SRes<RenderAssets<PreparedUiMaterial<M>>>;
+impl<M: UiMaterial, const I: usize> RenderCommand<TransparentUi> for SetUiMaterialBindGroup<M, I> {
+    type Param = (
+        SRes<RenderAssets<PreparedUiMaterial<M>>>,
+        SRes<UiMaterialMeta<M>>,
+    );
     type ViewQuery = ();
-    type ItemQuery = Read<UiMaterialBatch<M>>;
+    type ItemQuery = ();
 
     fn render<'w>(
-        _item: &P,
+        item: &TransparentUi,
         _view: (),
-        material_handle: Option<ROQueryItem<'_, '_, Self::ItemQuery>>,
-        materials: SystemParamItem<'w, '_, Self::Param>,
+        _entity: Option<()>,
+        (materials, meta): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let Some(material_handle) = material_handle else {
+        let Some(batch_index) = item.batch_index else {
             return RenderCommandResult::Skip;
         };
-        let Some(material) = materials.into_inner().get(material_handle.material) else {
+        let Some(batch) = meta.into_inner().batches.get(batch_index as usize) else {
+            return RenderCommandResult::Failure("UI material batch index out of range");
+        };
+        let Some(material) = materials.into_inner().get(batch.key.material) else {
             return RenderCommandResult::Skip;
         };
         pass.set_bind_group(I, &material.bind_group, &[]);
@@ -266,24 +303,30 @@ impl<P: PhaseItem, M: UiMaterial, const I: usize> RenderCommand<P>
 }
 
 pub struct DrawUiMaterialNode<M>(PhantomData<M>);
-impl<P: PhaseItem, M: UiMaterial> RenderCommand<P> for DrawUiMaterialNode<M> {
+impl<M: UiMaterial> RenderCommand<TransparentUi> for DrawUiMaterialNode<M> {
     type Param = SRes<UiMaterialMeta<M>>;
     type ViewQuery = ();
-    type ItemQuery = Read<UiMaterialBatch<M>>;
+    type ItemQuery = ();
 
     #[inline]
     fn render<'w>(
-        _item: &P,
+        item: &TransparentUi,
         _view: (),
-        batch: Option<&'w UiMaterialBatch<M>>,
+        _entity: Option<()>,
         ui_meta: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let Some(batch) = batch else {
+        let Some(batch_index) = item.batch_index else {
             return RenderCommandResult::Skip;
         };
-
-        pass.set_vertex_buffer(0, ui_meta.into_inner().vertices.buffer().unwrap().slice(..));
+        let meta = ui_meta.into_inner();
+        let Some(batch) = meta.batches.get(batch_index as usize) else {
+            return RenderCommandResult::Failure("UI material batch index out of range");
+        };
+        let Some(vertices) = meta.vertices.buffer() else {
+            return RenderCommandResult::Failure("missing retained UI material vertices");
+        };
+        pass.set_vertex_buffer(0, vertices.slice(..));
         pass.draw(batch.range.clone(), 0..1);
         RenderCommandResult::Success
     }
@@ -294,26 +337,30 @@ pub struct ExtractedUiMaterialNode<M: UiMaterial> {
     pub transform: Affine2,
     pub rect: Rect,
     pub border: BorderRect,
-    pub border_radius: [f32; 4],
+    pub border_radius: [[f32; 4]; 2],
     pub material: AssetId<M>,
     pub clip: Option<Rect>,
-    // Camera to render this UI node to. By the time it is extracted,
-    // it is defaulted to a single camera if only one exists.
-    // Nodes with ambiguous camera will be ignored.
-    pub extracted_camera_entity: Entity,
-    pub main_entity: MainEntity,
-    pub render_entity: Entity,
 }
 
+/// A render-world resource that stores all material nodes in the scene.
 #[derive(Resource)]
 pub struct ExtractedUiMaterialNodes<M: UiMaterial> {
-    pub uinodes: Vec<ExtractedUiMaterialNode<M>>,
+    /// The list of material nodes grouped by their main-world entity, along with
+    /// each group's target camera entity.
+    ///
+    /// This is a two-level data structure so that we can quickly remove all
+    /// material nodes associated with a main-world entity when it changes.
+    pub uinodes: MainEntityHashMap<(Entity, EntityIndexMap<ExtractedUiMaterialNode<M>>)>,
+    pub changed: MainEntityHashSet,
+    removed: Vec<RemovedUiNode>,
 }
 
 impl<M: UiMaterial> Default for ExtractedUiMaterialNodes<M> {
     fn default() -> Self {
         Self {
             uinodes: Default::default(),
+            changed: Default::default(),
+            removed: Default::default(),
         }
     }
 }
@@ -323,20 +370,54 @@ pub fn extract_ui_material_nodes<M: UiMaterial>(
     mut extracted_uinodes: ResMut<ExtractedUiMaterialNodes<M>>,
     materials: Extract<Res<Assets<M>>>,
     uinode_query: Extract<
-        Query<(
-            Entity,
-            &ComputedNode,
-            &ComputedStackIndex,
-            &UiGlobalTransform,
-            &MaterialNode<M>,
-            &InheritedVisibility,
-            Option<&CalculatedClip>,
-            &ComputedUiTargetCamera,
-        )>,
+        Query<
+            (
+                Entity,
+                &ComputedNode,
+                &ComputedStackIndex,
+                &UiGlobalTransform,
+                &MaterialNode<M>,
+                &InheritedVisibility,
+                Option<&CalculatedClip>,
+                &ComputedUiTargetCamera,
+            ),
+            Or<(
+                Changed<ComputedNode>,
+                Changed<ComputedStackIndex>,
+                Changed<UiGlobalTransform>,
+                Changed<MaterialNode<M>>,
+                Changed<InheritedVisibility>,
+                Changed<CalculatedClip>,
+                Changed<ComputedUiTargetCamera>,
+            )>,
+        >,
     >,
     camera_map: Extract<UiCameraMap>,
+    (
+        mut removed_computed_node_query,
+        mut removed_computed_stack_index_query,
+        mut removed_ui_global_transform_query,
+        mut removed_material_node_query,
+        mut removed_inherited_visibility_query,
+        mut removed_calculated_clip_query,
+        mut removed_computed_ui_target_camera_query,
+    ): (
+        Extract<RemovedComponents<ComputedNode>>,
+        Extract<RemovedComponents<ComputedStackIndex>>,
+        Extract<RemovedComponents<UiGlobalTransform>>,
+        Extract<RemovedComponents<MaterialNode<M>>>,
+        Extract<RemovedComponents<InheritedVisibility>>,
+        Extract<RemovedComponents<CalculatedClip>>,
+        Extract<RemovedComponents<ComputedUiTargetCamera>>,
+    ),
+    mut nodes_to_reextract_next_frame: Local<MainEntityHashSet>,
+    mut nodes_processed_this_frame: Local<MainEntityHashSet>,
 ) {
+    nodes_processed_this_frame.clear();
+    extracted_uinodes.changed.clear();
+    extracted_uinodes.removed.clear();
     let mut camera_mapper = camera_map.get_mapper();
+    let nodes_to_reextract = mem::take(&mut *nodes_to_reextract_next_frame);
 
     for (
         entity,
@@ -347,204 +428,246 @@ pub fn extract_ui_material_nodes<M: UiMaterial>(
         inherited_visibility,
         clip,
         camera,
-    ) in uinode_query.iter()
-    {
+    ) in uinode_query.iter().chain(
+        nodes_to_reextract
+            .into_iter()
+            .filter_map(|main_entity| uinode_query.get(main_entity.entity()).ok()),
+    ) {
+        let main_entity = MainEntity::from(entity);
+        extracted_uinodes.changed.insert(main_entity);
+
+        // Make sure we don't process the same node more than once.
+        // This is possible if the node was marked for reextraction on the
+        // previous frame and was also otherwise changed on this frame.
+        if nodes_processed_this_frame.contains(&main_entity) {
+            continue;
+        }
+        // If there were any previous UI nodes for this entity, despawn them.
+        let extracted = &mut *extracted_uinodes;
+        if let Some((_, old_nodes)) =
+            remove_owner(&mut extracted.uinodes, main_entity, &mut extracted.removed)
+        {
+            for render_entity in old_nodes.keys() {
+                commands.entity(*render_entity).despawn();
+            }
+        }
+
         // skip invisible nodes
         if !inherited_visibility.get() || computed_node.is_empty() {
             continue;
         }
 
-        // Skip loading materials
+        // If the material hasn't finished loading, skip the entity, and
+        // remember that we did so that we reextract the node next frame.
         if !materials.contains(handle) {
+            nodes_to_reextract_next_frame.insert(main_entity);
             continue;
         }
 
         let Some(extracted_camera_entity) = camera_mapper.map(camera) else {
             continue;
         };
+        nodes_processed_this_frame.insert(main_entity);
 
-        extracted_uinodes.uinodes.push(ExtractedUiMaterialNode {
-            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-            stack_index: stack_index.0,
-            transform: transform.into(),
-            material: handle.id(),
-            rect: Rect {
-                min: Vec2::ZERO,
-                max: computed_node.size(),
-            },
-            border: computed_node.border(),
-            border_radius: computed_node.border_radius().into(),
-            clip: clip.map(|clip| clip.clip),
-            extracted_camera_entity,
-            main_entity: entity.into(),
-        });
+        extracted_uinodes
+            .uinodes
+            .entry(main_entity)
+            .or_insert_with(|| (extracted_camera_entity, Default::default()))
+            .1
+            .insert(
+                commands.spawn_empty().id(),
+                ExtractedUiMaterialNode {
+                    stack_index: stack_index.0,
+                    transform: transform.into(),
+                    material: handle.id(),
+                    rect: Rect {
+                        min: Vec2::ZERO,
+                        max: computed_node.size(),
+                    },
+                    border: computed_node.border(),
+                    border_radius: computed_node.border_radius().into(),
+                    clip: clip.map(|clip| clip.clip),
+                },
+            );
+    }
+
+    // Only remove the render-world data if we didn't handle the node above.
+    // It's possible that a relevant component was removed and added in the same
+    // frame.
+    for main_entity in removed_computed_node_query
+        .read()
+        .chain(removed_computed_stack_index_query.read())
+        .chain(removed_ui_global_transform_query.read())
+        .chain(removed_material_node_query.read())
+        .chain(removed_inherited_visibility_query.read())
+        .chain(removed_calculated_clip_query.read())
+        .chain(removed_computed_ui_target_camera_query.read())
+    {
+        let main_entity = MainEntity::from(main_entity);
+        if nodes_processed_this_frame.contains(&main_entity) {
+            continue;
+        }
+        extracted_uinodes.changed.insert(main_entity);
+        let extracted = &mut *extracted_uinodes;
+        let Some((_, extracted_nodes)) =
+            remove_owner(&mut extracted.uinodes, main_entity, &mut extracted.removed)
+        else {
+            continue;
+        };
+        for render_entity in extracted_nodes.keys() {
+            commands.entity(*render_entity).despawn();
+        }
+    }
+}
+
+fn generate_material_vertices(
+    node: &ExtractedUiMaterialNode<impl UiMaterial>,
+) -> Option<[UiMaterialVertex; 6]> {
+    let size = node.rect.size();
+    let (position_diff, culled) = clipping_offsets(node.transform, Vec2::ZERO, size, node.clip);
+    if culled {
+        return None;
+    }
+    let positions =
+        QUAD_VERTEX_POSITIONS.map(|position| node.transform.transform_point2(position * size));
+    let uvs = [
+        node.rect.min + position_diff[0],
+        Vec2::new(node.rect.max.x, node.rect.min.y) + position_diff[1],
+        node.rect.max + position_diff[2],
+        Vec2::new(node.rect.min.x, node.rect.max.y) + position_diff[3],
+    ]
+    .map(|position| position / node.rect.max);
+    let border = [
+        node.border.min_inset.x,
+        node.border.min_inset.y,
+        node.border.max_inset.x,
+        node.border.max_inset.y,
+    ];
+    Some(QUAD_INDICES.map(|corner| {
+        UiMaterialVertex {
+            position: (positions[corner] + position_diff[corner])
+                .extend(1.0)
+                .into(),
+            uv: uvs[corner].into(),
+            size: size.into(),
+            border,
+            radius: node.border_radius,
+        }
+    }))
+}
+
+fn rebuild_material_owner<M: UiMaterial>(
+    main_entity: MainEntity,
+    meta: &mut UiMaterialMeta<M>,
+    extracted: &ExtractedUiMaterialNodes<M>,
+) {
+    meta.arena.free_owner(main_entity);
+    let Some((_, nodes)) = extracted.uinodes.get(&main_entity) else {
+        return;
+    };
+    let mut owned = Vec::with_capacity(nodes.len());
+    for (render_entity, node) in nodes {
+        if let Some(vertices) = generate_material_vertices(node) {
+            let count = vertices.len() as u32;
+            let (start, capacity) = meta.arena.alloc_exact(count);
+            meta.vertices.grow(start + capacity);
+            for (offset, vertex) in vertices.into_iter().enumerate() {
+                meta.vertices.set(start + offset as u32, vertex);
+            }
+            meta.arena.insert(*render_entity, start, count, capacity);
+        } else {
+            meta.arena.insert_empty(*render_entity);
+        }
+        owned.push(*render_entity);
+    }
+    if !owned.is_empty() {
+        meta.arena.owners.insert(main_entity, owned);
     }
 }
 
 pub fn prepare_uimaterial_nodes<M: UiMaterial>(
-    mut commands: Commands,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
-    mut ui_meta: ResMut<UiMaterialMeta<M>>,
-    mut extracted_uinodes: ResMut<ExtractedUiMaterialNodes<M>>,
+    mut meta: ResMut<UiMaterialMeta<M>>,
+    extracted: Res<ExtractedUiMaterialNodes<M>>,
     view_uniforms: Res<ViewUniforms>,
     globals_buffer: Res<GlobalsBuffer>,
-    ui_material_pipeline: Res<UiMaterialPipeline<M>>,
+    pipeline: Res<UiMaterialPipeline<M>>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut previous_len: Local<usize>,
+    (
+        mut sparse_buffer_update_jobs,
+        mut sparse_buffer_update_bind_groups,
+        sparse_buffer_update_pipelines,
+    ): (
+        ResMut<SparseBufferUpdateJobs>,
+        ResMut<SparseBufferUpdateBindGroups>,
+        Res<SparseBufferUpdatePipelines>,
+    ),
 ) {
-    if let (Some(view_binding), Some(globals_binding)) = (
+    if meta.arena.needs_compaction() || !meta.arena.initialized {
+        meta.arena.reset();
+        meta.vertices.clear();
+        for main_entity in extracted.uinodes.keys().copied() {
+            rebuild_material_owner(main_entity, &mut meta, &extracted);
+        }
+    } else {
+        for main_entity in extracted.changed.iter().copied() {
+            rebuild_material_owner(main_entity, &mut meta, &extracted);
+        }
+    }
+    meta.vertices.write_buffers(&render_device, &render_queue);
+    meta.vertices.prepare_to_populate_buffers(
+        &render_device,
+        &pipeline_cache,
+        &mut sparse_buffer_update_jobs,
+        &mut sparse_buffer_update_bind_groups,
+        &sparse_buffer_update_pipelines,
+    );
+    let (Some(view_binding), Some(globals_binding)) = (
         view_uniforms.uniforms.binding(),
         globals_buffer.buffer.binding(),
-    ) {
-        let mut batches: Vec<(Entity, UiMaterialBatch<M>)> = Vec::with_capacity(*previous_len);
-
-        ui_meta.vertices.clear();
-        ui_meta.view_bind_group = Some(render_device.create_bind_group(
-            "ui_material_view_bind_group",
-            &pipeline_cache.get_bind_group_layout(&ui_material_pipeline.view_layout),
-            &BindGroupEntries::sequential((view_binding, globals_binding)),
-        ));
-        let mut index = 0;
-
-        for ui_phase in phases.values_mut() {
-            let mut batch_item_index = 0;
-            let mut batch_shader_handle = None;
-
-            for item_index in 0..ui_phase.items.len() {
-                let item = &mut ui_phase.items[item_index];
-                if let Some(extracted_uinode) = extracted_uinodes
-                    .uinodes
-                    .get(item.index)
-                    .filter(|n| item.entity() == n.render_entity)
-                {
-                    let mut existing_batch = batches
-                        .last_mut()
-                        .filter(|_| batch_shader_handle == Some(extracted_uinode.material));
-
-                    if existing_batch.is_none() {
-                        batch_item_index = item_index;
-                        batch_shader_handle = Some(extracted_uinode.material);
-
-                        let new_batch = UiMaterialBatch {
-                            range: index..index,
-                            material: extracted_uinode.material,
-                        };
-
-                        batches.push((item.entity(), new_batch));
-
-                        existing_batch = batches.last_mut();
-                    }
-
-                    let uinode_rect = extracted_uinode.rect;
-
-                    let rect_size = uinode_rect.size();
-
-                    let positions = QUAD_VERTEX_POSITIONS.map(|pos| {
-                        extracted_uinode
-                            .transform
-                            .transform_point2(pos * rect_size)
-                            .extend(1.0)
-                    });
-
-                    let positions_diff = if let Some(clip) = extracted_uinode.clip {
-                        [
-                            Vec2::new(
-                                f32::max(clip.min.x - positions[0].x, 0.),
-                                f32::max(clip.min.y - positions[0].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::min(clip.max.x - positions[1].x, 0.),
-                                f32::max(clip.min.y - positions[1].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::min(clip.max.x - positions[2].x, 0.),
-                                f32::min(clip.max.y - positions[2].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::max(clip.min.x - positions[3].x, 0.),
-                                f32::min(clip.max.y - positions[3].y, 0.),
-                            ),
-                        ]
-                    } else {
-                        [Vec2::ZERO; 4]
-                    };
-
-                    let positions_clipped = [
-                        positions[0] + positions_diff[0].extend(0.),
-                        positions[1] + positions_diff[1].extend(0.),
-                        positions[2] + positions_diff[2].extend(0.),
-                        positions[3] + positions_diff[3].extend(0.),
-                    ];
-
-                    let transformed_rect_size = extracted_uinode
-                        .transform
-                        .transform_vector2(rect_size)
-                        .abs();
-
-                    // Don't try to cull nodes that have a rotation
-                    // In a rotation around the Z-axis, this value is 0.0 for an angle of 0.0 or π
-                    // In those two cases, the culling check can proceed normally as corners will be on
-                    // horizontal / vertical lines
-                    // For all other angles, bypass the culling check
-                    // This does not properly handles all rotations on all axis
-                    if extracted_uinode.transform.x_axis[1] == 0.0 {
-                        // Cull nodes that are completely clipped
-                        if positions_diff[0].x - positions_diff[1].x >= transformed_rect_size.x
-                            || positions_diff[1].y - positions_diff[2].y >= transformed_rect_size.y
-                        {
-                            continue;
-                        }
-                    }
-                    let uvs = [
-                        Vec2::new(
-                            uinode_rect.min.x + positions_diff[0].x,
-                            uinode_rect.min.y + positions_diff[0].y,
-                        ),
-                        Vec2::new(
-                            uinode_rect.max.x + positions_diff[1].x,
-                            uinode_rect.min.y + positions_diff[1].y,
-                        ),
-                        Vec2::new(
-                            uinode_rect.max.x + positions_diff[2].x,
-                            uinode_rect.max.y + positions_diff[2].y,
-                        ),
-                        Vec2::new(
-                            uinode_rect.min.x + positions_diff[3].x,
-                            uinode_rect.max.y + positions_diff[3].y,
-                        ),
-                    ]
-                    .map(|pos| pos / uinode_rect.max);
-
-                    for i in QUAD_INDICES {
-                        ui_meta.vertices.push(UiMaterialVertex {
-                            position: positions_clipped[i].into(),
-                            uv: uvs[i].into(),
-                            size: extracted_uinode.rect.size().into(),
-                            radius: extracted_uinode.border_radius,
-                            border: [
-                                extracted_uinode.border.min_inset.x,
-                                extracted_uinode.border.min_inset.y,
-                                extracted_uinode.border.max_inset.x,
-                                extracted_uinode.border.max_inset.y,
-                            ],
-                        });
-                    }
-
-                    index += QUAD_INDICES.len() as u32;
-                    existing_batch.unwrap().1.range.end = index;
-                    ui_phase.items[batch_item_index].batch_range_mut().end += 1;
-                } else {
-                    batch_shader_handle = None;
+    ) else {
+        meta.batches.clear();
+        return;
+    };
+    meta.view_bind_group = Some(render_device.create_bind_group(
+        "ui_material_view_bind_group",
+        &pipeline_cache.get_bind_group_layout(&pipeline.view_layout),
+        &BindGroupEntries::sequential((view_binding, globals_binding)),
+    ));
+    let UiMaterialMeta { arena, .. } = &*meta;
+    let mut unused_indices = RawBufferVec::new(BufferUsages::VERTEX);
+    meta.batches = batch_retained_ui(
+        &mut phases,
+        &mut unused_indices,
+        false,
+        |item| {
+            let Some(node) = extracted
+                .uinodes
+                .get(&item.main_entity())
+                .and_then(|(_, nodes)| nodes.get(&item.entity()))
+            else {
+                return RetainedBatchItem::NotOwned;
+            };
+            let Some(slot) = arena.slots.get(&item.entity()) else {
+                return RetainedBatchItem::Culled;
+            };
+            if slot.instances.count == 0 {
+                RetainedBatchItem::Culled
+            } else {
+                RetainedBatchItem::Drawable {
+                    instances: slot.instances,
+                    key: UiMaterialBatchKey {
+                        pipeline: item.pipeline,
+                        material: node.material,
+                    },
                 }
             }
-        }
-        ui_meta.vertices.write_buffer(&render_device, &render_queue);
-        *previous_len = batches.len();
-        commands.try_insert_batch(batches);
-    }
-    extracted_uinodes.uinodes.clear();
+        },
+        |left, right| left.pipeline == right.pipeline && left.material == right.material,
+        |_, _| {},
+    );
 }
 
 pub struct PreparedUiMaterial<T: UiMaterial> {
@@ -592,62 +715,203 @@ impl<M: UiMaterial> RenderAsset for PreparedUiMaterial<M> {
 }
 
 pub fn queue_ui_material_nodes<M: UiMaterial>(
-    extracted_uinodes: Res<ExtractedUiMaterialNodes<M>>,
+    extracted: Res<ExtractedUiMaterialNodes<M>>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
-    ui_material_pipeline: Res<UiMaterialPipeline<M>>,
+    pipeline: Res<UiMaterialPipeline<M>>,
+    mut meta: ResMut<UiMaterialMeta<M>>,
     mut pipelines: ResMut<SpecializedRenderPipelines<UiMaterialPipeline<M>>>,
     pipeline_cache: Res<PipelineCache>,
     render_materials: Res<RenderAssets<PreparedUiMaterial<M>>>,
-    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<&UiCameraView, With<ExtractedView>>,
+    mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
+    render_views: Query<(Entity, &UiCameraView), With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
 {
     let draw_function = draw_functions.read().id::<DrawUiMaterial<M>>();
-
-    for (index, extracted_uinode) in extracted_uinodes.uinodes.iter().enumerate() {
-        let Some(material) = render_materials.get(extracted_uinode.material) else {
+    let mut active_cameras = HashSet::new();
+    let mut invalidated_cameras = HashSet::new();
+    for (camera_entity, ui_camera_view) in &render_views {
+        let Ok(view) = camera_views.get(ui_camera_view.0) else {
             continue;
         };
-
-        let Ok(default_camera_view) =
-            render_views.get_mut(extracted_uinode.extracted_camera_entity)
-        else {
-            continue;
+        let state = UiMaterialCameraState {
+            retained_view_entity: view.retained_view_entity,
+            target_format: view.target_format,
         };
-
-        let Ok(view) = camera_views.get(default_camera_view.0) else {
-            continue;
-        };
-
-        let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
-        else {
-            continue;
-        };
-
-        let pipeline = pipelines.specialize(
-            &pipeline_cache,
-            &ui_material_pipeline,
-            UiMaterialKey {
-                target_format: view.target_format,
-                bind_group_data: material.key.clone(),
-            },
-        );
-        if transparent_phase.items.capacity() < extracted_uinodes.uinodes.len() {
-            transparent_phase.items.reserve_exact(
-                extracted_uinodes.uinodes.len() - transparent_phase.items.capacity(),
-            );
+        active_cameras.insert(camera_entity);
+        if meta.camera_states.insert(camera_entity, state) != Some(state) {
+            invalidated_cameras.insert(camera_entity);
         }
-        transparent_phase.add_transient(TransparentUi {
-            draw_function,
-            pipeline,
-            entity: (extracted_uinode.render_entity, extracted_uinode.main_entity),
-            sort_key: FloatOrd(extracted_uinode.stack_index as f32 + M::stack_z_offset()),
-            batch_range: 0..0,
-            extra_index: PhaseItemExtraIndex::None,
-            index,
-            indexed: false,
-        });
+    }
+    for removed in &extracted.removed {
+        let Some(camera_state) = meta.camera_states.get(&removed.camera_entity) else {
+            continue;
+        };
+        if let Some(phase) = phases.get_mut(&camera_state.retained_view_entity) {
+            phase.remove(removed.render_entity, removed.main_entity);
+        }
+    }
+
+    let mut current_material_keys = HashMap::default();
+    let mut changed_materials = HashSet::new();
+    for (_, nodes) in extracted.uinodes.values() {
+        for node in nodes.values() {
+            if current_material_keys.contains_key(&node.material) {
+                continue;
+            }
+            match render_materials.get(node.material) {
+                Some(material) => {
+                    if meta.material_keys.get(&node.material) != Some(&material.key) {
+                        changed_materials.insert(node.material);
+                    }
+                    current_material_keys.insert(node.material, material.key.clone());
+                }
+                None => {
+                    if meta.material_keys.contains_key(&node.material) {
+                        changed_materials.insert(node.material);
+                    }
+                }
+            }
+        }
+    }
+    meta.material_keys = current_material_keys;
+
+    let mut dirty = extracted.changed.clone();
+    dirty.extend(meta.pending_queue.iter().copied());
+    if !invalidated_cameras.is_empty() {
+        dirty.extend(
+            extracted
+                .uinodes
+                .iter()
+                .filter_map(|(main_entity, (camera_entity, _))| {
+                    invalidated_cameras
+                        .contains(camera_entity)
+                        .then_some(*main_entity)
+                }),
+        );
+    }
+    if !changed_materials.is_empty() {
+        dirty.extend(
+            extracted
+                .uinodes
+                .iter()
+                .filter_map(|(main_entity, (_, nodes))| {
+                    nodes
+                        .values()
+                        .any(|node| changed_materials.contains(&node.material))
+                        .then_some(*main_entity)
+                }),
+        );
+    }
+
+    for main_entity in dirty {
+        let Some((camera_entity, nodes)) = extracted.uinodes.get(&main_entity) else {
+            meta.pending_queue.remove(&main_entity);
+            continue;
+        };
+        let Some(camera_state) = meta.camera_states.get(camera_entity) else {
+            continue;
+        };
+        let Some(phase) = phases.get_mut(&camera_state.retained_view_entity) else {
+            continue;
+        };
+        let mut pending = false;
+        for (render_entity, node) in nodes {
+            let Some(material) = render_materials.get(node.material) else {
+                pending = true;
+                phase.remove(*render_entity, main_entity);
+                continue;
+            };
+            let item_pipeline = pipelines.specialize(
+                &pipeline_cache,
+                &pipeline,
+                UiMaterialKey {
+                    target_format: camera_state.target_format,
+                    bind_group_data: material.key.clone(),
+                },
+            );
+            phase.add_retained(TransparentUi {
+                draw_function,
+                pipeline: item_pipeline,
+                entity: (*render_entity, main_entity),
+                sort_key: FloatOrd(node.stack_index as f32 + M::stack_z_offset()),
+                batch_range: 0..0,
+                extra_index: PhaseItemExtraIndex::None,
+                indexed: false,
+                batch_index: None,
+            });
+        }
+        if pending {
+            meta.pending_queue.insert(main_entity);
+        } else {
+            meta.pending_queue.remove(&main_entity);
+        }
+    }
+    meta.camera_states
+        .retain(|camera, _| active_cameras.contains(camera));
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::size_of;
+
+    use super::*;
+    use crate::retained::{preprocess_wgsl_for_test, validate_wgsl_for_test};
+    use bevy_asset::uuid::Uuid;
+    use bevy_reflect::TypePath;
+
+    #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+    struct TestMaterial {}
+
+    impl UiMaterial for TestMaterial {}
+
+    #[test]
+    fn material_vertex_is_atomic_sparse_buffer_compatible() {
+        assert_eq!(size_of::<UiMaterialVertex>(), 19 * size_of::<u32>());
+        assert!(size_of::<UiMaterialVertex>() <= 32 * size_of::<u32>());
+    }
+
+    #[test]
+    fn retained_material_vertices_preserve_legacy_triangle_order_and_clipping() {
+        let node = ExtractedUiMaterialNode::<TestMaterial> {
+            stack_index: 0,
+            transform: Affine2::from_translation(Vec2::new(50.0, 40.0)),
+            rect: Rect::from_center_size(Vec2::ZERO, Vec2::new(100.0, 80.0)),
+            border: BorderRect::ZERO,
+            border_radius: [[0.0; 4]; 2],
+            material: AssetId::Uuid {
+                uuid: Uuid::from_u128(42),
+            },
+            clip: Some(Rect::new(10.0, 20.0, 90.0, 70.0)),
+        };
+        let vertices = generate_material_vertices(&node).unwrap();
+        let expected = [
+            Vec2::new(10.0, 20.0),
+            Vec2::new(90.0, 70.0),
+            Vec2::new(10.0, 70.0),
+            Vec2::new(10.0, 20.0),
+            Vec2::new(90.0, 20.0),
+            Vec2::new(90.0, 70.0),
+        ];
+        for (vertex, expected) in vertices.iter().zip(expected) {
+            assert_eq!(Vec2::from_slice(&vertex.position[..2]), expected);
+        }
+    }
+
+    #[test]
+    fn public_material_vertex_output_retains_the_legacy_fragment_abi() {
+        let output = preprocess_wgsl_for_test(include_str!("ui_vertex_output.wgsl"), &[], "");
+        let custom_fragment = preprocess_wgsl_for_test(
+            include_str!("../../../assets/shaders/custom_ui_material.wgsl"),
+            &[],
+            "",
+        );
+        assert!(output.contains("@location(2) border_radius: vec4<f32>"));
+        assert!(output.contains("@location(3) @interpolate(flat) size: vec2<f32>"));
+        validate_wgsl_for_test(
+            "legacy custom UI material fragment ABI",
+            &format!("{output}\n{custom_fragment}"),
+        );
     }
 }

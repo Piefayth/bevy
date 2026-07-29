@@ -41,37 +41,53 @@ fn enabled(flags: u32, mask: u32) -> bool {
 
 @group(0) @binding(0) var<uniform> view: View;
 
+const QUAD_CORNERS = array(
+    vec2(-0.5, -0.5),
+    vec2(0.5, 0.5),
+    vec2(-0.5, 0.5),
+    vec2(-0.5, -0.5),
+    vec2(0.5, -0.5),
+    vec2(0.5, 0.5),
+);
+const QUAD_CORNER_FLAGS = array(0u, 6u, 4u, 0u, 2u, 6u);
+const QUAD_CORNER_INDICES = array(0u, 2u, 3u, 0u, 1u, 2u);
+
+#ifdef UI_STORAGE_INSTANCE
+struct UiGeometryInstance {
+    transform_x: vec2<f32>,
+    transform_y: vec2<f32>,
+    translation: vec2<f32>,
+    size: vec2<f32>,
+    position_diff_first: vec4<f32>,
+    position_diff_second: vec4<f32>,
+    uv_first: vec4<f32>,
+    uv_second: vec4<f32>,
+};
+
+struct GradientStyleInstance {
+    flags_and_padding: vec4<u32>,
+    radius_x: vec4<f32>,
+    radius_y: vec4<f32>,
+    border: vec4<f32>,
+    gradient: vec4<f32>,
+    start_color: vec4<f32>,
+    end_color: vec4<f32>,
+    params: vec4<f32>,
+};
+
+@group(1) @binding(0) var<storage, read> geometry_instances: array<UiGeometryInstance>;
+@group(1) @binding(1) var<storage, read> style_instances: array<GradientStyleInstance>;
+#endif
+
 struct GradientVertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) size: vec2<f32>,
     @location(2) @interpolate(flat) flags: u32,
-    @location(3) @interpolate(flat) radius: vec4<f32>,
-    @location(4) @interpolate(flat) border: vec4<f32>,    
+    @location(3) @interpolate(flat) radius_x: vec4<f32>,
+    @location(4) @interpolate(flat) radius_y: vec4<f32>,
+    @location(5) @interpolate(flat) border: vec4<f32>,
 
     // Position relative to the center of the rectangle.
-    @location(5) point: vec2<f32>,
-    @location(6) @interpolate(flat) g_start: vec2<f32>,
-    @location(7) @interpolate(flat) dir: vec2<f32>,
-    @location(8) @interpolate(flat) start_color: vec4<f32>,
-    @location(9) @interpolate(flat) start_len: f32,
-    @location(10) @interpolate(flat) end_len: f32,
-    @location(11) @interpolate(flat) end_color: vec4<f32>,
-    @location(12) @interpolate(flat) hint: f32,
-    @builtin(position) position: vec4<f32>,
-};
-
-@vertex
-fn vertex(
-    @location(0) vertex_position: vec3<f32>,
-    @location(1) vertex_uv: vec2<f32>,
-    @location(2) flags: u32,
-
-    // x: top left, y: top right, z: bottom right, w: bottom left.
-    @location(3) radius: vec4<f32>,
-
-    // x: left, y: top, z: right, w: bottom.
-    @location(4) border: vec4<f32>,
-    @location(5) size: vec2<f32>,
     @location(6) point: vec2<f32>,
     @location(7) @interpolate(flat) g_start: vec2<f32>,
     @location(8) @interpolate(flat) dir: vec2<f32>,
@@ -79,14 +95,86 @@ fn vertex(
     @location(10) @interpolate(flat) start_len: f32,
     @location(11) @interpolate(flat) end_len: f32,
     @location(12) @interpolate(flat) end_color: vec4<f32>,
-    @location(13) @interpolate(flat) hint: f32
+    @location(13) @interpolate(flat) hint: f32,
+    @builtin(position) position: vec4<f32>,
+};
+
+fn unpack_corner(first: vec4<f32>, second: vec4<f32>, corner: u32) -> vec2<f32> {
+    switch corner {
+        case 0u: { return first.xy; }
+        case 1u: { return first.zw; }
+        case 2u: { return second.xy; }
+        default: { return second.zw; }
+    }
+}
+
+@vertex
+fn vertex(
+    @builtin(vertex_index) vertex_index: u32,
+#ifdef UI_STORAGE_INSTANCE
+    @location(0) instance_index: u32,
+#else
+    @location(0) transform_x: vec2<f32>,
+    @location(1) transform_y: vec2<f32>,
+    @location(2) translation: vec2<f32>,
+    @location(3) size: vec2<f32>,
+    @location(4) position_diff_01: vec4<f32>,
+    @location(5) position_diff_23: vec4<f32>,
+    @location(6) uv_01: vec4<f32>,
+    @location(7) uv_23: vec4<f32>,
+    @location(8) flags_and_padding: vec4<u32>,
+    @location(9) radius_x: vec4<f32>,
+    @location(10) radius_y: vec4<f32>,
+    @location(11) border: vec4<f32>,
+    @location(12) gradient: vec4<f32>,
+    @location(13) start_color: vec4<f32>,
+    @location(14) end_color: vec4<f32>,
+    @location(15) params: vec4<f32>,
+#endif
 ) -> GradientVertexOutput {
+#ifdef UI_STORAGE_INSTANCE
+    let geometry_data = geometry_instances[instance_index];
+    let style = style_instances[instance_index];
+    let transform_x = geometry_data.transform_x;
+    let transform_y = geometry_data.transform_y;
+    let translation = geometry_data.translation;
+    let size = geometry_data.size;
+    let position_diff_01 = geometry_data.position_diff_first;
+    let position_diff_23 = geometry_data.position_diff_second;
+    let uv_01 = geometry_data.uv_first;
+    let uv_23 = geometry_data.uv_second;
+    let flags_and_padding = style.flags_and_padding;
+    let radius_x = style.radius_x;
+    let radius_y = style.radius_y;
+    let border = style.border;
+    let gradient = style.gradient;
+    let start_color = style.start_color;
+    let end_color = style.end_color;
+    let params = style.params;
+#endif
+    let corner_index = QUAD_CORNER_INDICES[vertex_index];
+    let local_position = QUAD_CORNERS[vertex_index] * size;
+    let position_diff = unpack_corner(position_diff_01, position_diff_23, corner_index);
+    let world_position =
+        transform_x * local_position.x +
+        transform_y * local_position.y +
+        translation +
+        position_diff;
+    let vertex_uv = unpack_corner(uv_01, uv_23, corner_index);
+    let point = local_position + position_diff;
+    let flags = flags_and_padding.x | QUAD_CORNER_FLAGS[vertex_index];
+    let g_start = gradient.xy;
+    let dir = gradient.zw;
+    let start_len = params.x;
+    let end_len = params.y;
+    let hint = params.z;
     var out: GradientVertexOutput;
-    out.position = view.clip_from_world * vec4(vertex_position, 1.0);
+    out.position = view.clip_from_world * vec4(world_position, 0.0, 1.0);
     out.uv = vertex_uv;
     out.size = size;
     out.flags = flags;
-    out.radius = radius;
+    out.radius_x = radius_x;
+    out.radius_y = radius_y;
     out.border = border;
     out.point = point;
     out.dir = dir;
@@ -122,9 +210,9 @@ fn fragment(in: GradientVertexOutput) -> @location(0) vec4<f32> {
     );
 
     if enabled(in.flags, BORDER_ANY) {
-        return draw_uinode_border(gradient_color, in.point, in.size, in.radius, in.border, in.flags);
+        return draw_uinode_border(gradient_color, in.point, in.size, in.radius_x, in.radius_y, in.border, in.flags);
     } else {
-        return draw_uinode_background(gradient_color, in.point, in.size, in.radius, in.border, in.flags);
+        return draw_uinode_background(gradient_color, in.point, in.size, in.radius_x, in.radius_y, in.border, in.flags);
     }
 }
 

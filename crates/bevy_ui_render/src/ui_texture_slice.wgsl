@@ -9,6 +9,40 @@ var<uniform> globals: Globals;
 @group(1) @binding(0) var sprite_texture: texture_2d<f32>;
 @group(1) @binding(1) var sprite_sampler: sampler;
 
+const QUAD_CORNERS = array(
+    vec2(-0.5, -0.5),
+    vec2(0.5, 0.5),
+    vec2(-0.5, 0.5),
+    vec2(-0.5, -0.5),
+    vec2(0.5, -0.5),
+    vec2(0.5, 0.5),
+);
+const QUAD_CORNER_INDICES = array(0u, 2u, 3u, 0u, 1u, 2u);
+
+#ifdef UI_STORAGE_INSTANCE
+struct UiGeometryInstance {
+    transform_x: vec2<f32>,
+    transform_y: vec2<f32>,
+    translation: vec2<f32>,
+    size: vec2<f32>,
+    position_diff_first: vec4<f32>,
+    position_diff_second: vec4<f32>,
+    uv_first: vec4<f32>,
+    uv_second: vec4<f32>,
+};
+
+struct UiTextureSliceStyleInstance {
+    color: vec4<f32>,
+    texture_slices: vec4<f32>,
+    target_slices: vec4<f32>,
+    repeat: vec4<f32>,
+    atlas_rect: vec4<f32>,
+};
+
+@group(2) @binding(0) var<storage, read> geometry_instances: array<UiGeometryInstance>;
+@group(2) @binding(1) var<storage, read> style_instances: array<UiTextureSliceStyleInstance>;
+#endif
+
 struct UiVertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
@@ -43,20 +77,66 @@ struct UiVertexOutput {
     @builtin(position) position: vec4<f32>,
 }
 
+fn unpack_corner(first: vec4<f32>, second: vec4<f32>, corner: u32) -> vec2<f32> {
+    switch corner {
+        case 0u: { return first.xy; }
+        case 1u: { return first.zw; }
+        case 2u: { return second.xy; }
+        default: { return second.zw; }
+    }
+}
+
 @vertex
 fn vertex(
-    @location(0) vertex_position: vec3<f32>,
-    @location(1) vertex_uv: vec2<f32>,
-    @location(2) vertex_color: vec4<f32>,
-    @location(3) texture_slices: vec4<f32>,
-    @location(4) target_slices: vec4<f32>,
-    @location(5) repeat: vec4<f32>,
-    @location(6) atlas_rect: vec4<f32>,
+    @builtin(vertex_index) vertex_index: u32,
+#ifdef UI_STORAGE_INSTANCE
+    @location(0) instance_index: u32,
+#else
+    @location(0) transform_x: vec2<f32>,
+    @location(1) transform_y: vec2<f32>,
+    @location(2) translation: vec2<f32>,
+    @location(3) size: vec2<f32>,
+    @location(4) position_diff_01: vec4<f32>,
+    @location(5) position_diff_23: vec4<f32>,
+    @location(6) uv_01: vec4<f32>,
+    @location(7) uv_23: vec4<f32>,
+    @location(8) vertex_color: vec4<f32>,
+    @location(9) texture_slices: vec4<f32>,
+    @location(10) target_slices: vec4<f32>,
+    @location(11) repeat: vec4<f32>,
+    @location(12) atlas_rect: vec4<f32>,
+#endif
 ) -> UiVertexOutput {
+#ifdef UI_STORAGE_INSTANCE
+    let geometry = geometry_instances[instance_index];
+    let style = style_instances[instance_index];
+    let transform_x = geometry.transform_x;
+    let transform_y = geometry.transform_y;
+    let translation = geometry.translation;
+    let size = geometry.size;
+    let position_diff_01 = geometry.position_diff_first;
+    let position_diff_23 = geometry.position_diff_second;
+    let uv_01 = geometry.uv_first;
+    let uv_23 = geometry.uv_second;
+    let vertex_color = style.color;
+    let texture_slices = style.texture_slices;
+    let target_slices = style.target_slices;
+    let repeat = style.repeat;
+    let atlas_rect = style.atlas_rect;
+#endif
+    let corner_index = QUAD_CORNER_INDICES[vertex_index];
+    let local_position = QUAD_CORNERS[vertex_index] * size;
+    let position_diff = unpack_corner(position_diff_01, position_diff_23, corner_index);
+    let world_position =
+        transform_x * local_position.x +
+        transform_y * local_position.y +
+        translation +
+        position_diff;
+    let vertex_uv = unpack_corner(uv_01, uv_23, corner_index);
     var out: UiVertexOutput;
     out.uv = vertex_uv;
     out.color = vertex_color;
-    out.position = view.clip_from_world * vec4<f32>(vertex_position, 1.0);
+    out.position = view.clip_from_world * vec4<f32>(world_position, 0.0, 1.0);
     out.texture_slices = texture_slices;
     out.target_slices = target_slices;
     out.repeat = repeat;

@@ -182,7 +182,7 @@ fn setup_pica_pica(
             position_type: PositionType::Absolute,
             right: px(0.0),
             padding: px(4.0).all(),
-            border_radius: BorderRadius::bottom_left(px(4.0)),
+            border_radius: BorderRadius::bottom_left(Val2::all(px(4.0))),
             ..default()
         },
         BackgroundColor(Color::srgba(0.10, 0.10, 0.10, 0.8)),
@@ -356,7 +356,7 @@ fn setup_many_lights(
             position_type: PositionType::Absolute,
             right: px(0.0),
             padding: px(4.0).all(),
-            border_radius: BorderRadius::bottom_left(px(4.0)),
+            border_radius: BorderRadius::bottom_left(Val2::all(px(4.0))),
             ..default()
         },
         BackgroundColor(Color::srgba(0.10, 0.10, 0.10, 0.8)),

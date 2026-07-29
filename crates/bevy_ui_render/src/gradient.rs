@@ -1,35 +1,41 @@
 use core::{
     f32::consts::{FRAC_PI_2, TAU},
     hash::Hash,
-    ops::Range,
 };
 
 use super::shader_flags::BORDER_ALL;
+use crate::retained::{
+    batch_retained_ui, remove_owner, vertex_storage_supported, RemovedUiNode, RetainedBatchItem,
+    RetainedUiBatch, UiInstanceArena,
+};
 use crate::*;
 use bevy_asset::*;
 use bevy_color::{ColorToComponents, Hsla, Hsva, LinearRgba, Oklaba, Oklcha, Srgba};
 use bevy_ecs::{
-    prelude::Component,
+    entity::EntityHashMap,
     system::{
         lifetimeless::{Read, SRes},
         *,
     },
 };
+use bevy_math::Affine2;
 use bevy_math::{
     ops::{cos, sin},
     FloatOrd, Rect, Vec2,
 };
-use bevy_math::{Affine2, Vec2Swizzles};
 use bevy_mesh::VertexBufferLayout;
 use bevy_render::{
+    impl_atomic_pod,
     render_phase::*,
-    render_resource::{binding_types::uniform_buffer, *},
+    render_resource::{
+        binding_types::{storage_buffer_read_only_sized, uniform_buffer},
+        *,
+    },
     renderer::{RenderDevice, RenderQueue},
-    sync_world::TemporaryRenderEntity,
     view::*,
     Extract, ExtractSchedule, Render, RenderSystems,
 };
-use bevy_render::{sync_world::MainEntity, GpuResourceAppExt, RenderStartup};
+use bevy_render::{GpuResourceAppExt, RenderStartup};
 use bevy_shader::Shader;
 use bevy_sprite::BorderRect;
 use bevy_ui::{
@@ -50,7 +56,6 @@ impl Plugin for GradientPlugin {
             render_app
                 .add_render_command::<TransparentUi, DrawGradientFns>()
                 .init_resource::<ExtractedGradients>()
-                .init_resource::<ExtractedColorStops>()
                 .init_gpu_resource::<GradientMeta>()
                 .init_gpu_resource::<SpecializedRenderPipelines<GradientPipeline>>()
                 .add_systems(RenderStartup, init_gradient_pipeline)
@@ -71,24 +76,65 @@ impl Plugin for GradientPlugin {
     }
 }
 
-#[derive(Component)]
-pub struct GradientBatch {
-    pub range: Range<u32>,
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct GradientStyleInstance {
+    flags_and_padding: [u32; 4],
+    radius: [[f32; 4]; 2],
+    border: [f32; 4],
+    gradient: [f32; 4],
+    start_color: [f32; 4],
+    end_color: [f32; 4],
+    params: [f32; 4],
+}
+
+impl_atomic_pod!(GradientStyleInstance, GradientStyleInstanceBlob);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GradientCameraState {
+    retained_view_entity: RetainedViewEntity,
+    target_format: TextureFormat,
+    anti_alias: bool,
+    storage_buffers: bool,
 }
 
 #[derive(Resource)]
 pub struct GradientMeta {
-    vertices: RawBufferVec<UiGradientVertex>,
-    indices: RawBufferVec<u32>,
+    geometry_instances: AtomicSparseBufferVec<UiGeometryInstance>,
+    style_instances: AtomicSparseBufferVec<GradientStyleInstance>,
+    instance_indices: RawBufferVec<u32>,
     view_bind_group: Option<BindGroup>,
+    instance_bind_group: Option<BindGroup>,
+    instance_buffer_ids: Option<(BufferId, BufferId)>,
+    batches: Vec<RetainedUiBatch<CachedRenderPipelineId>>,
+    arena: UiInstanceArena,
+    scratch: Vec<(UiGeometryInstance, GradientStyleInstance)>,
+    camera_states: EntityHashMap<GradientCameraState>,
+    use_storage_buffers: bool,
 }
 
 impl Default for GradientMeta {
     fn default() -> Self {
         Self {
-            vertices: RawBufferVec::new(BufferUsages::VERTEX),
-            indices: RawBufferVec::new(BufferUsages::INDEX),
+            geometry_instances: AtomicSparseBufferVec::new(
+                BufferUsages::VERTEX | BufferUsages::STORAGE,
+                0,
+                "gradient geometry instances".into(),
+            ),
+            style_instances: AtomicSparseBufferVec::new(
+                BufferUsages::VERTEX | BufferUsages::STORAGE,
+                0,
+                "gradient style instances".into(),
+            ),
+            instance_indices: RawBufferVec::new(BufferUsages::VERTEX),
             view_bind_group: None,
+            instance_bind_group: None,
+            instance_buffer_ids: None,
+            batches: Vec::new(),
+            arena: UiInstanceArena::default(),
+            scratch: Vec::new(),
+            camera_states: EntityHashMap::default(),
+            use_storage_buffers: false,
         }
     }
 }
@@ -96,6 +142,7 @@ impl Default for GradientMeta {
 #[derive(Resource)]
 pub struct GradientPipeline {
     pub view_layout: BindGroupLayoutDescriptor,
+    pub instance_layout: BindGroupLayoutDescriptor,
     pub shader: Handle<Shader>,
 }
 
@@ -107,9 +154,20 @@ pub fn init_gradient_pipeline(mut commands: Commands, asset_server: Res<AssetSer
             uniform_buffer::<ViewUniform>(true),
         ),
     );
+    let instance_layout = BindGroupLayoutDescriptor::new(
+        "ui_gradient_instance_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::VERTEX,
+            (
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+            ),
+        ),
+    );
 
     commands.insert_resource(GradientPipeline {
         view_layout,
+        instance_layout,
         shader: load_embedded_asset!(asset_server.as_ref(), "gradient.wgsl"),
     });
 }
@@ -139,45 +197,21 @@ pub struct UiGradientPipelineKey {
     anti_alias: bool,
     color_space: InterpolationColorSpace,
     pub target_format: TextureFormat,
+    storage_buffers: bool,
 }
 
 impl SpecializedRenderPipeline for GradientPipeline {
     type Key = UiGradientPipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
-        let vertex_layout = VertexBufferLayout::from_vertex_formats(
-            VertexStepMode::Vertex,
-            vec![
-                // position
-                VertexFormat::Float32x3,
-                // uv
-                VertexFormat::Float32x2,
-                // flags
-                VertexFormat::Uint32,
-                // radius
-                VertexFormat::Float32x4,
-                // border
-                VertexFormat::Float32x4,
-                // size
-                VertexFormat::Float32x2,
-                // point
-                VertexFormat::Float32x2,
-                // start_point
-                VertexFormat::Float32x2,
-                // dir
-                VertexFormat::Float32x2,
-                // start_color
-                VertexFormat::Float32x4,
-                // start_len
-                VertexFormat::Float32,
-                // end_len
-                VertexFormat::Float32,
-                // end color
-                VertexFormat::Float32x4,
-                // hint
-                VertexFormat::Float32,
-            ],
-        );
+        let buffers = if key.storage_buffers {
+            vec![VertexBufferLayout::from_vertex_formats(
+                VertexStepMode::Instance,
+                vec![VertexFormat::Uint32],
+            )]
+        } else {
+            vec![ui_geometry_vertex_layout(), gradient_style_vertex_layout()]
+        };
         let color_space = match key.color_space {
             InterpolationColorSpace::Oklaba => "IN_OKLAB",
             InterpolationColorSpace::Oklcha => "IN_OKLCH",
@@ -190,17 +224,22 @@ impl SpecializedRenderPipeline for GradientPipeline {
             InterpolationColorSpace::HsvaLong => "IN_HSV_LONG",
         };
 
-        let shader_defs = if key.anti_alias {
+        let mut shader_defs = if key.anti_alias {
             vec![color_space.into(), "ANTI_ALIAS".into()]
         } else {
             vec![color_space.into()]
         };
+        let mut layout = vec![self.view_layout.clone()];
+        if key.storage_buffers {
+            shader_defs.push("UI_STORAGE_INSTANCE".into());
+            layout.push(self.instance_layout.clone());
+        }
 
         RenderPipelineDescriptor {
             vertex: VertexState {
                 shader: self.shader.clone(),
                 shader_defs: shader_defs.clone(),
-                buffers: vec![vertex_layout],
+                buffers,
                 ..default()
             },
             fragment: Some(FragmentState {
@@ -213,11 +252,28 @@ impl SpecializedRenderPipeline for GradientPipeline {
                 })],
                 ..default()
             }),
-            layout: vec![self.view_layout.clone()],
+            layout,
             label: Some("ui_gradient_pipeline".into()),
             ..default()
         }
     }
+}
+
+fn gradient_style_vertex_layout() -> VertexBufferLayout {
+    VertexBufferLayout::from_vertex_formats(
+        VertexStepMode::Instance,
+        vec![
+            VertexFormat::Uint32x4,
+            VertexFormat::Float32x4,
+            VertexFormat::Float32x4,
+            VertexFormat::Float32x4,
+            VertexFormat::Float32x4,
+            VertexFormat::Float32x4,
+            VertexFormat::Float32x4,
+            VertexFormat::Float32x4,
+        ],
+    )
+    .offset_locations_by(8)
 }
 
 pub enum ResolvedGradient {
@@ -231,12 +287,8 @@ pub struct ExtractedGradient {
     pub transform: Affine2,
     pub rect: Rect,
     pub clip: Option<Rect>,
-    pub extracted_camera_entity: Entity,
-    /// range into `ExtractedColorStops`
-    pub stops_range: Range<usize>,
+    pub stops: Vec<(LinearRgba, f32, f32)>,
     pub node_type: NodeType,
-    pub main_entity: MainEntity,
-    pub render_entity: Entity,
     /// Border radius of the UI node.
     /// Ordering: top left, top right, bottom right, bottom left.
     pub border_radius: ResolvedBorderRadius,
@@ -247,13 +299,17 @@ pub struct ExtractedGradient {
     pub color_space: InterpolationColorSpace,
 }
 
+/// A render-world resource that stores all gradients in the scene.
 #[derive(Resource, Default)]
 pub struct ExtractedGradients {
-    pub items: Vec<ExtractedGradient>,
+    /// The list of gradients grouped by their main-world entity, along with each group's target camera entity.
+    ///
+    /// This is a two-level data structure so that we can quickly remove all
+    /// gradients associated with a main-world entity when it changes.
+    pub items: MainEntityHashMap<(Entity, EntityIndexMap<ExtractedGradient>)>,
+    pub changed: MainEntityHashSet,
+    removed: Vec<RemovedUiNode>,
 }
-
-#[derive(Resource, Default)]
-pub struct ExtractedColorStops(pub Vec<(LinearRgba, f32, f32)>);
 
 // Interpolate implicit stops (where position is `f32::NAN`)
 // If the first and last stops are implicit set them to the `min` and `max` values
@@ -295,8 +351,9 @@ fn compute_color_stops(
     length: f32,
     target_size: Vec2,
     scratch: &mut Vec<(LinearRgba, f32, f32)>,
-    extracted_color_stops: &mut Vec<(LinearRgba, f32, f32)>,
-) {
+) -> Vec<(LinearRgba, f32, f32)> {
+    let mut extracted_color_stops = vec![];
+
     // resolve the physical distances of explicit stops and sort them
     scratch.extend(stops.iter().filter_map(|stop| {
         stop.point
@@ -321,8 +378,6 @@ fn compute_color_stops(
 
     let mut sorted_stops_drain = scratch.drain(..);
 
-    let range_start = extracted_color_stops.len();
-
     // Fill the extracted color stops buffer
     extracted_color_stops.extend(stops.iter().map(|stop| {
         if stop.point == Val::Auto {
@@ -332,29 +387,67 @@ fn compute_color_stops(
         }
     }));
 
-    interpolate_color_stops(&mut extracted_color_stops[range_start..], min, max);
+    interpolate_color_stops(&mut extracted_color_stops, min, max);
+
+    extracted_color_stops
 }
 
 pub fn extract_gradients(
     mut commands: Commands,
     mut extracted_gradients: ResMut<ExtractedGradients>,
-    mut extracted_color_stops: ResMut<ExtractedColorStops>,
-    mut extracted_uinodes: ResMut<ExtractedUiNodes>,
     gradients_query: Extract<
-        Query<(
-            Entity,
-            &ComputedNode,
-            &ComputedStackIndex,
-            &ComputedUiTargetCamera,
-            &ComputedUiRenderTargetInfo,
-            &UiGlobalTransform,
-            &InheritedVisibility,
-            Option<&CalculatedClip>,
-            AnyOf<(&BackgroundGradient, &BorderGradient)>,
-        )>,
+        Query<
+            (
+                Entity,
+                &ComputedNode,
+                &ComputedStackIndex,
+                &ComputedUiTargetCamera,
+                &ComputedUiRenderTargetInfo,
+                &UiGlobalTransform,
+                &InheritedVisibility,
+                Option<&CalculatedClip>,
+                AnyOf<(&BackgroundGradient, &BorderGradient)>,
+            ),
+            Or<(
+                Changed<ComputedNode>,
+                Changed<ComputedStackIndex>,
+                Changed<ComputedUiTargetCamera>,
+                Changed<ComputedUiRenderTargetInfo>,
+                Changed<UiGlobalTransform>,
+                Changed<InheritedVisibility>,
+                Changed<CalculatedClip>,
+                Changed<BackgroundGradient>,
+                Changed<BorderGradient>,
+            )>,
+        >,
     >,
+    (
+        mut removed_computed_node_query,
+        mut removed_computed_stack_index_query,
+        mut removed_computed_ui_target_camera_query,
+        mut removed_computed_ui_render_target_info_query,
+        mut removed_ui_global_transform_query,
+        mut removed_inherited_visibility_query,
+        mut removed_calculated_clip_query,
+        mut removed_background_gradient_query,
+        mut removed_border_gradient_query,
+    ): (
+        Extract<RemovedComponents<ComputedNode>>,
+        Extract<RemovedComponents<ComputedStackIndex>>,
+        Extract<RemovedComponents<ComputedUiTargetCamera>>,
+        Extract<RemovedComponents<ComputedUiRenderTargetInfo>>,
+        Extract<RemovedComponents<UiGlobalTransform>>,
+        Extract<RemovedComponents<InheritedVisibility>>,
+        Extract<RemovedComponents<CalculatedClip>>,
+        Extract<RemovedComponents<BackgroundGradient>>,
+        Extract<RemovedComponents<BorderGradient>>,
+    ),
     camera_map: Extract<UiCameraMap>,
+    mut nodes_processed_this_frame: Local<MainEntityHashSet>,
 ) {
+    nodes_processed_this_frame.clear();
+    extracted_gradients.changed.clear();
+    extracted_gradients.removed.clear();
     let mut camera_mapper = camera_map.get_mapper();
     let mut sorted_stops = vec![];
 
@@ -370,6 +463,19 @@ pub fn extract_gradients(
         (gradient, gradient_border),
     ) in &gradients_query
     {
+        let main_entity = MainEntity::from(entity);
+        extracted_gradients.changed.insert(main_entity);
+
+        // If there were any previous gradients for this entity, despawn them.
+        let extracted = &mut *extracted_gradients;
+        if let Some((_, old_gradients)) =
+            remove_owner(&mut extracted.items, main_entity, &mut extracted.removed)
+        {
+            for render_entity in old_gradients.keys() {
+                commands.entity(*render_entity).despawn();
+            }
+        }
+
         // Skip invisible images
         if !inherited_visibility.get() {
             continue;
@@ -378,7 +484,6 @@ pub fn extract_gradients(
         let Some(extracted_camera_entity) = camera_mapper.map(camera) else {
             continue;
         };
-
         for (gradients, node_type) in [
             (gradient.map(|g| &g.0), NodeType::Rect),
             (gradient_border.map(|g| &g.0), NodeType::Border(BORDER_ALL)),
@@ -390,34 +495,45 @@ pub fn extract_gradients(
                 if gradient.is_empty() {
                     continue;
                 }
+
+                nodes_processed_this_frame.insert(main_entity);
+
                 if let Some(color) = gradient.get_single() {
                     // With a single color stop there's no gradient, fill the node with the color
-                    extracted_uinodes.uinodes.push(ExtractedUiNode {
-                        z_order: stack_index.0 as f32
-                            + match node_type {
-                                NodeType::Rect | NodeType::Inverted => stack_z_offsets::GRADIENT,
-                                NodeType::Border(_) => stack_z_offsets::BORDER_GRADIENT,
+                    let length = compute_gradient_line_length(0.0, uinode.size);
+                    let extracted_stops = compute_color_stops(
+                        &[
+                            ColorStop::new(color, Val::Percent(0.0)),
+                            ColorStop::new(color, Val::Percent(100.0)),
+                        ],
+                        target.scale_factor(),
+                        length,
+                        target.physical_size().as_vec2(),
+                        &mut sorted_stops,
+                    );
+                    extracted_gradients
+                        .items
+                        .entry(main_entity)
+                        .or_insert_with(|| (extracted_camera_entity, Default::default()))
+                        .1
+                        .insert(
+                            commands.spawn_empty().id(),
+                            ExtractedGradient {
+                                stack_index: stack_index.0,
+                                transform: transform.into(),
+                                stops: extracted_stops,
+                                rect: Rect {
+                                    min: Vec2::ZERO,
+                                    max: uinode.size,
+                                },
+                                clip: clip.map(|clip| clip.clip),
+                                node_type,
+                                border_radius: uinode.border_radius,
+                                border: uinode.border,
+                                resolved_gradient: ResolvedGradient::Linear { angle: 0.0 },
+                                color_space: gradient.get_color_space(),
                             },
-                        image: AssetId::default(),
-                        clip: clip.map(|clip| clip.clip),
-                        extracted_camera_entity,
-                        transform: transform.into(),
-                        item: ExtractedUiItem::Node {
-                            color: color.into(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            atlas_scaling: None,
-                            flip_x: false,
-                            flip_y: false,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            node_type,
-                        },
-                        main_entity: entity.into(),
-                        render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                    });
+                        );
                     continue;
                 }
                 match gradient {
@@ -428,35 +544,37 @@ pub fn extract_gradients(
                     }) => {
                         let length = compute_gradient_line_length(*angle, uinode.size);
 
-                        let range_start = extracted_color_stops.0.len();
-
-                        compute_color_stops(
+                        let extracted_stops = compute_color_stops(
                             stops,
                             target.scale_factor(),
                             length,
                             target.physical_size().as_vec2(),
                             &mut sorted_stops,
-                            &mut extracted_color_stops.0,
                         );
 
-                        extracted_gradients.items.push(ExtractedGradient {
-                            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                            stack_index: stack_index.0,
-                            transform: transform.into(),
-                            stops_range: range_start..extracted_color_stops.0.len(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            clip: clip.map(|clip| clip.clip),
-                            extracted_camera_entity,
-                            main_entity: entity.into(),
-                            node_type,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            resolved_gradient: ResolvedGradient::Linear { angle: *angle },
-                            color_space: *color_space,
-                        });
+                        extracted_gradients
+                            .items
+                            .entry(main_entity)
+                            .or_insert_with(|| (extracted_camera_entity, Default::default()))
+                            .1
+                            .insert(
+                                commands.spawn_empty().id(),
+                                ExtractedGradient {
+                                    stack_index: stack_index.0,
+                                    transform: transform.into(),
+                                    stops: extracted_stops,
+                                    rect: Rect {
+                                        min: Vec2::ZERO,
+                                        max: uinode.size,
+                                    },
+                                    clip: clip.map(|clip| clip.clip),
+                                    node_type,
+                                    border_radius: uinode.border_radius,
+                                    border: uinode.border,
+                                    resolved_gradient: ResolvedGradient::Linear { angle: *angle },
+                                    color_space: *color_space,
+                                },
+                            );
                     }
                     Gradient::Radial(RadialGradient {
                         color_space,
@@ -479,34 +597,37 @@ pub fn extract_gradients(
 
                         let length = size.x;
 
-                        let range_start = extracted_color_stops.0.len();
-                        compute_color_stops(
+                        let computed_stops = compute_color_stops(
                             stops,
                             target.scale_factor(),
                             length,
                             target.physical_size().as_vec2(),
                             &mut sorted_stops,
-                            &mut extracted_color_stops.0,
                         );
 
-                        extracted_gradients.items.push(ExtractedGradient {
-                            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                            stack_index: stack_index.0,
-                            transform: transform.into(),
-                            stops_range: range_start..extracted_color_stops.0.len(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            clip: clip.map(|clip| clip.clip),
-                            extracted_camera_entity,
-                            main_entity: entity.into(),
-                            node_type,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            resolved_gradient: ResolvedGradient::Radial { center: c, size },
-                            color_space: *color_space,
-                        });
+                        extracted_gradients
+                            .items
+                            .entry(main_entity)
+                            .or_insert_with(|| (extracted_camera_entity, Default::default()))
+                            .1
+                            .insert(
+                                commands.spawn_empty().id(),
+                                ExtractedGradient {
+                                    stack_index: stack_index.0,
+                                    transform: transform.into(),
+                                    stops: computed_stops,
+                                    rect: Rect {
+                                        min: Vec2::ZERO,
+                                        max: uinode.size,
+                                    },
+                                    clip: clip.map(|clip| clip.clip),
+                                    node_type,
+                                    border_radius: uinode.border_radius,
+                                    border: uinode.border,
+                                    resolved_gradient: ResolvedGradient::Radial { center: c, size },
+                                    color_space: *color_space,
+                                },
+                            );
                     }
                     Gradient::Conic(ConicGradient {
                         color_space,
@@ -519,7 +640,6 @@ pub fn extract_gradients(
                             uinode.size,
                             target.physical_size().as_vec2(),
                         );
-                        let range_start = extracted_color_stops.0.len();
 
                         // sort the explicit stops
                         sorted_stops.extend(stops.iter().filter_map(|stop| {
@@ -531,125 +651,80 @@ pub fn extract_gradients(
                         let mut sorted_stops_drain = sorted_stops.drain(..);
 
                         // fill the extracted stops buffer
-                        extracted_color_stops.0.extend(stops.iter().map(|stop| {
-                            if stop.angle.is_none() {
-                                (stop.color.to_linear(), f32::NAN, stop.hint)
-                            } else {
-                                sorted_stops_drain.next().unwrap()
-                            }
-                        }));
+                        let mut extracted_color_stops: Vec<_> = stops
+                            .iter()
+                            .map(|stop| {
+                                if stop.angle.is_none() {
+                                    (stop.color.to_linear(), f32::NAN, stop.hint)
+                                } else {
+                                    sorted_stops_drain.next().unwrap()
+                                }
+                            })
+                            .collect();
 
-                        interpolate_color_stops(
-                            &mut extracted_color_stops.0[range_start..],
-                            0.,
-                            TAU,
-                        );
+                        interpolate_color_stops(&mut extracted_color_stops, 0., TAU);
 
-                        extracted_gradients.items.push(ExtractedGradient {
-                            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                            stack_index: stack_index.0,
-                            transform: transform.into(),
-                            stops_range: range_start..extracted_color_stops.0.len(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            clip: clip.map(|clip| clip.clip),
-                            extracted_camera_entity,
-                            main_entity: entity.into(),
-                            node_type,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            resolved_gradient: ResolvedGradient::Conic {
-                                start: *start,
-                                center: g_start,
-                            },
-                            color_space: *color_space,
-                        });
+                        extracted_gradients
+                            .items
+                            .entry(main_entity)
+                            .or_insert_with(|| (extracted_camera_entity, Default::default()))
+                            .1
+                            .insert(
+                                commands.spawn_empty().id(),
+                                ExtractedGradient {
+                                    stack_index: stack_index.0,
+                                    transform: transform.into(),
+                                    stops: extracted_color_stops,
+                                    rect: Rect {
+                                        min: Vec2::ZERO,
+                                        max: uinode.size,
+                                    },
+                                    clip: clip.map(|clip| clip.clip),
+                                    node_type,
+                                    border_radius: uinode.border_radius,
+                                    border: uinode.border,
+                                    resolved_gradient: ResolvedGradient::Conic {
+                                        start: *start,
+                                        center: g_start,
+                                    },
+                                    color_space: *color_space,
+                                },
+                            );
                     }
                 }
             }
         }
     }
-}
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "it's a system that needs a lot of them"
-)]
-pub fn queue_gradient(
-    extracted_gradients: ResMut<ExtractedGradients>,
-    gradients_pipeline: Res<GradientPipeline>,
-    mut pipelines: ResMut<SpecializedRenderPipelines<GradientPipeline>>,
-    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
-    camera_views: Query<&ExtractedView>,
-    pipeline_cache: Res<PipelineCache>,
-    draw_functions: Res<DrawFunctions<TransparentUi>>,
-) {
-    let draw_function = draw_functions.read().id::<DrawGradientFns>();
-    for (index, gradient) in extracted_gradients.items.iter().enumerate() {
-        let Ok((default_camera_view, ui_anti_alias)) =
-            render_views.get_mut(gradient.extracted_camera_entity)
+    // Only remove the render-world data if we didn't handle the node above.
+    // It's possible that a relevant component was removed and added in the same
+    // frame.
+    for main_entity in removed_computed_node_query
+        .read()
+        .chain(removed_computed_stack_index_query.read())
+        .chain(removed_computed_ui_target_camera_query.read())
+        .chain(removed_computed_ui_render_target_info_query.read())
+        .chain(removed_ui_global_transform_query.read())
+        .chain(removed_inherited_visibility_query.read())
+        .chain(removed_calculated_clip_query.read())
+        .chain(removed_background_gradient_query.read())
+        .chain(removed_border_gradient_query.read())
+    {
+        let main_entity = MainEntity::from(main_entity);
+        if nodes_processed_this_frame.contains(&main_entity) {
+            continue;
+        }
+        extracted_gradients.changed.insert(main_entity);
+        let extracted = &mut *extracted_gradients;
+        let Some((_, extracted_nodes)) =
+            remove_owner(&mut extracted.items, main_entity, &mut extracted.removed)
         else {
             continue;
         };
-
-        let Ok(view) = camera_views.get(default_camera_view.0) else {
-            continue;
-        };
-
-        let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
-        else {
-            continue;
-        };
-
-        let pipeline = pipelines.specialize(
-            &pipeline_cache,
-            &gradients_pipeline,
-            UiGradientPipelineKey {
-                anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
-                color_space: gradient.color_space,
-                target_format: view.target_format,
-            },
-        );
-
-        transparent_phase.add_transient(TransparentUi {
-            draw_function,
-            pipeline,
-            entity: (gradient.render_entity, gradient.main_entity),
-            sort_key: FloatOrd(
-                gradient.stack_index as f32
-                    + match gradient.node_type {
-                        NodeType::Rect | NodeType::Inverted => stack_z_offsets::GRADIENT,
-                        NodeType::Border(_) => stack_z_offsets::BORDER_GRADIENT,
-                    },
-            ),
-            batch_range: 0..0,
-            extra_index: PhaseItemExtraIndex::None,
-            index,
-            indexed: true,
-        });
+        for render_entity in extracted_nodes.keys() {
+            commands.entity(*render_entity).despawn();
+        }
     }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-struct UiGradientVertex {
-    position: [f32; 3],
-    uv: [f32; 2],
-    flags: u32,
-    radius: [f32; 4],
-    border: [f32; 4],
-    size: [f32; 2],
-    point: [f32; 2],
-    g_start: [f32; 2],
-    g_dir: [f32; 2],
-    start_color: [f32; 4],
-    start_len: f32,
-    end_len: f32,
-    end_color: [f32; 4],
-    hint: f32,
 }
 
 fn convert_color_to_space(color: LinearRgba, space: InterpolationColorSpace) -> [f32; 4] {
@@ -686,232 +761,376 @@ fn convert_color_to_space(color: LinearRgba, space: InterpolationColorSpace) -> 
     }
 }
 
+pub fn queue_gradient(
+    extracted_gradients: Res<ExtractedGradients>,
+    gradient_pipeline: Res<GradientPipeline>,
+    mut gradient_meta: ResMut<GradientMeta>,
+    mut pipelines: ResMut<SpecializedRenderPipelines<GradientPipeline>>,
+    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
+    render_views: Query<(Entity, &UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
+    camera_views: Query<&ExtractedView>,
+    pipeline_cache: Res<PipelineCache>,
+    draw_functions: Res<DrawFunctions<TransparentUi>>,
+    render_device: Res<RenderDevice>,
+) {
+    let draw_function = draw_functions.read().id::<DrawGradientFns>();
+    let storage_buffers = vertex_storage_supported(&render_device, 2);
+    let mut active_cameras = HashSet::new();
+    let mut invalidated_cameras = HashSet::new();
+
+    for (camera_entity, ui_camera_view, ui_anti_alias) in &render_views {
+        let Ok(view) = camera_views.get(ui_camera_view.0) else {
+            continue;
+        };
+        let state = GradientCameraState {
+            retained_view_entity: view.retained_view_entity,
+            target_format: view.target_format,
+            anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
+            storage_buffers,
+        };
+        active_cameras.insert(camera_entity);
+        if gradient_meta.camera_states.insert(camera_entity, state) != Some(state) {
+            invalidated_cameras.insert(camera_entity);
+        }
+    }
+
+    for removed in &extracted_gradients.removed {
+        let Some(camera_state) = gradient_meta.camera_states.get(&removed.camera_entity) else {
+            continue;
+        };
+        if let Some(phase) = transparent_render_phases.get_mut(&camera_state.retained_view_entity) {
+            phase.remove(removed.render_entity, removed.main_entity);
+        }
+    }
+
+    let mut dirty = extracted_gradients.changed.clone();
+    if !invalidated_cameras.is_empty() {
+        dirty.extend(extracted_gradients.items.iter().filter_map(
+            |(main_entity, (camera_entity, _))| {
+                invalidated_cameras
+                    .contains(camera_entity)
+                    .then_some(*main_entity)
+            },
+        ));
+    }
+
+    for main_entity in dirty {
+        let Some((camera_entity, gradients)) = extracted_gradients.items.get(&main_entity) else {
+            continue;
+        };
+        let Some(camera_state) = gradient_meta.camera_states.get(camera_entity) else {
+            continue;
+        };
+        let Some(phase) = transparent_render_phases.get_mut(&camera_state.retained_view_entity)
+        else {
+            continue;
+        };
+        for (render_entity, gradient) in gradients {
+            let pipeline = pipelines.specialize(
+                &pipeline_cache,
+                &gradient_pipeline,
+                UiGradientPipelineKey {
+                    anti_alias: camera_state.anti_alias,
+                    color_space: gradient.color_space,
+                    target_format: camera_state.target_format,
+                    storage_buffers: camera_state.storage_buffers,
+                },
+            );
+            phase.add_retained(TransparentUi {
+                draw_function,
+                pipeline,
+                entity: (*render_entity, main_entity),
+                sort_key: FloatOrd(
+                    gradient.stack_index as f32
+                        + match gradient.node_type {
+                            NodeType::Border(_) => stack_z_offsets::BORDER_GRADIENT,
+                            _ => stack_z_offsets::GRADIENT,
+                        },
+                ),
+                batch_range: 0..0,
+                extra_index: PhaseItemExtraIndex::None,
+                indexed: false,
+                batch_index: None,
+            });
+        }
+    }
+    gradient_meta
+        .camera_states
+        .retain(|camera, _| active_cameras.contains(camera));
+}
+
+fn generate_gradient_instances(
+    gradient: &ExtractedGradient,
+    scratch: &mut Vec<(UiGeometryInstance, GradientStyleInstance)>,
+) {
+    scratch.clear();
+    let size = gradient.rect.size();
+    let (position_diff, culled) =
+        clipping_offsets(gradient.transform, Vec2::ZERO, size, gradient.clip);
+    if culled {
+        return;
+    }
+    let (position_diff_01, position_diff_23) = pack_corners(position_diff);
+    let (uv_01, uv_23) = pack_corners([Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y]);
+    let geometry = UiGeometryInstance {
+        transform_x: gradient.transform.x_axis.into(),
+        transform_y: gradient.transform.y_axis.into(),
+        translation: gradient.transform.translation.into(),
+        size: size.into(),
+        position_diff_01,
+        position_diff_23,
+        uv_01,
+        uv_23,
+    };
+    let corner_points = QUAD_VERTEX_POSITIONS.map(|position| position * size);
+    let mut flags = match gradient.node_type {
+        NodeType::Border(borders) => borders,
+        _ => 0,
+    };
+    let (g_start, g_dir, gradient_flags) = match gradient.resolved_gradient {
+        ResolvedGradient::Linear { angle } => {
+            let corner_index = (angle - FRAC_PI_2).rem_euclid(TAU) / FRAC_PI_2;
+            (
+                corner_points[corner_index as usize],
+                Vec2::new(sin(angle), -cos(angle)),
+                0,
+            )
+        }
+        ResolvedGradient::Conic { center, start } => {
+            (center, Vec2::new(start, 0.0), shader_flags::CONIC)
+        }
+        ResolvedGradient::Radial { center, size } => (
+            center,
+            Vec2::splat(if size.y != 0.0 { size.x / size.y } else { 1.0 }),
+            shader_flags::RADIAL,
+        ),
+    };
+    flags |= gradient_flags;
+
+    let mut segment_count = 0;
+    for stop_index in 0..gradient.stops.len() - 1 {
+        let mut start_stop = gradient.stops[stop_index];
+        let end_stop = gradient.stops[stop_index + 1];
+        if start_stop.1 == end_stop.1 {
+            if stop_index == gradient.stops.len() - 2 {
+                if segment_count > 0 {
+                    start_stop.0 = LinearRgba::NONE;
+                }
+            } else {
+                continue;
+            }
+        }
+        let mut stop_flags = flags;
+        if start_stop.1 > 0.0 && (stop_index == 0 || segment_count == 0) {
+            stop_flags |= shader_flags::FILL_START;
+        }
+        if stop_index == gradient.stops.len() - 2 {
+            stop_flags |= shader_flags::FILL_END;
+        }
+        scratch.push((
+            geometry,
+            GradientStyleInstance {
+                flags_and_padding: [stop_flags, 0, 0, 0],
+                radius: gradient.border_radius.into(),
+                border: [
+                    gradient.border.min_inset.x,
+                    gradient.border.min_inset.y,
+                    gradient.border.max_inset.x,
+                    gradient.border.max_inset.y,
+                ],
+                gradient: [g_start.x, g_start.y, g_dir.x, g_dir.y],
+                start_color: convert_color_to_space(start_stop.0, gradient.color_space),
+                end_color: convert_color_to_space(end_stop.0, gradient.color_space),
+                params: [start_stop.1, end_stop.1, start_stop.2, 0.0],
+            },
+        ));
+        segment_count += 1;
+    }
+}
+
+fn rebuild_gradient_owner(
+    main_entity: MainEntity,
+    meta: &mut GradientMeta,
+    extracted_gradients: &ExtractedGradients,
+) {
+    meta.arena.free_owner(main_entity);
+    let Some((_, gradients)) = extracted_gradients.items.get(&main_entity) else {
+        return;
+    };
+    let mut owned = Vec::with_capacity(gradients.len());
+    for (render_entity, gradient) in gradients {
+        generate_gradient_instances(gradient, &mut meta.scratch);
+        if meta.scratch.is_empty() {
+            meta.arena.insert_empty(*render_entity);
+        } else {
+            let count = u32::try_from(meta.scratch.len()).expect("too many gradient segments");
+            let (start, capacity) = meta.arena.alloc(count);
+            meta.geometry_instances.grow(start + capacity);
+            meta.style_instances.grow(start + capacity);
+            for (offset, (geometry, style)) in meta.scratch.iter().copied().enumerate() {
+                let index = start + offset as u32;
+                meta.geometry_instances.set(index, geometry);
+                meta.style_instances.set(index, style);
+            }
+            meta.arena.insert(*render_entity, start, count, capacity);
+        }
+        owned.push(*render_entity);
+    }
+    if !owned.is_empty() {
+        meta.arena.owners.insert(main_entity, owned);
+    }
+}
+
 pub fn prepare_gradient(
-    mut commands: Commands,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
-    mut ui_meta: ResMut<GradientMeta>,
-    mut extracted_gradients: ResMut<ExtractedGradients>,
-    mut extracted_color_stops: ResMut<ExtractedColorStops>,
+    mut meta: ResMut<GradientMeta>,
+    extracted_gradients: Res<ExtractedGradients>,
     view_uniforms: Res<ViewUniforms>,
-    gradients_pipeline: Res<GradientPipeline>,
+    gradient_pipeline: Res<GradientPipeline>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut previous_len: Local<usize>,
+    (
+        mut sparse_buffer_update_jobs,
+        mut sparse_buffer_update_bind_groups,
+        sparse_buffer_update_pipelines,
+    ): (
+        ResMut<SparseBufferUpdateJobs>,
+        ResMut<SparseBufferUpdateBindGroups>,
+        Res<SparseBufferUpdatePipelines>,
+    ),
 ) {
-    if let Some(view_binding) = view_uniforms.uniforms.binding() {
-        let mut batches: Vec<(Entity, GradientBatch)> = Vec::with_capacity(*previous_len);
+    meta.use_storage_buffers = vertex_storage_supported(&render_device, 2);
+    if meta.arena.needs_compaction() || !meta.arena.initialized {
+        meta.arena.reset();
+        meta.geometry_instances.clear();
+        meta.style_instances.clear();
+        for main_entity in extracted_gradients.items.keys().copied() {
+            rebuild_gradient_owner(main_entity, &mut meta, &extracted_gradients);
+        }
+    } else {
+        for main_entity in extracted_gradients.changed.iter().copied() {
+            rebuild_gradient_owner(main_entity, &mut meta, &extracted_gradients);
+        }
+    }
+    meta.geometry_instances
+        .write_buffers(&render_device, &render_queue);
+    meta.style_instances
+        .write_buffers(&render_device, &render_queue);
+    meta.geometry_instances.prepare_to_populate_buffers(
+        &render_device,
+        &pipeline_cache,
+        &mut sparse_buffer_update_jobs,
+        &mut sparse_buffer_update_bind_groups,
+        &sparse_buffer_update_pipelines,
+    );
+    meta.style_instances.prepare_to_populate_buffers(
+        &render_device,
+        &pipeline_cache,
+        &mut sparse_buffer_update_jobs,
+        &mut sparse_buffer_update_bind_groups,
+        &sparse_buffer_update_pipelines,
+    );
 
-        ui_meta.vertices.clear();
-        ui_meta.indices.clear();
-        ui_meta.view_bind_group = Some(render_device.create_bind_group(
-            "gradient_view_bind_group",
-            &pipeline_cache.get_bind_group_layout(&gradients_pipeline.view_layout),
-            &BindGroupEntries::single(view_binding),
-        ));
-
-        // Buffer indexes
-        let mut vertices_index = 0;
-        let mut indices_index = 0;
-
-        for ui_phase in phases.values_mut() {
-            for item_index in 0..ui_phase.items.len() {
-                let item = &mut ui_phase.items[item_index];
-                if let Some(gradient) = extracted_gradients
-                    .items
-                    .get(item.index)
-                    .filter(|n| item.entity() == n.render_entity)
-                {
-                    *item.batch_range_mut() = item_index as u32..item_index as u32 + 1;
-                    let uinode_rect = gradient.rect;
-
-                    let rect_size = uinode_rect.size();
-
-                    // Specify the corners of the node
-                    let positions = QUAD_VERTEX_POSITIONS.map(|pos| {
-                        gradient
-                            .transform
-                            .transform_point2(pos * rect_size)
-                            .extend(0.)
-                    });
-                    let corner_points = QUAD_VERTEX_POSITIONS.map(|pos| pos * rect_size);
-
-                    // Calculate the effect of clipping
-                    // Note: this won't work with rotation/scaling, but that's much more complex (may need more that 2 quads)
-                    let positions_diff = if let Some(clip) = gradient.clip {
-                        [
-                            Vec2::new(
-                                f32::max(clip.min.x - positions[0].x, 0.),
-                                f32::max(clip.min.y - positions[0].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::min(clip.max.x - positions[1].x, 0.),
-                                f32::max(clip.min.y - positions[1].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::min(clip.max.x - positions[2].x, 0.),
-                                f32::min(clip.max.y - positions[2].y, 0.),
-                            ),
-                            Vec2::new(
-                                f32::max(clip.min.x - positions[3].x, 0.),
-                                f32::min(clip.max.y - positions[3].y, 0.),
-                            ),
-                        ]
-                    } else {
-                        [Vec2::ZERO; 4]
-                    };
-
-                    let positions_clipped = [
-                        positions[0] + positions_diff[0].extend(0.),
-                        positions[1] + positions_diff[1].extend(0.),
-                        positions[2] + positions_diff[2].extend(0.),
-                        positions[3] + positions_diff[3].extend(0.),
-                    ];
-
-                    let points = [
-                        corner_points[0] + positions_diff[0],
-                        corner_points[1] + positions_diff[1],
-                        corner_points[2] + positions_diff[2],
-                        corner_points[3] + positions_diff[3],
-                    ];
-
-                    let transformed_rect_size =
-                        gradient.transform.transform_vector2(rect_size).abs();
-
-                    // Don't try to cull nodes that have a rotation
-                    // In a rotation around the Z-axis, this value is 0.0 for an angle of 0.0 or π
-                    // In those two cases, the culling check can proceed normally as corners will be on
-                    // horizontal / vertical lines
-                    // For all other angles, bypass the culling check
-                    // This does not properly handles all rotations on all axis
-                    if gradient.transform.x_axis[1] == 0.0 {
-                        // Cull nodes that are completely clipped
-                        if positions_diff[0].x - positions_diff[1].x >= transformed_rect_size.x
-                            || positions_diff[1].y - positions_diff[2].y >= transformed_rect_size.y
-                        {
-                            continue;
-                        }
-                    }
-
-                    let uvs = { [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y] };
-
-                    let mut flags = if let NodeType::Border(borders) = gradient.node_type {
-                        borders
-                    } else {
-                        0
-                    };
-
-                    let (g_start, g_dir, g_flags) = match gradient.resolved_gradient {
-                        ResolvedGradient::Linear { angle } => {
-                            let corner_index = (angle - FRAC_PI_2).rem_euclid(TAU) / FRAC_PI_2;
-                            (
-                                corner_points[corner_index as usize].into(),
-                                // CSS angles increase in a clockwise direction
-                                [sin(angle), -cos(angle)],
-                                0,
-                            )
-                        }
-                        ResolvedGradient::Conic { center, start } => {
-                            (center.into(), [start, 0.], shader_flags::CONIC)
-                        }
-                        ResolvedGradient::Radial { center, size } => (
-                            center.into(),
-                            Vec2::splat(if size.y != 0. { size.x / size.y } else { 1. }).into(),
-                            shader_flags::RADIAL,
-                        ),
-                    };
-
-                    flags |= g_flags;
-
-                    let range = gradient.stops_range.start..gradient.stops_range.end - 1;
-                    let mut segment_count = 0;
-
-                    for stop_index in range {
-                        let mut start_stop = extracted_color_stops.0[stop_index];
-                        let end_stop = extracted_color_stops.0[stop_index + 1];
-                        if start_stop.1 == end_stop.1 {
-                            if stop_index == gradient.stops_range.end - 2 {
-                                if 0 < segment_count {
-                                    start_stop.0 = LinearRgba::NONE;
-                                }
-                            } else {
-                                continue;
-                            }
-                        }
-                        let start_color =
-                            convert_color_to_space(start_stop.0, gradient.color_space);
-                        let end_color = convert_color_to_space(end_stop.0, gradient.color_space);
-                        let mut stop_flags = flags;
-                        if 0. < start_stop.1
-                            && (stop_index == gradient.stops_range.start || segment_count == 0)
-                        {
-                            stop_flags |= shader_flags::FILL_START;
-                        }
-                        if stop_index == gradient.stops_range.end - 2 {
-                            stop_flags |= shader_flags::FILL_END;
-                        }
-
-                        for i in 0..4 {
-                            ui_meta.vertices.push(UiGradientVertex {
-                                position: positions_clipped[i].into(),
-                                uv: uvs[i].into(),
-                                flags: stop_flags | shader_flags::CORNERS[i],
-                                radius: [
-                                    gradient.border_radius.top_left,
-                                    gradient.border_radius.top_right,
-                                    gradient.border_radius.bottom_right,
-                                    gradient.border_radius.bottom_left,
-                                ],
-                                border: [
-                                    gradient.border.min_inset.x,
-                                    gradient.border.min_inset.y,
-                                    gradient.border.max_inset.x,
-                                    gradient.border.max_inset.y,
-                                ],
-                                size: rect_size.xy().into(),
-                                g_start,
-                                g_dir,
-                                point: points[i].into(),
-                                start_color,
-                                start_len: start_stop.1,
-                                end_len: end_stop.1,
-                                end_color,
-                                hint: start_stop.2,
-                            });
-                        }
-
-                        for &i in &QUAD_INDICES {
-                            ui_meta.indices.push(indices_index + i as u32);
-                        }
-                        indices_index += 4;
-                        segment_count += 1;
-                    }
-
-                    if 0 < segment_count {
-                        let vertices_count = 6 * segment_count;
-
-                        batches.push((
-                            item.entity(),
-                            GradientBatch {
-                                range: vertices_index..(vertices_index + vertices_count),
-                            },
-                        ));
-
-                        vertices_index += vertices_count;
-                    }
+    let Some(view_binding) = view_uniforms.uniforms.binding() else {
+        meta.batches.clear();
+        return;
+    };
+    meta.view_bind_group = Some(render_device.create_bind_group(
+        "gradient_view_bind_group",
+        &pipeline_cache.get_bind_group_layout(&gradient_pipeline.view_layout),
+        &BindGroupEntries::single(view_binding),
+    ));
+    if meta.use_storage_buffers {
+        if let (Some(geometry_buffer), Some(style_buffer)) = (
+            meta.geometry_instances.buffer(),
+            meta.style_instances.buffer(),
+        ) {
+            let ids = (geometry_buffer.id(), style_buffer.id());
+            if meta.instance_buffer_ids != Some(ids) {
+                meta.instance_bind_group = Some(render_device.create_bind_group(
+                    "gradient_instance_bind_group",
+                    &pipeline_cache.get_bind_group_layout(&gradient_pipeline.instance_layout),
+                    &BindGroupEntries::sequential((
+                        geometry_buffer.as_entire_binding(),
+                        style_buffer.as_entire_binding(),
+                    )),
+                ));
+                meta.instance_buffer_ids = Some(ids);
+            }
+        } else {
+            meta.instance_bind_group = None;
+            meta.instance_buffer_ids = None;
+        }
+    }
+    let GradientMeta {
+        arena,
+        instance_indices,
+        use_storage_buffers,
+        ..
+    } = &mut *meta;
+    meta.batches = batch_retained_ui(
+        &mut phases,
+        instance_indices,
+        *use_storage_buffers,
+        |item| {
+            if extracted_gradients
+                .items
+                .get(&item.main_entity())
+                .and_then(|(_, gradients)| gradients.get(&item.entity()))
+                .is_none()
+            {
+                return RetainedBatchItem::NotOwned;
+            }
+            let Some(slot) = arena.slots.get(&item.entity()) else {
+                return RetainedBatchItem::Culled;
+            };
+            if slot.instances.count == 0 {
+                RetainedBatchItem::Culled
+            } else {
+                RetainedBatchItem::Drawable {
+                    instances: slot.instances,
+                    key: item.pipeline,
                 }
             }
-        }
-        ui_meta.vertices.write_buffer(&render_device, &render_queue);
-        ui_meta.indices.write_buffer(&render_device, &render_queue);
-        *previous_len = batches.len();
-        commands.try_insert_batch(batches);
-    }
-    extracted_gradients.items.clear();
-    extracted_color_stops.0.clear();
+        },
+        PartialEq::eq,
+        |_, _| {},
+    );
+    meta.instance_indices
+        .write_buffer(&render_device, &render_queue);
 }
 
-pub type DrawGradientFns = (SetItemPipeline, SetGradientViewBindGroup<0>, DrawGradient);
+pub type DrawGradientFns = (
+    SetItemPipeline,
+    SetGradientViewBindGroup<0>,
+    SetGradientInstanceBindGroup<1>,
+    DrawGradient,
+);
+
+pub struct SetGradientInstanceBindGroup<const I: usize>;
+impl<const I: usize> RenderCommand<TransparentUi> for SetGradientInstanceBindGroup<I> {
+    type Param = SRes<GradientMeta>;
+    type ViewQuery = ();
+    type ItemQuery = ();
+
+    fn render<'w>(
+        _item: &TransparentUi,
+        _view: (),
+        _entity: Option<()>,
+        meta: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        let meta = meta.into_inner();
+        if meta.use_storage_buffers {
+            let Some(bind_group) = meta.instance_bind_group.as_ref() else {
+                return RenderCommandResult::Failure("missing gradient instance bind group");
+            };
+            pass.set_bind_group(I, bind_group, &[]);
+        }
+        RenderCommandResult::Success
+    }
+}
 
 pub struct SetGradientViewBindGroup<const I: usize>;
 impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetGradientViewBindGroup<I> {
@@ -935,36 +1154,156 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetGradientViewBindGroup
 }
 
 pub struct DrawGradient;
-impl<P: PhaseItem> RenderCommand<P> for DrawGradient {
+impl RenderCommand<TransparentUi> for DrawGradient {
     type Param = SRes<GradientMeta>;
     type ViewQuery = ();
-    type ItemQuery = Read<GradientBatch>;
+    type ItemQuery = ();
 
     #[inline]
     fn render<'w>(
-        _item: &P,
+        item: &TransparentUi,
         _view: (),
-        batch: Option<&'w GradientBatch>,
+        _entity: Option<()>,
         ui_meta: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let Some(batch) = batch else {
+        let Some(batch_index) = item.batch_index else {
             return RenderCommandResult::Skip;
         };
-        let ui_meta = ui_meta.into_inner();
-        let Some(vertices) = ui_meta.vertices.buffer() else {
-            return RenderCommandResult::Failure("missing vertices to draw ui");
+        let meta = ui_meta.into_inner();
+        let Some(batch) = meta.batches.get(batch_index as usize) else {
+            return RenderCommandResult::Failure("gradient batch index out of range");
         };
-        let Some(indices) = ui_meta.indices.buffer() else {
-            return RenderCommandResult::Failure("missing indices to draw ui");
-        };
-
-        // Store the vertices
-        pass.set_vertex_buffer(0, vertices.slice(..));
-        // Define how to "connect" the vertices
-        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
-        // Draw the vertices
-        pass.draw_indexed(batch.range.clone(), 0, 0..1);
+        if meta.use_storage_buffers {
+            let Some(indices) = meta.instance_indices.buffer() else {
+                return RenderCommandResult::Failure("missing gradient instance indices");
+            };
+            pass.set_vertex_buffer(0, indices.slice(..));
+        } else {
+            let Some(geometry) = meta.geometry_instances.buffer() else {
+                return RenderCommandResult::Failure("missing gradient geometry instances");
+            };
+            let Some(style) = meta.style_instances.buffer() else {
+                return RenderCommandResult::Failure("missing gradient style instances");
+            };
+            pass.set_vertex_buffer(0, geometry.slice(..));
+            pass.set_vertex_buffer(1, style.slice(..));
+        }
+        pass.draw(0..6, batch.range.clone());
         RenderCommandResult::Success
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use core::mem::{offset_of, size_of};
+
+    use super::*;
+    use crate::retained::{preprocess_wgsl_for_test, validate_wgsl_for_test};
+
+    fn gradient(stops: Vec<(LinearRgba, f32, f32)>) -> ExtractedGradient {
+        ExtractedGradient {
+            stack_index: 0,
+            transform: Affine2::IDENTITY,
+            rect: Rect::from_center_size(Vec2::ZERO, Vec2::new(100.0, 50.0)),
+            clip: None,
+            stops,
+            node_type: NodeType::Rect,
+            border_radius: ResolvedBorderRadius::ZERO,
+            border: BorderRect::ZERO,
+            resolved_gradient: ResolvedGradient::Linear { angle: 0.0 },
+            color_space: InterpolationColorSpace::LinearRgba,
+        }
+    }
+
+    #[test]
+    fn gradient_instance_layout_uses_exactly_the_portable_attribute_budget() {
+        let layout = gradient_style_vertex_layout();
+        assert_eq!(size_of::<GradientStyleInstance>(), 128);
+        assert_eq!(layout.array_stride, 128);
+        assert_eq!(layout.attributes.len(), 8);
+        assert_eq!(
+            layout.attributes[0].offset as usize,
+            offset_of!(GradientStyleInstance, flags_and_padding)
+        );
+        assert_eq!(
+            layout.attributes[7].offset as usize,
+            offset_of!(GradientStyleInstance, params)
+        );
+        assert_eq!(
+            ui_geometry_vertex_layout().attributes.len() + layout.attributes.len(),
+            16
+        );
+    }
+
+    #[test]
+    fn gradient_segments_are_retained_one_instance_per_nonempty_stop_interval() {
+        let red = LinearRgba::RED;
+        let blue = LinearRgba::BLUE;
+        let green = LinearRgba::GREEN;
+        let mut scratch = Vec::new();
+        generate_gradient_instances(
+            &gradient(vec![(red, 0.0, 0.5), (blue, 0.5, 0.25), (green, 1.0, 0.75)]),
+            &mut scratch,
+        );
+        assert_eq!(scratch.len(), 2);
+        assert_eq!(scratch[0].1.start_color, red.to_f32_array());
+        assert_eq!(scratch[0].1.end_color, blue.to_f32_array());
+        assert_eq!(scratch[0].1.params, [0.0, 0.5, 0.5, 0.0]);
+        assert_eq!(scratch[1].1.params, [0.5, 1.0, 0.25, 0.0]);
+        assert_eq!(
+            scratch[1].1.flags_and_padding[0] & shader_flags::FILL_END,
+            shader_flags::FILL_END
+        );
+    }
+
+    #[test]
+    fn equal_intermediate_gradient_stops_do_not_allocate_empty_instances() {
+        let mut scratch = Vec::new();
+        generate_gradient_instances(
+            &gradient(vec![
+                (LinearRgba::RED, 0.0, 0.5),
+                (LinearRgba::BLUE, 0.5, 0.5),
+                (LinearRgba::GREEN, 0.5, 0.5),
+                (LinearRgba::WHITE, 1.0, 0.5),
+            ]),
+            &mut scratch,
+        );
+        assert_eq!(scratch.len(), 2);
+    }
+
+    #[test]
+    fn gradient_shader_validates_for_every_instance_and_antialias_path() {
+        let source = include_str!("gradient.wgsl");
+        let prefix = "
+            struct View { clip_from_world: mat4x4<f32>, }
+            const PI: f32 = 3.141592653589793;
+            fn draw_uinode_background(
+                color: vec4<f32>, point: vec2<f32>, size: vec2<f32>,
+                radius_x: vec4<f32>, radius_y: vec4<f32>,
+                border: vec4<f32>, flags: u32,
+            ) -> vec4<f32> { return color; }
+            fn draw_uinode_border(
+                color: vec4<f32>, point: vec2<f32>, size: vec2<f32>,
+                radius_x: vec4<f32>, radius_y: vec4<f32>,
+                border: vec4<f32>, flags: u32,
+            ) -> vec4<f32> { return color; }
+        ";
+        for storage in [false, true] {
+            for anti_alias in [false, true] {
+                let mut definitions = vec!["IN_LINEAR_RGB"];
+                if storage {
+                    definitions.push("UI_STORAGE_INSTANCE");
+                }
+                if anti_alias {
+                    definitions.push("ANTI_ALIAS");
+                }
+                let processed = preprocess_wgsl_for_test(source, &definitions, prefix);
+                validate_wgsl_for_test(
+                    &format!("gradient shader (storage={storage}, aa={anti_alias})"),
+                    &processed,
+                );
+            }
+        }
     }
 }
