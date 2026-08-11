@@ -259,7 +259,7 @@ fn upsert_edges(
     }
 }
 
-fn edge_rect(size: Vec2, width: f32, radii: [f32; 4], edge: usize) -> Rect {
+pub(crate) fn edge_rect(size: Vec2, width: f32, radii: [f32; 4], edge: usize) -> Rect {
     let half = size * 0.5;
     let reach = match edge {
         0 => width.max(radii[0]).max(radii[3]),

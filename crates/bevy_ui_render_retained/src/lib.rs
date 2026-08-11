@@ -15,6 +15,7 @@ extern crate alloc;
 mod background;
 mod border;
 mod damage;
+mod gradient;
 mod image;
 mod layer;
 mod paint;

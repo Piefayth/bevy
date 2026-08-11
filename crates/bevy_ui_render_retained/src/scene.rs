@@ -17,6 +17,7 @@ use bevy::{
     sprite::{BorderRect, SliceScaleMode, SpriteImageMode},
     ui::ResolvedBorderRadius,
     ui_render::{
+        gradient::{ExtractedColorStops, ExtractedGradient, ExtractedGradients, ResolvedGradient},
         ui_texture_slice_pipeline::{ExtractedUiTextureSlice, ExtractedUiTextureSlices},
         ExtractedGlyph, ExtractedUiItem, ExtractedUiNode, ExtractedUiNodes, NodeType,
     },
@@ -32,6 +33,8 @@ pub(crate) enum PaintFamily {
     Background,
     Border,
     Image,
+    Gradient,
+    BorderGradient,
     TextBackground,
     TextShadow,
     TextShadowDecoration,
@@ -70,9 +73,142 @@ pub(crate) enum ResourceFingerprint {
 
 #[derive(Clone)]
 pub(crate) enum RetainedDrawItem {
+    Gradient(RetainedGradientItem),
     Node(RetainedNodeItem),
     Glyphs(Box<[RetainedGlyph]>),
     TextureSlice(RetainedTextureSliceItem),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RetainedGradientItem {
+    stack_index: u32,
+    rect: [FloatBits; 4],
+    border_radius: [FloatBits; 4],
+    border: [FloatBits; 4],
+    resolved: RetainedResolvedGradient,
+    color_space: bevy::ui::InterpolationColorSpace,
+    stops: Box<[RetainedGradientStop]>,
+    border_gradient: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetainedResolvedGradient {
+    Linear {
+        angle: FloatBits,
+    },
+    Conic {
+        center: [FloatBits; 2],
+        start: FloatBits,
+    },
+    Radial {
+        center: [FloatBits; 2],
+        size: [FloatBits; 2],
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RetainedGradientStop {
+    color: [FloatBits; 4],
+    position: FloatBits,
+    hint: FloatBits,
+}
+
+impl RetainedGradientItem {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the constructor captures one complete canonical gradient command"
+    )]
+    pub(crate) fn new(
+        stack_index: u32,
+        rect: Rect,
+        border_radius: ResolvedBorderRadius,
+        border: BorderRect,
+        resolved: ResolvedGradient,
+        color_space: bevy::ui::InterpolationColorSpace,
+        stops: &[(bevy::color::LinearRgba, f32, f32)],
+        border_gradient: bool,
+    ) -> Self {
+        let resolved = match resolved {
+            ResolvedGradient::Linear { angle } => RetainedResolvedGradient::Linear {
+                angle: FloatBits::new(angle),
+            },
+            ResolvedGradient::Conic { center, start } => RetainedResolvedGradient::Conic {
+                center: center.to_array().map(FloatBits::new),
+                start: FloatBits::new(start),
+            },
+            ResolvedGradient::Radial { center, size } => RetainedResolvedGradient::Radial {
+                center: center.to_array().map(FloatBits::new),
+                size: size.to_array().map(FloatBits::new),
+            },
+        };
+        Self {
+            stack_index,
+            rect: rect_fingerprint(rect),
+            border_radius: <[f32; 4]>::from(border_radius).map(FloatBits::new),
+            border: [
+                border.min_inset.x,
+                border.min_inset.y,
+                border.max_inset.x,
+                border.max_inset.y,
+            ]
+            .map(FloatBits::new),
+            resolved,
+            color_space,
+            stops: stops
+                .iter()
+                .map(|(color, position, hint)| RetainedGradientStop {
+                    color: color.to_f32_array().map(FloatBits::new),
+                    position: FloatBits::new(*position),
+                    hint: FloatBits::new(*hint),
+                })
+                .collect(),
+            border_gradient,
+        }
+    }
+
+    fn rect(&self) -> Rect {
+        rect_from_fingerprint(self.rect)
+    }
+
+    fn border_radius(&self) -> ResolvedBorderRadius {
+        ResolvedBorderRadius {
+            top_left: self.border_radius[0].get(),
+            top_right: self.border_radius[1].get(),
+            bottom_right: self.border_radius[2].get(),
+            bottom_left: self.border_radius[3].get(),
+        }
+    }
+
+    fn border(&self) -> BorderRect {
+        BorderRect {
+            min_inset: Vec2::new(self.border[0].get(), self.border[1].get()),
+            max_inset: Vec2::new(self.border[2].get(), self.border[3].get()),
+        }
+    }
+
+    fn resolved(&self) -> ResolvedGradient {
+        match self.resolved {
+            RetainedResolvedGradient::Linear { angle } => {
+                ResolvedGradient::Linear { angle: angle.get() }
+            }
+            RetainedResolvedGradient::Conic { center, start } => ResolvedGradient::Conic {
+                center: Vec2::new(center[0].get(), center[1].get()),
+                start: start.get(),
+            },
+            RetainedResolvedGradient::Radial { center, size } => ResolvedGradient::Radial {
+                center: Vec2::new(center[0].get(), center[1].get()),
+                size: Vec2::new(size[0].get(), size[1].get()),
+            },
+        }
+    }
+
+    fn node_type(&self) -> NodeType {
+        if self.border_gradient {
+            NodeType::Border(bevy::ui_render::shader_flags::BORDER_ALL)
+        } else {
+            NodeType::Rect
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -173,6 +309,7 @@ struct RetainedNodeFingerprint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RetainedItemFingerprint {
+    Gradient,
     Node(RetainedNodeFingerprint),
     Glyphs,
     TextureSlice(RetainedTextureSliceFingerprint),
@@ -223,6 +360,9 @@ impl PartialEq for RetainedRecord {
             && self.item == other.item
             && match (&self.draw.item, &other.draw.item) {
                 (RetainedDrawItem::Glyphs(left), RetainedDrawItem::Glyphs(right)) => left == right,
+                (RetainedDrawItem::Gradient(left), RetainedDrawItem::Gradient(right)) => {
+                    left == right
+                }
                 _ => true,
             }
     }
@@ -271,6 +411,7 @@ impl RetainedRecord {
                 })
             }
             RetainedDrawItem::Glyphs(_) => RetainedItemFingerprint::Glyphs,
+            RetainedDrawItem::Gradient(_) => RetainedItemFingerprint::Gradient,
             RetainedDrawItem::TextureSlice(item) => {
                 RetainedItemFingerprint::TextureSlice(RetainedTextureSliceFingerprint {
                     rect: rect_fingerprint(item.rect),
@@ -318,6 +459,13 @@ impl RetainedRecord {
 
 fn rect_fingerprint(rect: Rect) -> [FloatBits; 4] {
     [rect.min.x, rect.min.y, rect.max.x, rect.max.y].map(FloatBits::new)
+}
+
+fn rect_from_fingerprint(rect: [FloatBits; 4]) -> Rect {
+    Rect::from_corners(
+        Vec2::new(rect[0].get(), rect[1].get()),
+        Vec2::new(rect[2].get(), rect[3].get()),
+    )
 }
 
 fn texture_slice_mode_fingerprint(mode: &SpriteImageMode) -> TextureSliceModeFingerprint {
@@ -567,6 +715,8 @@ pub(crate) fn replay_retained_ui(
     items: Res<RetainedItems>,
     mut extracted: ResMut<ExtractedUiNodes>,
     mut extracted_slices: ResMut<ExtractedUiTextureSlices>,
+    mut extracted_gradients: ResMut<ExtractedGradients>,
+    mut extracted_stops: ResMut<ExtractedColorStops>,
 ) {
     let mut surfaces = state.lock();
     let mut items = items.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -618,6 +768,8 @@ pub(crate) fn replay_retained_ui(
                 push_replayed(
                     &mut extracted,
                     &mut extracted_slices,
+                    &mut extracted_gradients,
+                    &mut extracted_stops,
                     &mut items,
                     &record.value.draw,
                     coverage,
@@ -629,6 +781,8 @@ pub(crate) fn replay_retained_ui(
             push_replayed(
                 &mut extracted,
                 &mut extracted_slices,
+                &mut extracted_gradients,
+                &mut extracted_stops,
                 &mut items,
                 &record.value.draw,
                 record.coverage.clone(),
@@ -642,12 +796,52 @@ pub(crate) fn replay_retained_ui(
 fn push_replayed(
     extracted: &mut ExtractedUiNodes,
     extracted_slices: &mut ExtractedUiTextureSlices,
+    extracted_gradients: &mut ExtractedGradients,
+    extracted_stops: &mut ExtractedColorStops,
     items: &mut HashMap<Entity, RetainedItem>,
     draw: &RetainedDraw,
     coverage: PaintCoverage,
     node_type: Option<NodeType>,
 ) {
     let item = match &draw.item {
+        RetainedDrawItem::Gradient(item) => {
+            let range_start = extracted_stops.0.len();
+            extracted_stops.0.extend(item.stops.iter().map(|stop| {
+                (
+                    bevy::color::LinearRgba::new(
+                        stop.color[0].get(),
+                        stop.color[1].get(),
+                        stop.color[2].get(),
+                        stop.color[3].get(),
+                    ),
+                    stop.position.get(),
+                    stop.hint.get(),
+                )
+            }));
+            extracted_gradients.items.push(ExtractedGradient {
+                stack_index: item.stack_index,
+                transform: draw.transform,
+                rect: item.rect(),
+                clip: draw.clip,
+                extracted_camera_entity: draw.camera,
+                stops_range: range_start..extracted_stops.0.len(),
+                node_type: item.node_type(),
+                main_entity: draw.main_entity,
+                render_entity: draw.render_entity,
+                border_radius: item.border_radius(),
+                border: item.border(),
+                resolved_gradient: item.resolved(),
+                color_space: item.color_space,
+            });
+            items.insert(
+                draw.render_entity,
+                RetainedItem {
+                    coverage,
+                    image: draw.image,
+                },
+            );
+            return;
+        }
         RetainedDrawItem::Node(item) => ExtractedUiItem::Node {
             color: item.color,
             rect: item.rect,

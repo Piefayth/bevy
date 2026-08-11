@@ -149,6 +149,16 @@ queue. `DrawUiTextureSliceItem` prepares and draws one retained quad, so damage
 culling cannot silently submit adjacent same-texture slices as a stock batch.
 This remains a focused `bevy_ui_render` patch; it does not expand crate scope.
 
+Gradients use an equivalent `GradientInfrastructurePlugin` split. The shared
+`resolve_gradient` function is the sole implementation of logical stop,
+radial-shape, and conic-angle resolution for both stock and retained extraction.
+A red-first mixed-stack test exposed a stock ordering defect: a one-stop
+gradient was converted to the ordinary node pipeline and could no longer keep
+its list position among multistop gradients queued by another system. The
+optimization was removed. Resolution now represents a solid gradient as two
+equal stops, so every entry uses one ordered gradient pipeline and the retained
+renderer needs no special case.
+
 ## Model learned from other UI systems
 
 Mature UI systems retain several representations rather than one:
@@ -509,9 +519,10 @@ constructed stock final scene is byte-identical to the retained scene reached
 through movement, recoloring, and removal, including translucent overlap.
 
 The integrated retained families are backgrounds (`BackgroundColor` and
-`OuterColor`), ordinary, sliced, and tiled `ImageNode`s, solid borders and
-outlines, and all stock UI text paint. They share one scene, one stable
-`(entity, family, ordinal)` identity space, and one damage journal per camera.
+`OuterColor`), ordinary, sliced, and tiled `ImageNode`s, background and border
+gradients, solid borders and outlines, and all stock UI text paint. They share
+one scene, one stable `(entity, family, ordinal)` identity space, and one damage
+journal per camera.
 Family extractors only update canonical records; a single later replay stage
 sorts every visible family together. This is required for correctness:
 repairing a translucent image or glyph must first replay the background
@@ -584,6 +595,17 @@ the common sampled-image dependencies. GPU differentials cover quiet sliced
 and tiled output, tint repair, and same-texture siblings; the last asserts that
 a one-node repair submits exactly one prepared quad rather than the stock
 texture batch.
+
+Background and border gradients retain one canonical record per list entry.
+Resolved geometry, interpolation color space, exact-bit stops and hints,
+border geometry, order, target scale, transform, and clip all participate in
+comparison. Empty and fully transparent gradients create no records. Border
+gradient coverage is the exact union of its four rounded edge reaches, not the
+node box: a 24-by-20 test node repairs 340 possible border pixels and never its
+140-pixel center. GPU differentials cover linear, radial, conic, solid,
+mixed-stack ordering, border mutation, equal replacement, and removal. The
+prepared-quad counter also proves that a three-stop change submits its two
+gradient segments and no unrelated item.
 
 Availability follows Bevy's render-asset lifecycle rather than main-world
 `Assets<Image>` membership. Removing a main-world asset does not unload its GPU

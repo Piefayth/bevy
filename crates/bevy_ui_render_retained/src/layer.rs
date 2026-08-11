@@ -2,6 +2,7 @@
 
 use crate::background::extract_retained_backgrounds;
 use crate::border::extract_retained_borders;
+use crate::gradient::{extract_retained_gradients, RetainedGradientDependencies};
 use crate::image::{extract_retained_images, RetainedImageDependencies};
 use crate::sampled_image::{
     extract_sampled_image_changes, resolve_ready_sampled_images, RetainedSampledImages,
@@ -48,6 +49,7 @@ use bevy::{
         ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
     },
     ui_render::{
+        gradient::{DrawGradientFns, GradientBatch, GradientInfrastructurePlugin},
         ui_texture_slice_pipeline::{
             queue_ui_slice_items, DrawUiTextureSliceItem, UiTextureSlicerBatch,
             UiTextureSlicerInfrastructurePlugin,
@@ -71,6 +73,7 @@ pub struct RetainedUiRenderPlugin;
 
 impl Plugin for RetainedUiRenderPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(GradientInfrastructurePlugin);
         app.add_plugins(UiTextureSlicerInfrastructurePlugin);
         embedded_asset!(app, "composite.wgsl");
 
@@ -82,6 +85,7 @@ impl Plugin for RetainedUiRenderPlugin {
             .init_resource::<LayerSurfaces>()
             .init_resource::<RetainedUiLayerCounters>()
             .init_resource::<RetainedUiScene>()
+            .init_resource::<RetainedGradientDependencies>()
             .init_resource::<RetainedImageDependencies>()
             .init_resource::<RetainedSampledImages>()
             .init_resource::<RetainedTextDependencies>()
@@ -98,6 +102,12 @@ impl Plugin for RetainedUiRenderPlugin {
             .add_systems(
                 ExtractSchedule,
                 extract_retained_borders.in_set(RenderUiSystems::ExtractBorders),
+            )
+            .add_systems(
+                ExtractSchedule,
+                extract_retained_gradients
+                    .in_set(RenderUiSystems::ExtractGradient)
+                    .before(replay_retained_ui),
             )
             .add_systems(
                 ExtractSchedule,
@@ -482,6 +492,7 @@ fn phase_is_ready(
 
 #[derive(Clone, Copy)]
 struct RetainedDrawFunctionIds {
+    gradient: DrawFunctionId,
     ui: DrawFunctionId,
     texture_slice: DrawFunctionId,
 }
@@ -489,6 +500,7 @@ struct RetainedDrawFunctionIds {
 fn retained_draw_function_ids(world: &World) -> RetainedDrawFunctionIds {
     let draw_functions = world.resource::<DrawFunctions<TransparentUi>>().read();
     RetainedDrawFunctionIds {
+        gradient: draw_functions.id::<DrawGradientFns>(),
         ui: draw_functions.id::<DrawUiItem>(),
         texture_slice: draw_functions.id::<DrawUiTextureSliceItem>(),
     }
@@ -499,7 +511,11 @@ fn item_batch_range(
     item: &TransparentUi,
     draw_functions: RetainedDrawFunctionIds,
 ) -> Option<Range<u32>> {
-    if item.draw_function == draw_functions.ui {
+    if item.draw_function == draw_functions.gradient {
+        world
+            .get::<GradientBatch>(item.entity())
+            .map(|batch| batch.range.clone())
+    } else if item.draw_function == draw_functions.ui {
         world
             .get::<UiItemBatch>(item.entity())
             .map(|batch| batch.range.clone())

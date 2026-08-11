@@ -384,6 +384,32 @@ fn sliced_mode() -> NodeImageMode {
     })
 }
 
+fn linear_gradient(first: Color, middle: Color, last: Color) -> BackgroundGradient {
+    BackgroundGradient::from(LinearGradient::to_right(vec![
+        ColorStop::auto(first),
+        ColorStop::percent(middle, 45),
+        ColorStop::auto(last),
+    ]))
+}
+
+fn spawn_gradient_leaf(world: &mut World, camera: Entity, gradient: BackgroundGradient) -> Entity {
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(7),
+                top: px(9),
+                width: px(24),
+                height: px(20),
+                border_radius: BorderRadius::all(px(4)),
+                ..default()
+            },
+            gradient,
+            UiTargetCamera(camera),
+        ))
+        .id()
+}
+
 fn spawn_slice_pair(world: &mut World, camera: Entity, first_tint: Color) -> Entity {
     let image = add_slice_image(world);
     let mut first = Entity::PLACEHOLDER;
@@ -825,6 +851,360 @@ fn quiet_sliced_image_matches_stock_without_another_repair() {
             retained.paint_after_mutation,
             retained.paint_before_mutation
         );
+    });
+}
+
+#[test]
+fn quiet_linear_gradient_matches_stock_without_another_repair() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_gradient_leaf(
+                world,
+                camera,
+                linear_gradient(
+                    Color::srgb_u8(220, 40, 30),
+                    Color::srgba_u8(30, 190, 80, 180),
+                    Color::srgb_u8(40, 80, 220),
+                ),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn changed_gradient_stop_repairs_one_item_and_two_segment_quads() {
+    with_gpu_lock(|| {
+        let initial_middle = Color::srgba_u8(30, 190, 80, 180);
+        let final_middle = Color::srgba_u8(230, 190, 25, 210);
+        let setup = move |world: &mut World, camera, middle| {
+            spawn_gradient_leaf(
+                world,
+                camera,
+                linear_gradient(
+                    Color::srgb_u8(220, 40, 30),
+                    middle,
+                    Color::srgb_u8(40, 80, 220),
+                ),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, final_middle),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, initial_middle),
+            move |world, entity| {
+                let mut entity = world.entity_mut(entity);
+                let Gradient::Linear(gradient) =
+                    &mut entity.get_mut::<BackgroundGradient>().unwrap().0[0]
+                else {
+                    unreachable!()
+                };
+                gradient.stops[1].color = final_middle;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 24 * 20);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 2);
+    });
+}
+
+#[test]
+fn single_stop_gradient_matches_stock_solid_fill() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_gradient_leaf(
+                world,
+                camera,
+                BackgroundGradient::from(LinearGradient::to_right(vec![ColorStop::auto(
+                    Color::srgba_u8(220, 60, 35, 190),
+                )])),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+    });
+}
+
+#[test]
+fn changed_border_gradient_repairs_only_border_pixels() {
+    with_gpu_lock(|| {
+        let initial_middle = Color::srgba_u8(30, 190, 80, 180);
+        let final_middle = Color::srgba_u8(230, 190, 25, 210);
+        let setup = move |world: &mut World, camera, middle| {
+            world
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(7),
+                        top: px(9),
+                        width: px(24),
+                        height: px(20),
+                        border: UiRect::all(px(4)),
+                        border_radius: BorderRadius::all(px(4)),
+                        ..default()
+                    },
+                    BorderGradient::from(LinearGradient::to_right(vec![
+                        ColorStop::auto(Color::srgb_u8(220, 40, 30)),
+                        ColorStop::percent(middle, 45),
+                        ColorStop::auto(Color::srgb_u8(40, 80, 220)),
+                    ])),
+                    UiTargetCamera(camera),
+                ))
+                .id()
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, final_middle),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, initial_middle),
+            move |world, entity| {
+                let mut entity = world.entity_mut(entity);
+                let Gradient::Linear(gradient) =
+                    &mut entity.get_mut::<BorderGradient>().unwrap().0[0]
+                else {
+                    unreachable!()
+                };
+                gradient.stops[1].color = final_middle;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 340);
+        assert_eq!(after.items_replayed, before.items_replayed + 4);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 8);
+    });
+}
+
+#[test]
+fn radial_and_conic_gradient_stack_matches_stock_order() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_gradient_leaf(
+                world,
+                camera,
+                BackgroundGradient(vec![
+                    RadialGradient::new(
+                        UiPosition::CENTER,
+                        RadialGradientShape::ClosestCorner,
+                        vec![
+                            ColorStop::auto(Color::srgba_u8(220, 40, 30, 180)),
+                            ColorStop::auto(Color::srgba_u8(30, 190, 80, 80)),
+                        ],
+                    )
+                    .into(),
+                    ConicGradient::new(
+                        UiPosition::CENTER,
+                        vec![
+                            AngularColorStop::new(Color::srgba_u8(40, 80, 220, 80), 0.0),
+                            AngularColorStop::auto(Color::srgba_u8(230, 190, 25, 120)),
+                            AngularColorStop::new(
+                                Color::srgba_u8(220, 40, 150, 80),
+                                core::f32::consts::TAU,
+                            ),
+                        ],
+                    )
+                    .with_start(0.3)
+                    .into(),
+                ]),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+    });
+}
+
+#[test]
+fn mixed_solid_and_multistop_gradient_stack_matches_stock_order() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_gradient_leaf(
+                world,
+                camera,
+                BackgroundGradient(vec![
+                    LinearGradient::to_right(vec![
+                        ColorStop::auto(Color::srgba_u8(220, 40, 30, 160)),
+                        ColorStop::auto(Color::srgba_u8(30, 190, 80, 70)),
+                    ])
+                    .into(),
+                    LinearGradient::to_right(vec![ColorStop::auto(Color::srgba_u8(
+                        40, 80, 220, 110,
+                    ))])
+                    .into(),
+                    LinearGradient::to_top(vec![
+                        ColorStop::auto(Color::srgba_u8(230, 190, 25, 90)),
+                        ColorStop::auto(Color::srgba_u8(220, 40, 150, 130)),
+                    ])
+                    .into(),
+                ]),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+    });
+}
+
+#[test]
+fn removing_background_gradient_repairs_its_vacated_pixels() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera, with_gradient| {
+            let entity = world
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(7),
+                        top: px(9),
+                        width: px(24),
+                        height: px(20),
+                        ..default()
+                    },
+                    UiTargetCamera(camera),
+                ))
+                .id();
+            if with_gradient {
+                world.entity_mut(entity).insert(linear_gradient(
+                    Color::srgb_u8(220, 40, 30),
+                    Color::srgba_u8(30, 190, 80, 180),
+                    Color::srgb_u8(40, 80, 220),
+                ));
+            }
+            entity
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, false),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, true),
+            |world, entity| {
+                world.entity_mut(entity).remove::<BackgroundGradient>();
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 24 * 20);
+    });
+}
+
+#[test]
+fn equal_gradient_replacement_compares_without_repair() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                spawn_gradient_leaf(
+                    world,
+                    camera,
+                    linear_gradient(
+                        Color::srgb_u8(220, 40, 30),
+                        Color::srgba_u8(30, 190, 80, 180),
+                        Color::srgb_u8(40, 80, 220),
+                    ),
+                )
+            },
+            |world, entity| {
+                let gradient = world
+                    .entity(entity)
+                    .get::<BackgroundGradient>()
+                    .unwrap()
+                    .clone();
+                world.entity_mut(entity).insert(gradient);
+            },
+        );
+
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        let paint_before = output.paint_before_mutation.unwrap();
+        let paint_after = output.paint_after_mutation.unwrap();
+        assert_eq!(paint_after.candidates, paint_before.candidates + 1);
+        assert_eq!(
+            paint_after.records_compared,
+            paint_before.records_compared + 1
+        );
+        assert_eq!(paint_after.records_changed, paint_before.records_changed);
     });
 }
 

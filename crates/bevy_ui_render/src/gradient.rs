@@ -44,6 +44,25 @@ pub struct GradientPlugin;
 
 impl Plugin for GradientPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(GradientInfrastructurePlugin);
+
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.add_systems(
+                ExtractSchedule,
+                extract_gradients
+                    .in_set(RenderUiSystems::ExtractGradient)
+                    .after(extract_uinode_background_colors),
+            );
+        }
+    }
+}
+
+/// GPU pipeline, queueing, and preparation shared by UI gradient render policies.
+#[derive(Default)]
+pub struct GradientInfrastructurePlugin;
+
+impl Plugin for GradientInfrastructurePlugin {
+    fn build(&self, app: &mut App) {
         embedded_asset!(app, "gradient.wgsl");
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
@@ -54,12 +73,6 @@ impl Plugin for GradientPlugin {
                 .init_gpu_resource::<GradientMeta>()
                 .init_gpu_resource::<SpecializedRenderPipelines<GradientPipeline>>()
                 .add_systems(RenderStartup, init_gradient_pipeline)
-                .add_systems(
-                    ExtractSchedule,
-                    extract_gradients
-                        .in_set(RenderUiSystems::ExtractGradient)
-                        .after(extract_uinode_background_colors),
-                )
                 .add_systems(
                     Render,
                     (
@@ -220,6 +233,7 @@ impl SpecializedRenderPipeline for GradientPipeline {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum ResolvedGradient {
     Linear { angle: f32 },
     Conic { center: Vec2, start: f32 },
@@ -335,11 +349,97 @@ fn compute_color_stops(
     interpolate_color_stops(&mut extracted_color_stops[range_start..], min, max);
 }
 
+/// Resolves one nonempty gradient into the exact geometry and stops consumed by the GPU pipeline.
+pub fn resolve_gradient(
+    gradient: &Gradient,
+    scale_factor: f32,
+    node_size: Vec2,
+    target_size: Vec2,
+    scratch: &mut Vec<(LinearRgba, f32, f32)>,
+    resolved_stops: &mut Vec<(LinearRgba, f32, f32)>,
+) -> (ResolvedGradient, InterpolationColorSpace) {
+    if let Some(color) = gradient.get_single() {
+        let color = color.to_linear();
+        resolved_stops.extend([
+            (color, 0.0, 0.5),
+            (color, compute_gradient_line_length(0.0, node_size), 0.5),
+        ]);
+        return (
+            ResolvedGradient::Linear { angle: 0.0 },
+            InterpolationColorSpace::LinearRgba,
+        );
+    }
+    match gradient {
+        Gradient::Linear(LinearGradient {
+            color_space,
+            angle,
+            stops,
+        }) => {
+            compute_color_stops(
+                stops,
+                scale_factor,
+                compute_gradient_line_length(*angle, node_size),
+                target_size,
+                scratch,
+                resolved_stops,
+            );
+            (ResolvedGradient::Linear { angle: *angle }, *color_space)
+        }
+        Gradient::Radial(RadialGradient {
+            color_space,
+            position,
+            shape,
+            stops,
+        }) => {
+            let center = position.resolve(scale_factor, node_size, target_size);
+            let size = shape.resolve(center, scale_factor, node_size, target_size);
+            compute_color_stops(
+                stops,
+                scale_factor,
+                size.x,
+                target_size,
+                scratch,
+                resolved_stops,
+            );
+            (ResolvedGradient::Radial { center, size }, *color_space)
+        }
+        Gradient::Conic(ConicGradient {
+            color_space,
+            start,
+            position,
+            stops,
+        }) => {
+            let center = position.resolve(scale_factor, node_size, target_size);
+            scratch.extend(stops.iter().filter_map(|stop| {
+                stop.angle
+                    .map(|angle| (stop.color.to_linear(), angle.clamp(0., TAU), stop.hint))
+            }));
+            scratch.sort_by_key(|(_, angle, _)| FloatOrd(*angle));
+            let mut sorted_stops = scratch.drain(..);
+            let range_start = resolved_stops.len();
+            resolved_stops.extend(stops.iter().map(|stop| {
+                if stop.angle.is_none() {
+                    (stop.color.to_linear(), f32::NAN, stop.hint)
+                } else {
+                    sorted_stops.next().unwrap()
+                }
+            }));
+            interpolate_color_stops(&mut resolved_stops[range_start..], 0.0, TAU);
+            (
+                ResolvedGradient::Conic {
+                    center,
+                    start: *start,
+                },
+                *color_space,
+            )
+        }
+    }
+}
+
 pub fn extract_gradients(
     mut commands: Commands,
     mut extracted_gradients: ResMut<ExtractedGradients>,
     mut extracted_color_stops: ResMut<ExtractedColorStops>,
-    mut extracted_uinodes: ResMut<ExtractedUiNodes>,
     gradients_query: Extract<
         Query<(
             Entity,
@@ -390,184 +490,33 @@ pub fn extract_gradients(
                 if gradient.is_empty() {
                     continue;
                 }
-                if let Some(color) = gradient.get_single() {
-                    // With a single color stop there's no gradient, fill the node with the color
-                    extracted_uinodes.uinodes.push(ExtractedUiNode {
-                        z_order: stack_index.0 as f32
-                            + match node_type {
-                                NodeType::Rect | NodeType::Inverted => stack_z_offsets::GRADIENT,
-                                NodeType::Border(_) => stack_z_offsets::BORDER_GRADIENT,
-                            },
-                        image: AssetId::default(),
-                        clip: clip.map(|clip| clip.clip),
-                        extracted_camera_entity,
-                        transform: transform.into(),
-                        item: ExtractedUiItem::Node {
-                            color: color.into(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            atlas_scaling: None,
-                            flip_x: false,
-                            flip_y: false,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            node_type,
-                        },
-                        main_entity: entity.into(),
-                        render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                    });
-                    continue;
-                }
-                match gradient {
-                    Gradient::Linear(LinearGradient {
-                        color_space,
-                        angle,
-                        stops,
-                    }) => {
-                        let length = compute_gradient_line_length(*angle, uinode.size);
-
-                        let range_start = extracted_color_stops.0.len();
-
-                        compute_color_stops(
-                            stops,
-                            target.scale_factor(),
-                            length,
-                            target.physical_size().as_vec2(),
-                            &mut sorted_stops,
-                            &mut extracted_color_stops.0,
-                        );
-
-                        extracted_gradients.items.push(ExtractedGradient {
-                            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                            stack_index: stack_index.0,
-                            transform: transform.into(),
-                            stops_range: range_start..extracted_color_stops.0.len(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            clip: clip.map(|clip| clip.clip),
-                            extracted_camera_entity,
-                            main_entity: entity.into(),
-                            node_type,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            resolved_gradient: ResolvedGradient::Linear { angle: *angle },
-                            color_space: *color_space,
-                        });
-                    }
-                    Gradient::Radial(RadialGradient {
-                        color_space,
-                        position: center,
-                        shape,
-                        stops,
-                    }) => {
-                        let c = center.resolve(
-                            target.scale_factor(),
-                            uinode.size,
-                            target.physical_size().as_vec2(),
-                        );
-
-                        let size = shape.resolve(
-                            c,
-                            target.scale_factor(),
-                            uinode.size,
-                            target.physical_size().as_vec2(),
-                        );
-
-                        let length = size.x;
-
-                        let range_start = extracted_color_stops.0.len();
-                        compute_color_stops(
-                            stops,
-                            target.scale_factor(),
-                            length,
-                            target.physical_size().as_vec2(),
-                            &mut sorted_stops,
-                            &mut extracted_color_stops.0,
-                        );
-
-                        extracted_gradients.items.push(ExtractedGradient {
-                            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                            stack_index: stack_index.0,
-                            transform: transform.into(),
-                            stops_range: range_start..extracted_color_stops.0.len(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            clip: clip.map(|clip| clip.clip),
-                            extracted_camera_entity,
-                            main_entity: entity.into(),
-                            node_type,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            resolved_gradient: ResolvedGradient::Radial { center: c, size },
-                            color_space: *color_space,
-                        });
-                    }
-                    Gradient::Conic(ConicGradient {
-                        color_space,
-                        start,
-                        position: center,
-                        stops,
-                    }) => {
-                        let g_start = center.resolve(
-                            target.scale_factor(),
-                            uinode.size,
-                            target.physical_size().as_vec2(),
-                        );
-                        let range_start = extracted_color_stops.0.len();
-
-                        // sort the explicit stops
-                        sorted_stops.extend(stops.iter().filter_map(|stop| {
-                            stop.angle.map(|angle| {
-                                (stop.color.to_linear(), angle.clamp(0., TAU), stop.hint)
-                            })
-                        }));
-                        sorted_stops.sort_by_key(|(_, angle, _)| FloatOrd(*angle));
-                        let mut sorted_stops_drain = sorted_stops.drain(..);
-
-                        // fill the extracted stops buffer
-                        extracted_color_stops.0.extend(stops.iter().map(|stop| {
-                            if stop.angle.is_none() {
-                                (stop.color.to_linear(), f32::NAN, stop.hint)
-                            } else {
-                                sorted_stops_drain.next().unwrap()
-                            }
-                        }));
-
-                        interpolate_color_stops(
-                            &mut extracted_color_stops.0[range_start..],
-                            0.,
-                            TAU,
-                        );
-
-                        extracted_gradients.items.push(ExtractedGradient {
-                            render_entity: commands.spawn(TemporaryRenderEntity).id(),
-                            stack_index: stack_index.0,
-                            transform: transform.into(),
-                            stops_range: range_start..extracted_color_stops.0.len(),
-                            rect: Rect {
-                                min: Vec2::ZERO,
-                                max: uinode.size,
-                            },
-                            clip: clip.map(|clip| clip.clip),
-                            extracted_camera_entity,
-                            main_entity: entity.into(),
-                            node_type,
-                            border_radius: uinode.border_radius,
-                            border: uinode.border,
-                            resolved_gradient: ResolvedGradient::Conic {
-                                start: *start,
-                                center: g_start,
-                            },
-                            color_space: *color_space,
-                        });
-                    }
-                }
+                let range_start = extracted_color_stops.0.len();
+                let (resolved_gradient, color_space) = resolve_gradient(
+                    gradient,
+                    target.scale_factor(),
+                    uinode.size,
+                    target.physical_size().as_vec2(),
+                    &mut sorted_stops,
+                    &mut extracted_color_stops.0,
+                );
+                extracted_gradients.items.push(ExtractedGradient {
+                    render_entity: commands.spawn(TemporaryRenderEntity).id(),
+                    stack_index: stack_index.0,
+                    transform: transform.into(),
+                    stops_range: range_start..extracted_color_stops.0.len(),
+                    rect: Rect {
+                        min: Vec2::ZERO,
+                        max: uinode.size,
+                    },
+                    clip: clip.map(|clip| clip.clip),
+                    extracted_camera_entity,
+                    main_entity: entity.into(),
+                    node_type,
+                    border_radius: uinode.border_radius,
+                    border: uinode.border,
+                    resolved_gradient,
+                    color_space,
+                });
             }
         }
     }

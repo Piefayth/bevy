@@ -8,7 +8,7 @@
 //! Provides rendering functionality for `bevy_ui`.
 
 pub mod box_shadow;
-mod gradient;
+pub mod gradient;
 mod pipeline;
 pub mod render_pass;
 mod text;
