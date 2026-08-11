@@ -4,14 +4,14 @@ use crate::{
     experimental::{UiChildren, UiRootNodes},
     ui_transform::{UiGlobalTransform, UiTransform},
     ComputedNode, ComputedUiRenderTargetInfo, ContentSize, Display, IgnoreScroll, LayoutConfig,
-    Node, Outline, OverflowAxis, ScrollPosition,
+    LayoutContainment, Node, Outline, OverflowAxis, ScrollPosition,
 };
 use bevy_ecs::{
     change_detection::{DetectChanges, DetectChangesMut, Mut},
     entity::{Entity, EntityHashSet},
     hierarchy::{ChildOf, Children},
     lifecycle::RemovedComponents,
-    query::{Added, Changed, Or, With},
+    query::{Added, Changed, Has, Or, With},
     system::{Local, ParamSet, Query, ResMut, SystemParam},
     world::Ref,
 };
@@ -28,10 +28,6 @@ use bevy_text::FontCx;
 mod convert;
 pub mod debug;
 pub mod ui_surface;
-
-fn drain_removed<T: bevy_ecs::component::Component>(removed: &mut RemovedComponents<T>) -> bool {
-    removed.read().count() != 0
-}
 
 pub struct LayoutContext {
     pub scale_factor: f32,
@@ -75,47 +71,179 @@ pub enum LayoutError {
     TaffyError(taffy::tree::TaffyError),
 }
 
+#[derive(SystemParam)]
+#[doc(hidden)]
+pub struct LayoutChanges<'w, 's> {
+    added_node: Query<'w, 's, (), Added<Node>>,
+    containment: Query<'w, 's, (), With<LayoutContainment>>,
+    changed_children: Query<'w, 's, Entity, Changed<Children>>,
+    changed_parent: Query<'w, 's, Entity, Changed<ChildOf>>,
+    removed_children: RemovedComponents<'w, 's, Children>,
+    removed_parent: RemovedComponents<'w, 's, ChildOf>,
+    removed_node: RemovedComponents<'w, 's, Node>,
+    removed_containment: RemovedComponents<'w, 's, LayoutContainment>,
+}
+
+fn layout_scope(
+    entity: Entity,
+    include_entity_boundary: bool,
+    ui_children: &UiChildren,
+    containment: &Query<(), With<LayoutContainment>>,
+) -> (Entity, bool) {
+    if include_entity_boundary && containment.contains(entity) {
+        return (entity, false);
+    }
+
+    let mut scope = entity;
+    let mut ancestor = ui_children.get_parent(entity);
+    while let Some(parent) = ancestor {
+        scope = parent;
+        if containment.contains(parent) {
+            return (scope, false);
+        }
+        ancestor = ui_children.get_parent(parent);
+    }
+    (scope, true)
+}
+
+fn mark_layout_scope(
+    entity: Entity,
+    include_entity_boundary: bool,
+    ui_children: &UiChildren,
+    containment: &Query<(), With<LayoutContainment>>,
+    dirty_scopes: &mut EntityHashSet,
+    dirty_outer_roots: &mut EntityHashSet,
+) {
+    let (scope, outer_root) =
+        layout_scope(entity, include_entity_boundary, ui_children, containment);
+    dirty_scopes.insert(scope);
+    if outer_root {
+        dirty_outer_roots.insert(scope);
+    }
+}
+
 /// Synchronizes the UI layout tree and computes Taffy layout.
 pub fn ui_layout_system(
     mut ui_surface: ResMut<UiSurface>,
     ui_root_node_query: UiRootNodes,
     ui_children: UiChildren,
-    mut node_query: Query<(
-        Entity,
-        Ref<Node>,
-        &mut ContentSize,
-        Ref<ComputedUiRenderTargetInfo>,
+    mut node_queries: ParamSet<(
+        Query<
+            Entity,
+            Or<(
+                Changed<Node>,
+                Changed<ContentSize>,
+                Changed<ComputedUiRenderTargetInfo>,
+                Added<LayoutContainment>,
+            )>,
+        >,
+        Query<(
+            Entity,
+            Ref<Node>,
+            &mut ContentSize,
+            Ref<ComputedUiRenderTargetInfo>,
+            Has<LayoutContainment>,
+        )>,
     )>,
-    added_node_query: Query<(), Added<Node>>,
     mut buffer_query: Query<&mut ComputedTextBlock>,
     mut font_system: ResMut<FontCx>,
-    mut removed_children: RemovedComponents<Children>,
-    mut removed_nodes: RemovedComponents<Node>,
+    mut changes: LayoutChanges,
     #[cfg(feature = "ghost_nodes")] mut removed_ghost_nodes: RemovedComponents<GhostNode>,
     #[cfg(feature = "ghost_nodes")] added_ghost_node_query: Query<Entity, Added<GhostNode>>,
     #[cfg(feature = "ghost_nodes")] ghost_node_query: Query<(), With<GhostNode>>,
+    mut dirty_scopes: Local<EntityHashSet>,
+    mut dirty_outer_roots: Local<EntityHashSet>,
+    mut dirty_nodes: Local<EntityHashSet>,
+    mut removed_containment_scratch: Local<EntityHashSet>,
+    mut scope_roots: Local<Vec<Entity>>,
 ) {
-    // Sync Node and ContentSize to Taffy for all nodes
-    node_query
-        .iter_mut()
-        .for_each(|(entity, node, mut content_size, computed_target)| {
-            if computed_target.is_changed() || node.is_changed() || content_size.is_changed() {
-                let layout_context = LayoutContext::new(
-                    computed_target.scale_factor,
-                    computed_target.physical_size.as_vec2(),
-                );
-                if content_size.is_changed() && content_size.measure.is_none() {
-                    ui_surface.try_remove_node_context(entity);
-                }
-                let measure = content_size.bypass_change_detection().measure.take();
-                ui_surface.upsert_node(&layout_context, entity, &node, measure);
-            }
-        });
+    ui_surface.layout_geometry_scopes.clear();
+    dirty_scopes.clear();
+    dirty_outer_roots.clear();
+    dirty_nodes.clear();
+    removed_containment_scratch.clear();
+    scope_roots.clear();
+    removed_containment_scratch.extend(changes.removed_containment.read());
+    dirty_nodes.extend(node_queries.p0().iter());
+    dirty_nodes.extend(removed_containment_scratch.iter().copied());
+
+    let mut node_query = node_queries.p1();
+    for entity in dirty_nodes.iter().copied() {
+        let Ok((_, node, mut content_size, computed_target, contained)) =
+            node_query.get_mut(entity)
+        else {
+            continue;
+        };
+        let layout_context = LayoutContext::new(
+            computed_target.scale_factor,
+            computed_target.physical_size.as_vec2(),
+        );
+        let target_changed = computed_target.is_changed();
+        let context_removed = content_size.is_changed()
+            && content_size.measure.is_none()
+            && ui_surface.try_remove_node_context(entity);
+        let measure = content_size.bypass_change_detection().measure.take();
+        let layout_changed = ui_surface.upsert_node_with_containment(
+            &layout_context,
+            entity,
+            &node,
+            measure,
+            contained,
+        );
+        if target_changed || context_removed || layout_changed {
+            mark_layout_scope(
+                entity,
+                false,
+                &ui_children,
+                &changes.containment,
+                &mut dirty_scopes,
+                &mut dirty_outer_roots,
+            );
+        }
+    }
+
+    for entity in changes.changed_children.iter() {
+        mark_layout_scope(
+            entity,
+            true,
+            &ui_children,
+            &changes.containment,
+            &mut dirty_scopes,
+            &mut dirty_outer_roots,
+        );
+    }
+    for entity in changes.changed_parent.iter() {
+        mark_layout_scope(
+            entity,
+            false,
+            &ui_children,
+            &changes.containment,
+            &mut dirty_scopes,
+            &mut dirty_outer_roots,
+        );
+    }
+
+    let hierarchy_changed =
+        !changes.changed_children.is_empty() || !changes.changed_parent.is_empty();
+    let mut sync_children = hierarchy_changed || !changes.added_node.is_empty();
+    #[cfg(feature = "ghost_nodes")]
+    let mut compute_all_roots = false;
+    #[cfg(not(feature = "ghost_nodes"))]
+    let compute_all_roots = false;
 
     // update and remove children
     #[cfg(not(feature = "ghost_nodes"))]
     {
-        for entity in removed_children.read() {
+        for entity in changes.removed_children.read() {
+            sync_children = true;
+            mark_layout_scope(
+                entity,
+                true,
+                &ui_children,
+                &changes.containment,
+                &mut dirty_scopes,
+                &mut dirty_outer_roots,
+            );
             ui_surface.try_remove_children(entity);
         }
     }
@@ -124,16 +252,24 @@ pub fn ui_layout_system(
     {
         // Collect the closest non-ghost ancestors of entities that had `GhostNode` added or removed since last layout update.
         ui_surface.dirty_ghost_children_scratch.clear();
-        for entity in added_ghost_node_query
-            .iter()
-            .chain(removed_ghost_nodes.read())
-        {
+        for entity in added_ghost_node_query.iter() {
+            sync_children = true;
+            compute_all_roots = true;
+            if let Some(parent) = ui_children.get_parent(entity) {
+                ui_surface.dirty_ghost_children_scratch.insert(parent);
+            }
+        }
+        for entity in removed_ghost_nodes.read() {
+            sync_children = true;
+            compute_all_roots = true;
             if let Some(parent) = ui_children.get_parent(entity) {
                 ui_surface.dirty_ghost_children_scratch.insert(parent);
             }
         }
 
-        for entity in removed_children.read() {
+        for entity in changes.removed_children.read() {
+            sync_children = true;
+            compute_all_roots = true;
             ui_surface.try_remove_children(entity);
             if ghost_node_query.contains(entity)
                 && let Some(parent) = ui_children.get_parent(entity)
@@ -143,14 +279,57 @@ pub fn ui_layout_system(
         }
     }
 
-    // clean up removed nodes after syncing children to avoid potential panic (invalid SlotMap key used)
-    ui_surface.remove_entities(
-        removed_nodes
-            .read()
-            .filter(|entity| !node_query.contains(*entity)),
-    );
+    for entity in changes.removed_parent.read() {
+        sync_children = true;
+        mark_layout_scope(
+            entity,
+            false,
+            &ui_children,
+            &changes.containment,
+            &mut dirty_scopes,
+            &mut dirty_outer_roots,
+        );
+    }
 
-    for ui_root_entity in ui_root_node_query.iter() {
+    // Removing a Taffy node detaches it from its parent before affected child lists are rebuilt.
+    for entity in changes
+        .removed_node
+        .read()
+        .filter(|entity| !node_query.contains(*entity))
+    {
+        let (scope, outer_root) = layout_scope(entity, false, &ui_children, &changes.containment);
+        if node_query.contains(scope) {
+            dirty_scopes.insert(scope);
+            if outer_root {
+                dirty_outer_roots.insert(scope);
+            }
+        }
+        ui_surface.remove_entities([entity]);
+    }
+
+    if compute_all_roots {
+        dirty_scopes.clear();
+        dirty_scopes.extend(ui_root_node_query.iter());
+        dirty_outer_roots.clear();
+        dirty_outer_roots.extend(ui_root_node_query.iter());
+    }
+
+    for &entity in dirty_scopes.iter() {
+        let mut ancestor = ui_children.get_parent(entity);
+        let mut covered_by_ancestor = false;
+        while let Some(parent) = ancestor {
+            if dirty_scopes.contains(&parent) {
+                covered_by_ancestor = true;
+                break;
+            }
+            ancestor = ui_children.get_parent(parent);
+        }
+        if !covered_by_ancestor {
+            scope_roots.push(entity);
+        }
+    }
+
+    for ui_root_entity in scope_roots.drain(..) {
         fn update_children_recursively(
             ui_surface: &mut UiSurface,
             ui_children: &UiChildren,
@@ -176,38 +355,68 @@ pub fn ui_layout_system(
             }
         }
 
-        update_children_recursively(
-            &mut ui_surface,
-            &ui_children,
-            &added_node_query,
-            ui_root_entity,
-        );
+        if sync_children {
+            update_children_recursively(
+                &mut ui_surface,
+                &ui_children,
+                &changes.added_node,
+                ui_root_entity,
+            );
+        }
 
-        let (_, _, _, computed_target) = node_query.get(ui_root_entity).unwrap();
+        let Ok((_, _, _, computed_target, _)) = node_query.get(ui_root_entity) else {
+            continue;
+        };
+        ui_surface.layout_geometry_scopes.insert(ui_root_entity);
 
-        ui_surface.compute_layout(
-            ui_root_entity,
-            computed_target.physical_size,
-            &mut buffer_query,
-            &mut font_system,
-        );
+        if dirty_outer_roots.contains(&ui_root_entity) {
+            ui_surface.compute_layout(
+                ui_root_entity,
+                computed_target.physical_size,
+                &mut buffer_query,
+                &mut font_system,
+            );
+        }
+
+        fn compute_contained_layouts_recursively(
+            ui_surface: &mut UiSurface,
+            ui_children: &UiChildren,
+            containment_query: &Query<(), With<LayoutContainment>>,
+            buffer_query: &mut Query<&mut ComputedTextBlock>,
+            font_system: &mut FontCx,
+            entity: Entity,
+        ) {
+            if containment_query.contains(entity) {
+                ui_surface.compute_contained_layout(entity, buffer_query, font_system);
+            }
+            for child in ui_children.iter_ui_children(entity) {
+                compute_contained_layouts_recursively(
+                    ui_surface,
+                    ui_children,
+                    containment_query,
+                    buffer_query,
+                    font_system,
+                    child,
+                );
+            }
+        }
+
+        if !changes.containment.is_empty() {
+            compute_contained_layouts_recursively(
+                &mut ui_surface,
+                &ui_children,
+                &changes.containment,
+                &mut buffer_query,
+                &mut font_system,
+                ui_root_entity,
+            );
+        }
     }
 }
 
 #[derive(SystemParam)]
 #[doc(hidden)]
 pub struct GeometryChanges<'w, 's> {
-    layout: Query<
-        'w,
-        's,
-        Entity,
-        Or<(
-            Changed<Node>,
-            Changed<ContentSize>,
-            Changed<ComputedUiRenderTargetInfo>,
-        )>,
-    >,
-    hierarchy: Query<'w, 's, Entity, Or<(Changed<Children>, Changed<ChildOf>)>>,
     subtrees: Query<
         'w,
         's,
@@ -222,12 +431,7 @@ pub struct GeometryChanges<'w, 's> {
             )>,
         ),
     >,
-    outlines: Query<'w, 's, Entity, (With<Node>, Changed<Outline>)>,
-    removed_node: RemovedComponents<'w, 's, Node>,
-    removed_content_size: RemovedComponents<'w, 's, ContentSize>,
-    removed_target: RemovedComponents<'w, 's, ComputedUiRenderTargetInfo>,
-    removed_children: RemovedComponents<'w, 's, Children>,
-    removed_parent: RemovedComponents<'w, 's, ChildOf>,
+    nodes: Query<'w, 's, Entity, (With<Node>, Or<(Changed<Node>, Changed<Outline>)>)>,
     removed_transform: RemovedComponents<'w, 's, UiTransform>,
     removed_config: RemovedComponents<'w, 's, LayoutConfig>,
     removed_outline: RemovedComponents<'w, 's, Outline>,
@@ -236,15 +440,6 @@ pub struct GeometryChanges<'w, 's> {
 }
 
 impl GeometryChanges<'_, '_> {
-    fn requires_all_roots(&mut self) -> bool {
-        !self.hierarchy.is_empty()
-            | drain_removed(&mut self.removed_node)
-            | drain_removed(&mut self.removed_content_size)
-            | drain_removed(&mut self.removed_target)
-            | drain_removed(&mut self.removed_children)
-            | drain_removed(&mut self.removed_parent)
-    }
-
     fn collect_local(
         &mut self,
         dirty_subtrees: &mut EntityHashSet,
@@ -255,7 +450,7 @@ impl GeometryChanges<'_, '_> {
         dirty_subtrees.extend(self.removed_config.read());
         dirty_subtrees.extend(self.removed_scroll.read());
         dirty_subtrees.extend(self.removed_ignore_scroll.read());
-        dirty_nodes.extend(self.outlines.iter());
+        dirty_nodes.extend(self.nodes.iter());
         dirty_nodes.extend(self.removed_outline.read());
     }
 }
@@ -307,12 +502,11 @@ fn geometry_context(
 
 /// Resolves Taffy output, transforms, scrolling, outlines, and radii into render geometry.
 ///
-/// Layout-affecting changes resolve their complete UI roots because Taffy may move siblings.
-/// Placement changes resolve only the changed subtrees, and outline changes resolve only the
-/// changed nodes.
+/// Layout-affecting changes resolve the nearest containing layout scope because Taffy may move
+/// siblings within it. Placement changes resolve only the changed subtrees, and outline changes
+/// resolve only the changed nodes.
 pub fn ui_geometry_system(
     mut ui_surface: ResMut<UiSurface>,
-    ui_root_node_query: UiRootNodes,
     ui_children: UiChildren,
     target_query: Query<&ComputedUiRenderTargetInfo>,
     mut node_queries: ParamSet<(
@@ -338,18 +532,7 @@ pub fn ui_geometry_system(
     subtree_roots.clear();
 
     changes.collect_local(&mut dirty_subtrees, &mut dirty_nodes);
-    for entity in changes.layout.iter() {
-        let mut root = entity;
-        while let Some(parent) = ui_children.get_parent(root) {
-            root = parent;
-        }
-        dirty_subtrees.insert(root);
-    }
-    if changes.requires_all_roots() {
-        dirty_subtrees.clear();
-        dirty_nodes.clear();
-        dirty_subtrees.extend(ui_root_node_query.iter());
-    }
+    dirty_subtrees.extend(ui_surface.layout_geometry_scopes.drain());
 
     for &entity in dirty_subtrees.iter() {
         let mut ancestor = ui_children.get_parent(entity);
@@ -406,7 +589,7 @@ pub fn ui_geometry_system(
             continue;
         };
         let mut node_update_query = node_queries.p0();
-        update_outline_geometry(
+        update_local_node_geometry(
             entity,
             &mut node_update_query,
             computed_target.scale_factor,
@@ -491,8 +674,12 @@ fn update_uinode_geometry_recursive(
             max_inset: Vec2::new(rect.right, rect.bottom),
         };
 
-        node.bypass_change_detection().border = taffy_rect_to_border_rect(layout.border);
-        node.bypass_change_detection().padding = taffy_rect_to_border_rect(layout.padding);
+        let border = taffy_rect_to_border_rect(layout.border);
+        let padding = taffy_rect_to_border_rect(layout.padding);
+        if node.border != border || node.padding != padding {
+            node.border = border;
+            node.padding = padding;
+        }
 
         // Compute the node's new global transform
         let mut local_transform = transform.compute_affine(
@@ -567,7 +754,7 @@ fn update_uinode_geometry_recursive(
     }
 }
 
-fn update_outline_geometry(
+fn update_local_node_geometry(
     entity: Entity,
     node_update_query: &mut Query<(
         &mut ComputedNode,
@@ -586,6 +773,9 @@ fn update_outline_geometry(
     else {
         return;
     };
+    let size = node.size;
+    node.bypass_change_detection().border_radius =
+        style.border_radius.resolve(scale_factor, size, target_size);
     update_outline_values(&mut node, style, maybe_outline, scale_factor, target_size);
 }
 
@@ -623,8 +813,11 @@ fn update_outline_values(
 #[cfg(test)]
 mod tests {
     use crate::{
-        layout::ui_surface::UiSurface, prelude::*, ui_geometry_system, ui_layout_system,
-        update::propagate_ui_target_cameras, ContentSize, LayoutContext,
+        layout::ui_surface::UiSurface,
+        prelude::*,
+        ui_geometry_system, ui_layout_system,
+        update::{propagate_ui_target_cameras, update_clipping_system},
+        ContentSize, LayoutContext,
     };
     use bevy_app::{App, HierarchyPropagatePlugin, PostUpdate, PropagateSet, TaskPoolPlugin};
     use bevy_camera::{Camera, Camera2d, ComputedCameraValues, RenderTargetInfo, Viewport};
@@ -665,6 +858,7 @@ mod tests {
                 propagate_ui_target_cameras,
                 ui_layout_system,
                 ui_geometry_system,
+                update_clipping_system,
                 mark_dirty_trees,
                 sync_simple_transforms,
                 propagate_parent_transforms,
@@ -736,6 +930,399 @@ mod tests {
         app.world_mut().get_mut::<Node>(leaf_a).unwrap().width = Val::Px(1.0);
         app.update();
         assert_eq!(app.world().resource::<UiSurface>().geometry_visits, 3);
+    }
+
+    #[test]
+    fn layout_computes_only_the_changed_root() {
+        let mut app = setup_ui_test_app();
+        let root_a = app.world_mut().spawn(Node::default()).id();
+        let leaf_a = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(root_a)))
+            .id();
+        let root_b = app.world_mut().spawn(Node::default()).id();
+        app.world_mut().spawn((Node::default(), ChildOf(root_b)));
+        app.update();
+
+        app.world_mut()
+            .resource_mut::<UiSurface>()
+            .layout_computations = 0;
+        app.world_mut().get_mut::<Node>(leaf_a).unwrap().width = Val::Px(1.0);
+        app.update();
+
+        assert_eq!(app.world().resource::<UiSurface>().layout_computations, 1);
+    }
+
+    #[test]
+    fn equal_node_write_does_not_compute_layout() {
+        let mut app = setup_ui_test_app();
+        let node = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(20.0),
+                ..default()
+            })
+            .id();
+        app.update();
+
+        app.world_mut()
+            .resource_mut::<UiSurface>()
+            .layout_computations = 0;
+        app.world_mut().get_mut::<Node>(node).unwrap().width = Val::Px(20.0);
+        app.update();
+
+        assert_eq!(app.world().resource::<UiSurface>().layout_computations, 0);
+    }
+
+    #[test]
+    fn contained_layout_change_stops_at_the_boundary() {
+        let mut app = setup_ui_test_app();
+        let root = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(500.0),
+                height: Val::Px(100.0),
+                ..default()
+            })
+            .id();
+        let boundary = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(200.0),
+                    height: Val::Px(100.0),
+                    ..default()
+                },
+                LayoutContainment,
+                ChildOf(root),
+            ))
+            .id();
+        let leaf = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(20.0),
+                    height: Val::Px(20.0),
+                    ..default()
+                },
+                ChildOf(boundary),
+            ))
+            .id();
+        app.world_mut().spawn((Node::default(), ChildOf(root)));
+        app.update();
+
+        let mut surface = app.world_mut().resource_mut::<UiSurface>();
+        surface.layout_computations = 0;
+        surface.geometry_visits = 0;
+        app.world_mut().get_mut::<Node>(leaf).unwrap().width = Val::Px(21.0);
+        app.update();
+
+        let surface = app.world().resource::<UiSurface>();
+        assert_eq!(surface.layout_computations, 1);
+        assert_eq!(surface.geometry_visits, 2);
+    }
+
+    #[test]
+    fn reparenting_between_contained_layouts_updates_only_both_boundaries() {
+        let mut app = setup_ui_test_app();
+        let root = app.world_mut().spawn(Node::default()).id();
+        let boundary_a = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(100.0),
+                    height: Val::Px(100.0),
+                    ..default()
+                },
+                LayoutContainment,
+                ChildOf(root),
+            ))
+            .id();
+        let boundary_b = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(100.0),
+                    height: Val::Px(100.0),
+                    ..default()
+                },
+                LayoutContainment,
+                ChildOf(root),
+            ))
+            .id();
+        let leaf = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(boundary_a)))
+            .id();
+        app.update();
+
+        let mut surface = app.world_mut().resource_mut::<UiSurface>();
+        surface.layout_computations = 0;
+        surface.geometry_visits = 0;
+        app.world_mut().entity_mut(leaf).insert(ChildOf(boundary_b));
+        app.update();
+
+        let surface = app.world().resource::<UiSurface>();
+        assert_eq!(surface.layout_computations, 2);
+        assert_eq!(surface.geometry_visits, 3);
+    }
+
+    #[test]
+    fn nested_containment_stops_at_the_nearest_boundary() {
+        let mut app = setup_ui_test_app();
+        let outer = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(200.0),
+                    height: Val::Px(100.0),
+                    ..default()
+                },
+                LayoutContainment,
+            ))
+            .id();
+        let inner = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(100.0),
+                    height: Val::Px(50.0),
+                    ..default()
+                },
+                LayoutContainment,
+                ChildOf(outer),
+            ))
+            .id();
+        let leaf = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(20.0),
+                    height: Val::Px(20.0),
+                    ..default()
+                },
+                ChildOf(inner),
+            ))
+            .id();
+        app.update();
+
+        let mut surface = app.world_mut().resource_mut::<UiSurface>();
+        surface.layout_computations = 0;
+        surface.geometry_visits = 0;
+        app.world_mut().get_mut::<Node>(leaf).unwrap().width = Val::Px(21.0);
+        app.update();
+
+        let surface = app.world().resource::<UiSurface>();
+        assert_eq!(surface.layout_computations, 1);
+        assert_eq!(surface.geometry_visits, 2);
+
+        app.world_mut()
+            .resource_mut::<UiSurface>()
+            .layout_computations = 0;
+        app.world_mut().get_mut::<Node>(inner).unwrap().width = Val::Px(101.0);
+        app.update();
+        assert_eq!(app.world().resource::<UiSurface>().layout_computations, 2);
+    }
+
+    #[test]
+    fn root_containment_distinguishes_its_outer_and_inner_layouts() {
+        let mut app = setup_ui_test_app();
+        let boundary = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(200.0),
+                    height: Val::Px(100.0),
+                    ..default()
+                },
+                LayoutContainment,
+            ))
+            .id();
+        let leaf = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(boundary)))
+            .id();
+        app.update();
+
+        app.world_mut()
+            .resource_mut::<UiSurface>()
+            .layout_computations = 0;
+        app.world_mut().get_mut::<Node>(leaf).unwrap().width = Val::Px(1.0);
+        app.update();
+        assert_eq!(app.world().resource::<UiSurface>().layout_computations, 1);
+
+        app.world_mut()
+            .resource_mut::<UiSurface>()
+            .layout_computations = 0;
+        app.world_mut().get_mut::<Node>(boundary).unwrap().width = Val::Px(201.0);
+        app.update();
+        assert_eq!(app.world().resource::<UiSurface>().layout_computations, 2);
+    }
+
+    #[test]
+    fn removing_override_clip_restores_the_current_parent_clip() {
+        let mut app = setup_ui_test_app();
+        let parent = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(100.0),
+                height: Val::Px(50.0),
+                overflow: Overflow::clip(),
+                ..default()
+            })
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((Node::default(), OverrideClip, ChildOf(parent)))
+            .id();
+        let leaf = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(child)))
+            .id();
+        app.update();
+        assert!(app.world().get::<CalculatedClip>(leaf).is_none());
+
+        app.world_mut().entity_mut(child).remove::<OverrideClip>();
+        app.update();
+
+        let parent_clip = app.world().get::<CalculatedClip>(child).unwrap().clip;
+        assert_eq!(
+            app.world().get::<CalculatedClip>(leaf).unwrap().clip,
+            parent_clip
+        );
+    }
+
+    #[test]
+    fn resolved_border_change_updates_descendant_clipping() {
+        let mut app = setup_ui_test_app();
+        let parent = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(100.0),
+                height: Val::Px(50.0),
+                overflow: Overflow::clip(),
+                ..default()
+            })
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(parent)))
+            .id();
+        app.update();
+        let before = app.world().get::<CalculatedClip>(child).unwrap().clip;
+
+        app.world_mut().get_mut::<Node>(parent).unwrap().border = UiRect::all(Val::Px(10.0));
+        app.update();
+
+        let after = app.world().get::<CalculatedClip>(child).unwrap().clip;
+        assert_eq!(after.width(), before.width() - 20.0);
+        assert_eq!(after.height(), before.height() - 20.0);
+    }
+
+    #[test]
+    fn contained_layout_matches_an_uncontained_fixed_box() {
+        let mut app = setup_ui_test_app();
+
+        fn spawn_tree(world: &mut World, contained: bool) -> (Entity, [Entity; 2]) {
+            let mut boundary = world.spawn(Node {
+                width: Val::Px(200.0),
+                height: Val::Px(100.0),
+                box_sizing: BoxSizing::ContentBox,
+                padding: UiRect::all(Val::Px(10.0)),
+                border: UiRect::all(Val::Px(2.0)),
+                overflow: Overflow::scroll_x(),
+                scrollbar_width: 7.0,
+                column_gap: Val::Px(5.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            });
+            if contained {
+                boundary.insert(LayoutContainment);
+            }
+            let boundary = boundary.id();
+            let children = core::array::from_fn(|index| {
+                world
+                    .spawn((
+                        Node {
+                            width: Val::Px(if index == 0 { 220.0 } else { 20.0 }),
+                            height: Val::Px(10.0),
+                            flex_shrink: 0.0,
+                            ..default()
+                        },
+                        ChildOf(boundary),
+                    ))
+                    .id()
+            });
+            (boundary, children)
+        }
+
+        let (plain, plain_children) = spawn_tree(app.world_mut(), false);
+        let (contained, contained_children) = spawn_tree(app.world_mut(), true);
+        app.update();
+
+        assert_eq!(
+            app.world().get::<ComputedNode>(plain).unwrap(),
+            app.world().get::<ComputedNode>(contained).unwrap()
+        );
+        for (plain_child, contained_child) in plain_children.into_iter().zip(contained_children) {
+            assert_eq!(
+                app.world().get::<ComputedNode>(plain_child).unwrap(),
+                app.world().get::<ComputedNode>(contained_child).unwrap()
+            );
+            assert_eq!(
+                app.world().get::<UiGlobalTransform>(plain_child).unwrap(),
+                app.world()
+                    .get::<UiGlobalTransform>(contained_child)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn containment_can_be_added_and_removed_without_stale_taffy_edges() {
+        let mut app = setup_ui_test_app();
+        let boundary = app.world_mut().spawn(Node::default()).id();
+        app.world_mut().spawn((
+            Node {
+                width: Val::Px(40.0),
+                height: Val::Px(20.0),
+                ..default()
+            },
+            ChildOf(boundary),
+        ));
+        app.update();
+
+        let ordinary_size = app.world().get::<ComputedNode>(boundary).unwrap().size();
+        assert_eq!(ordinary_size, Vec2::new(40.0, 20.0));
+
+        app.world_mut()
+            .entity_mut(boundary)
+            .insert(LayoutContainment);
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(boundary).unwrap().size(),
+            Vec2::ZERO
+        );
+        assert!(
+            app.world().resource::<UiSurface>().entity_to_taffy[&boundary]
+                .container_id
+                .is_some()
+        );
+
+        app.world_mut()
+            .entity_mut(boundary)
+            .remove::<LayoutContainment>();
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(boundary).unwrap().size(),
+            ordinary_size
+        );
+        assert!(
+            app.world().resource::<UiSurface>().entity_to_taffy[&boundary]
+                .container_id
+                .is_none()
+        );
     }
 
     #[test]

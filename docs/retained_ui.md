@@ -11,9 +11,10 @@ The objective is stricter than ordinary "retained mode":
 - pixels are repainted only when a complete dependency proof says their current
   value may be wrong;
 - layout, placement, paint, raster, and composition changes are independent;
-- a static UI performs no main-world UI work, no extraction, and no raster work;
-  if the game renders a fresh world frame, only the irreducible composition of
-  visible cached UI remains;
+- a static UI performs no Taffy computation, recursive geometry, stack, clipping,
+  extraction, or raster work; stock `Changed<T>` candidate scans and, if the game
+  renders a fresh world frame, the irreducible composition of visible cached UI
+  remain;
 - correctness never depends on a timing threshold, heartbeat, or cache
   promotion heuristic.
 
@@ -28,16 +29,16 @@ The first implementation is therefore an external replacement for
 `bevy_ui_render`. Crate scope expands only when a tested requirement cannot be
 implemented through public scheduling and render-graph APIs.
 
-Known likely expansion points are:
+The implemented expansion decisions are:
 
-1. `bevy_ui`: stock layout, stack construction, and clipping walk static trees.
+1. `bevy_ui`: stock layout, stack construction, and clipping walked static trees,
+   and stock Taffy invalidation coupled every descendant to its complete UI root.
    [Issue #22909](https://github.com/bevyengine/bevy/issues/22909) describes the
-   same idle-cost and root-invalidation problem. We will first test whether an
-   external plugin can gate the public `UiSystems` sets and handle placement
-   separately.
-2. `bevy_core_pipeline`: a fresh world frame still needs cached UI composited.
-   We will first test a final-writer interposition that preserves Bevy's output
-   attachment and presentation bookkeeping, avoiding a core-pipeline fork.
+   same idle cost and root invalidation. A focused `bevy_ui` patch was required
+   for independent layout/geometry scheduling and semantic layout containment.
+2. `bevy_core_pipeline`: no patch is currently required. The retained crate
+   replaces the public final-writer system and preserves Bevy's output attachment
+   and presentation bookkeeping.
 
 Current upstream UI-render work retains intermediate render data, but not final
 pixels:
@@ -73,16 +74,51 @@ scroll-only animation could avoid Taffy only by either:
 - duplicating Bevy's geometry traversal in the third-party crate.
 
 The second choice creates two owners for the same derived state and is rejected.
-The focused `bevy_ui` patch now splits the original function into public,
+The focused `bevy_ui` patch splits the original function into public,
 ordered `ui_layout_system` and `ui_geometry_system` systems. The former owns
 Taffy synchronization and computation; the latter owns placement, scrolling,
 rounding, outlines, radii, and derived render geometry. This is the second
 justified `bevy_ui` expansion: it lets a `UiTransform` or scroll animation skip
-Taffy without duplicating Bevy internals. Geometry nomination is exact:
-layout-affecting changes resolve their affected root because Taffy may move
-siblings, transforms and scrolling resolve only the changed subtree, and an
-outline resolves only its node. Static-tree quiescence alone would not have
-justified this patch.
+Taffy without duplicating Bevy internals. Geometry consumes the exact scopes that
+layout actually computed instead of independently inferring them from another
+`Changed<T>` list. Transforms and scrolling resolve only the changed subtree;
+radius and outline changes resolve one node.
+
+Root-level gating alone cannot remove a real layout spike. In a flat 10,000-child
+flex row, changing one child's width can change every sibling through flex shrink;
+Taffy is correct to recompute that dependency root. Profiling on the development
+machine attributed roughly 3.5--4 ms of the original 4--5 ms frame to that
+coupled Taffy computation. Disabling retained bookkeeping did not remove it.
+
+`LayoutContainment` is the justified third `bevy_ui` expansion. It is an explicit
+size-and-layout promise, analogous to CSS size/layout containment and Flutter's
+relayout boundaries: descendants are laid out under a disconnected Taffy root
+whose constraints are the boundary's already-resolved border box. Descendant
+changes therefore cannot affect the boundary's size or anything outside it.
+The boundary's own `Node` still participates normally in its parent's layout.
+No threshold or inferred promotion is involved; applications should give a
+boundary an explicit size when a zero intrinsic size is not useful.
+
+```rust
+commands
+    .spawn((
+        Node {
+            width: px(640),
+            height: px(360),
+            ..default()
+        },
+        LayoutContainment,
+    ))
+    .with_children(spawn_menu_contents);
+```
+
+Dirty layout scopes distinguish the boundary's outer box from its contained
+contents. This matters when a containment boundary is itself an ECS root:
+changing a descendant computes only the contained tree, while changing the
+boundary's own size computes the outer tree and then the contained tree if its
+constraints changed. Nested containment stops at the nearest boundary, and
+reparenting updates exactly the old and new boundaries. Equal `Node` writes are
+compared against Taffy's canonical style and do not dirty Taffy.
 
 There is a second possible `bevy_ui` boundary for O(changes) candidate
 nomination. In Bevy 0.19, lifecycle hooks run for component insertion,
@@ -349,7 +385,7 @@ The implementation uses these conceptual domains:
 | Domain | Examples | Required work |
 | --- | --- | --- |
 | Structure | children, visibility participation, render family | rebuild affected identities/order/dependencies |
-| Measure | `Node`, content size, text metrics, target scale | run layout for the affected dependency root |
+| Measure | layout fields in `Node`, content size, text metrics, target scale | run layout for the nearest semantic dependency scope |
 | Placement | `UiTransform`, scroll offset | update spatial properties and affected descendant coverage |
 | Paint | colors, glyphs, borders, image selection | rebuild only affected paint records and repair their pixels |
 | Composite | retained-island transform or opacity | update compositor properties, no island repaint |
@@ -357,7 +393,10 @@ The implementation uses these conceptual domains:
 
 For existing Bevy components, the intended semantics are:
 
-- `Node` changes layout;
+- layout fields in `Node` nominate layout, then canonical Taffy-style comparison
+  decides whether layout actually became dirty;
+- `LayoutContainment` prevents descendant measure changes from escaping its
+  explicitly sized box;
 - `UiTransform` changes placement but not measurement;
 - `BackgroundColor`, `BorderColor`, and equivalent visual components change
   paint but not layout;
@@ -547,11 +586,17 @@ The current matrix is exact about what it includes:
 | Layer | Sizes | Shapes | Mutations | Deliberately excluded |
 |---|---:|---|---|---|
 | `Changed<T>` nomination | 100, 1,000, 10,000 entities | one archetype | quiet, one changed, all changed; one input and an eight-input `Or` | canonical extraction and rendering |
-| Main-world UI work | 100, 1,000, 10,000 nodes | flat, four-way balanced, 100-node independent roots; a 256-deep chain | quiet, one layout, one placement, all layout; one reparent for the forest | render extraction and GPU work |
+| Main-world UI work | 100, 1,000, 10,000 nodes | flat, four-way balanced, 100-node independent roots, explicit containment groups of 10/100/1,000; a 256-deep chain | quiet, equal `Node` write, one/all layout, one local node-geometry change, one placement, one change per boundary, all contained leaves; one reparent for the forest | render extraction and GPU work |
 | Canonical paint and damage union | 100, 1,000, 10,000 records | adjacent tiles, separated pixels, full overlap | quiet, one paint change, all paint changes | Bevy extraction and rasterization |
 | Sorted replay selection | 100, 1,000, 10,000 items | one disjoint hit, a contiguous 10% cluster, alternating 50% hits, full overlap | one damage region | draw-command execution and rasterization |
 | GPU acceptance | small 64-by-64 scenes | disjoint and translucent overlap across every integrated family | quiet and targeted changes | stable wall-clock timing |
 | Windowed stress executable | configurable, 10,000 by default | grid, full overlap, alternating overlap; background, text, image, gradients/shadows/borders, or mixed | quiet, one/all paint, one/all placement, one/all layout, one churn | automated pass/fail timing thresholds |
+
+Layout topology and paint overlap are orthogonal inputs: overlap does not alter
+Taffy's dependency graph, so the layout Criterion cases do not duplicate every
+paint geometry. The windowed stress executable composes them, allowing (for
+example) 10,000 fully overlapping nodes, 100-node layout containment, mixed
+paint families, and one or all layout animations in the same run.
 
 The deterministic 10,000-record tests prove that quiet retained paint submits
 zero candidates, one animation submits one candidate, and 10,000 animations
@@ -560,9 +605,11 @@ one replay item, full overlap selects all 10,000, alternating overlap selects
 5,000 items in 5,000 ranges, and one remove/reinsert performs constant record
 work. GPU tests separately assert records and quads replayed, damaged pixels,
 surface repairs, fused composites, and physical UI texture samples. Main-world
-counters prove that quiet and paint-only frames execute no Taffy, geometry,
-stack, or clipping walk; they do not pretend the remaining change-detection
-scans cost zero.
+counters prove that quiet and paint-only frames execute no Taffy, recursive
+geometry, stack, or clipping walk. Layout-scope unit tests assert exact Taffy
+computation and geometry-visit counts for multiple roots, nested containment,
+marker insertion/removal, and reparenting between boundaries. They do not
+pretend the remaining change-detection scans cost zero.
 
 - [Bevy benchmark instructions](../benches/README.md)
 
@@ -573,22 +620,29 @@ baselines:
 
 | 10,000-node shape and mutation | Stock | Retained |
 |---|---:|---:|
-| flat, quiet | 1.098 ms | 0.224 ms |
-| flat, one layout change | 4.044 ms | 4.264 ms |
-| flat, one placement change | 0.937 ms | 0.276 ms |
-| flat, all layout changes | 5.148 ms | 5.649 ms |
-| balanced, quiet | 1.037 ms | 0.159 ms |
-| balanced, one layout change | 1.429 ms | 1.441 ms |
-| balanced, one placement change | 1.038 ms | 0.297 ms |
-| 100 independent roots, quiet | 0.899 ms | 0.231 ms |
-| 100 independent roots, one layout change | 1.069 ms | 0.867 ms |
-| 100 independent roots, one placement change | 0.887 ms | 0.303 ms |
-| 100 independent roots, one reparent | 1.475 ms | 1.427 ms |
+| flat, quiet | 0.461 ms | 0.208 ms |
+| flat, one equal `Node` write | 0.426 ms | 0.242 ms |
+| flat, one radius change | 0.400 ms | 0.252 ms |
+| flat, one genuinely coupled layout change | 4.171 ms | 4.100 ms |
+| flat, all layout changes | 5.816 ms | 5.637 ms |
+| contained 10, one internal layout change | 0.307 ms | 0.202 ms |
+| contained 100, one internal layout change | 0.296 ms | 0.173 ms |
+| contained 1,000, one internal layout change | 0.511 ms | 0.440 ms |
+| contained 100, boundary's own layout changes | 0.805 ms | 0.686 ms |
+| contained 100, one internal change in every boundary | 2.868 ms | 2.778 ms |
+| contained 100, all internal leaves change | 4.453 ms | 4.236 ms |
 
-A 256-deep chain measured 37.9 microseconds retained versus 84.9 microseconds
-stock when quiet, 49.6 versus 83.9 microseconds for one placement change, and
-291 microseconds for one layout change on both paths. A 1,000-deep chain
-overflowed a Bevy task-pool thread's stack during initial layout, so it is
+The contained results show the intended scaling law: a mutation pays for the
+changed candidate scan plus the smallest semantically coupled widget, not the
+whole menu. Changing one leaf in every boundary or every contained leaf remains
+an intentionally expensive case because it genuinely invalidates all groups.
+The benchmark includes both cases rather than presenting containment only in
+its best case.
+
+A 256-deep chain previously measured 37.9 microseconds retained versus 84.9
+microseconds stock when quiet, 49.6 versus 83.9 microseconds for one placement
+change, and 291 microseconds for one layout change on both paths. A 1,000-deep
+chain overflowed a Bevy task-pool thread's stack during initial layout, so it is
 recorded as an unsupported stress result rather than silently omitted or
 reported as a timing.
 
@@ -887,13 +941,17 @@ The windowed stress matrix is intended to run unchanged on the target device:
 cargo run --profile stress-test -p bevy_ui_render_retained --features stress_test \
   --example stress_test -- \
   --renderer retained --geometry overlap --family mixed \
-  --workload one-paint --nodes 10000 --frames 1200
+  --workload one-layout --nodes 10000 --layout-group 100 --frames 1200
 ```
 
 Run the same command with `--renderer stock` for the A/B. Geometry accepts
 `grid`, `overlap`, and `alternating`; family accepts `background`, `text`,
 `image`, `effects`, and `mixed`; workload accepts `quiet`, `one-paint`, `all-paint`,
 `one-placement`, `all-placement`, `one-layout`, `all-layout`, and `one-churn`.
+Omitting `--layout-group` creates one coupled root; supplying a positive size
+partitions the nodes into explicit `LayoutContainment` widgets of that size.
+The 10/100/1,000 sweep used by Criterion can therefore be repeated on physical
+target hardware without changing code.
 It prints Bevy frame-time diagnostics and, on the retained path, cumulative
 main-world, extraction, damage, replay, composite, and UI-sample counters every
 120 frames, plus the current retained texture payload bytes. The byte gauge is

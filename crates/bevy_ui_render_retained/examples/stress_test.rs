@@ -88,6 +88,7 @@ struct Config {
     family: Family,
     workload: Workload,
     nodes: usize,
+    layout_group: Option<usize>,
     frames: Option<u32>,
 }
 
@@ -99,6 +100,7 @@ impl Default for Config {
             family: Family::Background,
             workload: Workload::Quiet,
             nodes: 10_000,
+            layout_group: None,
             frames: None,
         }
     }
@@ -154,6 +156,10 @@ impl Config {
                     };
                 }
                 "--nodes" => config.nodes = value().parse().expect("--nodes must be an integer"),
+                "--layout-group" => {
+                    config.layout_group =
+                        Some(value().parse().expect("--layout-group must be an integer"));
+                }
                 "--frames" => {
                     config.frames = Some(value().parse().expect("--frames must be an integer"));
                 }
@@ -162,7 +168,7 @@ impl Config {
                         "--renderer stock|retained --geometry grid|overlap|alternating \
                          --family background|text|image|effects|mixed \
                          --workload quiet|one-paint|all-paint|one-placement|all-placement|\
-                         one-layout|all-layout|one-churn --nodes N [--frames N]"
+                         one-layout|all-layout|one-churn --nodes N [--layout-group N] [--frames N]"
                     );
                     std::process::exit(0);
                 }
@@ -170,13 +176,16 @@ impl Config {
             }
         }
         assert!(config.nodes > 0, "--nodes must be nonzero");
+        assert!(
+            config.layout_group.is_none_or(|size| size > 0),
+            "--layout-group must be nonzero"
+        );
         config
     }
 }
 
 #[derive(Resource)]
 struct StressNodes {
-    root: Entity,
     nodes: Vec<StressItem>,
     image: Handle<Image>,
     alternate: bool,
@@ -185,6 +194,7 @@ struct StressNodes {
 #[derive(Clone, Copy)]
 struct StressItem {
     entity: Entity,
+    parent: Entity,
     family: ItemFamily,
 }
 
@@ -277,21 +287,42 @@ fn setup(mut commands: Commands, config: Res<Config>, mut images: ResMut<Assets<
         .id();
     let columns = (config.nodes as f32).sqrt().ceil() as usize;
     let mut nodes = Vec::with_capacity(config.nodes);
+    let mut parent = root;
     for index in 0..config.nodes {
+        if config
+            .layout_group
+            .is_some_and(|group_size| index.is_multiple_of(group_size))
+        {
+            parent = commands
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: percent(100),
+                        height: percent(100),
+                        ..Default::default()
+                    },
+                    LayoutContainment,
+                    ChildOf(root),
+                ))
+                .id();
+        }
         let family = config.family.item(index);
         let entity = spawn_item(
             &mut commands,
-            root,
+            parent,
             family,
             config.geometry,
             index,
             columns,
             &image,
         );
-        nodes.push(StressItem { entity, family });
+        nodes.push(StressItem {
+            entity,
+            parent,
+            family,
+        });
     }
     commands.insert_resource(StressNodes {
-        root,
         nodes,
         image,
         alternate: false,
@@ -300,7 +331,7 @@ fn setup(mut commands: Commands, config: Res<Config>, mut images: ResMut<Assets<
 
 fn spawn_item(
     commands: &mut Commands,
-    root: Entity,
+    parent: Entity,
     family: ItemFamily,
     geometry: Geometry,
     index: usize,
@@ -331,7 +362,7 @@ fn spawn_item(
             },
             ..Default::default()
         },
-        ChildOf(root),
+        ChildOf(parent),
     ));
     match family {
         ItemFamily::Background => {
@@ -462,14 +493,18 @@ fn churn_one(mut commands: Commands, config: Res<Config>, mut stress: ResMut<Str
     commands.entity(old.entity).despawn();
     let entity = spawn_item(
         &mut commands,
-        stress.root,
+        old.parent,
         old.family,
         config.geometry,
         0,
         (config.nodes as f32).sqrt().ceil() as usize,
         &stress.image,
     );
-    stress.nodes[0].entity = entity;
+    stress.nodes[0] = StressItem {
+        entity,
+        parent: old.parent,
+        family: old.family,
+    };
 }
 
 fn report_main_work(main: Res<RetainedUiMainWorldCounters>, mut frames: Local<u32>) {

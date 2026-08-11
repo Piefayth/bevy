@@ -313,6 +313,67 @@ fn spawn_leaf_background(world: &mut World, camera: Entity, node: Node) -> Entit
         .id()
 }
 
+fn render_layout_motion(contained: bool) -> RenderOutput {
+    render_scene(
+        UiRenderer::Retained,
+        PaintSchedule::EveryFrame,
+        move |world, camera| {
+            let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+            let parent = if contained {
+                world
+                    .spawn((
+                        Node {
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                        LayoutContainment,
+                        ChildOf(root),
+                    ))
+                    .id()
+            } else {
+                root
+            };
+            world
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(5),
+                        top: px(8),
+                        width: px(10),
+                        height: px(10),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb_u8(220, 45, 28)),
+                    ChildOf(parent),
+                ))
+                .id()
+        },
+        |world, leaf| {
+            world.entity_mut(leaf).get_mut::<Node>().unwrap().left = px(30);
+        },
+    )
+}
+
+fn assert_layout_motion(output: RenderOutput) {
+    let before = output.before_mutation.unwrap();
+    let after = output.after_mutation.unwrap();
+    assert_eq!(after.repairs, before.repairs + 1);
+    assert_eq!(after.repair_pixels, before.repair_pixels + 200);
+    assert_eq!(after.items_replayed, before.items_replayed + 3);
+
+    let old_center = ((13 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+    let new_center = ((13 * WIDTH + 35) as usize) * BYTES_PER_PIXEL;
+    assert_eq!(
+        &output.pixels[old_center..old_center + BYTES_PER_PIXEL],
+        &[18, 32, 76, 255]
+    );
+    assert_eq!(
+        &output.pixels[new_center..new_center + BYTES_PER_PIXEL],
+        &[220, 45, 28, 255]
+    );
+}
+
 fn add_solid_image(world: &mut World, color: [u8; 4]) -> Handle<Image> {
     world.resource_mut::<Assets<Image>>().add(Image::new_fill(
         Extent3d {
@@ -3455,44 +3516,14 @@ fn changed_background_encodes_exactly_one_full_repair() {
 #[test]
 fn moving_one_leaf_repairs_only_old_and_new_pixels_and_intersecting_items() {
     with_gpu_lock(|| {
-        let output = render_scene(
-            UiRenderer::Retained,
-            PaintSchedule::EveryFrame,
-            |world, camera| {
-                spawn_leaf_background(
-                    world,
-                    camera,
-                    Node {
-                        position_type: PositionType::Absolute,
-                        left: px(5),
-                        top: px(8),
-                        width: px(10),
-                        height: px(10),
-                        ..default()
-                    },
-                )
-            },
-            |world, leaf| {
-                world.entity_mut(leaf).get_mut::<Node>().unwrap().left = px(30);
-            },
-        );
+        assert_layout_motion(render_layout_motion(false));
+    });
+}
 
-        let before = output.before_mutation.unwrap();
-        let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 200);
-        assert_eq!(after.items_replayed, before.items_replayed + 3);
-
-        let old_center = ((13 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
-        let new_center = ((13 * WIDTH + 35) as usize) * BYTES_PER_PIXEL;
-        assert_eq!(
-            &output.pixels[old_center..old_center + BYTES_PER_PIXEL],
-            &[18, 32, 76, 255]
-        );
-        assert_eq!(
-            &output.pixels[new_center..new_center + BYTES_PER_PIXEL],
-            &[220, 45, 28, 255]
-        );
+#[test]
+fn contained_layout_motion_repairs_the_same_exact_pixels() {
+    with_gpu_lock(|| {
+        assert_layout_motion(render_layout_motion(true));
     });
 }
 

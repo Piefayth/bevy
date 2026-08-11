@@ -7,12 +7,13 @@ use bevy::{
         lifecycle::RemovedComponents,
         query::{Added, Changed, Or},
         schedule::{IntoScheduleConfigs, ScheduleCleanupPolicy},
-        system::{Query, Res, SystemParam},
+        system::{Query, Res, ResMut, SystemParam},
     },
     ui::{
-        ui_geometry_system, ui_layout_system, ui_stack_system, CalculatedClip, ComputedNode,
-        ComputedUiRenderTargetInfo, ContentSize, GlobalZIndex, IgnoreScroll, LayoutConfig, Node,
-        Outline, OverrideClip, ScrollPosition, UiGlobalTransform, UiSystems, UiTransform, ZIndex,
+        ui_geometry_system, ui_layout_system, ui_stack_system, ComputedNode,
+        ComputedUiRenderTargetInfo, ContentSize, GlobalZIndex, IgnoreScroll, LayoutConfig,
+        LayoutContainment, Node, Outline, OverrideClip, ScrollPosition, UiGlobalTransform,
+        UiSystems, UiTransform, ZIndex,
     },
 };
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -65,7 +66,8 @@ pub struct RetainedUiMainWorldPlugin;
 
 impl Plugin for RetainedUiMainWorldPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<RetainedUiMainWorldCounters>();
+        app.init_resource::<RetainedUiMainWorldCounters>()
+            .init_resource::<UiDirtyDomains>();
 
         let removed_layout = app
             .remove_systems_in_set(
@@ -114,10 +116,19 @@ impl Plugin for RetainedUiMainWorldPlugin {
 
         app.add_systems(
             PostUpdate,
+            classify_ui_changes
+                .in_set(UiSystems::Layout)
+                .before(ui_layout_system)
+                .before(ui_geometry_system)
+                .before(ui_stack_system)
+                .before(bevy::ui::update::update_clipping_system),
+        )
+        .add_systems(
+            PostUpdate,
             ui_layout_system
                 .in_set(UiSystems::Layout)
                 .ambiguous_with(bevy::sprite::update_text2d_layout)
-                .run_if(layout_may_change),
+                .run_if(layout_is_dirty),
         )
         .add_systems(
             PostUpdate,
@@ -125,13 +136,13 @@ impl Plugin for RetainedUiMainWorldPlugin {
                 .in_set(UiSystems::Layout)
                 .after(ui_layout_system)
                 .ambiguous_with(bevy::sprite::update_text2d_layout)
-                .run_if(geometry_may_change),
+                .run_if(geometry_is_dirty),
         )
         .add_systems(
             PostUpdate,
             ui_stack_system
                 .in_set(UiSystems::Stack)
-                .run_if(stack_may_change),
+                .run_if(stack_is_dirty),
         )
         .add_systems(
             PostUpdate,
@@ -142,55 +153,15 @@ impl Plugin for RetainedUiMainWorldPlugin {
     }
 }
 
-#[derive(SystemParam)]
-struct RemovedLayoutInputs<'w, 's> {
-    node: RemovedComponents<'w, 's, Node>,
-    content_size: RemovedComponents<'w, 's, ContentSize>,
-    target: RemovedComponents<'w, 's, ComputedUiRenderTargetInfo>,
-    children: RemovedComponents<'w, 's, Children>,
-    parent: RemovedComponents<'w, 's, ChildOf>,
-}
-
-impl RemovedLayoutInputs<'_, '_> {
-    fn any(&mut self) -> bool {
-        let Self {
-            node,
-            content_size,
-            target,
-            children,
-            parent,
-        } = self;
-        drain_removed(node)
-            | drain_removed(content_size)
-            | drain_removed(target)
-            | drain_removed(children)
-            | drain_removed(parent)
-    }
-}
-
-fn layout_may_change(
-    changed_core: Query<
-        (),
-        Or<(
-            Changed<Node>,
-            Changed<ContentSize>,
-            Changed<ComputedUiRenderTargetInfo>,
-            Changed<Children>,
-            Changed<ChildOf>,
-        )>,
-    >,
-    mut removed: RemovedLayoutInputs,
-    counters: Res<RetainedUiMainWorldCounters>,
-) -> bool {
-    let changed = !changed_core.is_empty() || removed.any();
-    if changed {
-        counters.layout_runs.fetch_add(1, Ordering::Relaxed);
-    }
-    changed
+#[derive(bevy::prelude::Resource, Default)]
+struct UiDirtyDomains {
+    layout: bool,
+    geometry: bool,
+    stack: bool,
 }
 
 #[derive(SystemParam)]
-struct RemovedGeometryInputs<'w, 's> {
+struct RemovedUiInputs<'w, 's> {
     node: RemovedComponents<'w, 's, Node>,
     content_size: RemovedComponents<'w, 's, ContentSize>,
     target: RemovedComponents<'w, 's, ComputedUiRenderTargetInfo>,
@@ -201,95 +172,35 @@ struct RemovedGeometryInputs<'w, 's> {
     ignore_scroll: RemovedComponents<'w, 's, IgnoreScroll>,
     children: RemovedComponents<'w, 's, Children>,
     parent: RemovedComponents<'w, 's, ChildOf>,
+    containment: RemovedComponents<'w, 's, LayoutContainment>,
+    global_z: RemovedComponents<'w, 's, GlobalZIndex>,
+    local_z: RemovedComponents<'w, 's, ZIndex>,
 }
 
-impl RemovedGeometryInputs<'_, '_> {
-    fn any(&mut self) -> bool {
-        let Self {
-            node,
-            content_size,
-            target,
-            transform,
-            config,
-            outline,
-            scroll,
-            ignore_scroll,
-            children,
-            parent,
-        } = self;
-        drain_removed(node)
-            | drain_removed(content_size)
-            | drain_removed(target)
-            | drain_removed(transform)
-            | drain_removed(config)
-            | drain_removed(outline)
-            | drain_removed(scroll)
-            | drain_removed(ignore_scroll)
-            | drain_removed(children)
-            | drain_removed(parent)
-    }
-}
-
-fn geometry_may_change(
-    changed_core: Query<
+fn classify_ui_changes(
+    layout_changes: Query<
         (),
         Or<(
             Changed<Node>,
             Changed<ContentSize>,
             Changed<ComputedUiRenderTargetInfo>,
-            Changed<UiTransform>,
             Changed<Children>,
             Changed<ChildOf>,
+            Changed<LayoutContainment>,
         )>,
     >,
-    changed_optional: Query<
+    geometry_changes: Query<
         (),
         Or<(
+            Changed<UiTransform>,
             Changed<LayoutConfig>,
             Changed<Outline>,
             Changed<ScrollPosition>,
             Changed<IgnoreScroll>,
         )>,
     >,
-    mut removed: RemovedGeometryInputs,
-    counters: Res<RetainedUiMainWorldCounters>,
-) -> bool {
-    let changed = !changed_core.is_empty() || !changed_optional.is_empty() || removed.any();
-    if changed {
-        counters.geometry_runs.fetch_add(1, Ordering::Relaxed);
-    }
-    changed
-}
-
-#[derive(SystemParam)]
-struct RemovedStackInputs<'w, 's> {
-    node: RemovedComponents<'w, 's, Node>,
-    global_z: RemovedComponents<'w, 's, GlobalZIndex>,
-    local_z: RemovedComponents<'w, 's, ZIndex>,
-    children: RemovedComponents<'w, 's, Children>,
-    parent: RemovedComponents<'w, 's, ChildOf>,
-}
-
-impl RemovedStackInputs<'_, '_> {
-    fn any(&mut self) -> bool {
-        let Self {
-            node,
-            global_z,
-            local_z,
-            children,
-            parent,
-        } = self;
-        drain_removed(node)
-            | drain_removed(global_z)
-            | drain_removed(local_z)
-            | drain_removed(children)
-            | drain_removed(parent)
-    }
-}
-
-fn stack_may_change(
     added_nodes: Query<(), Added<Node>>,
-    changed_order: Query<
+    stack_changes: Query<
         (),
         Or<(
             Changed<GlobalZIndex>,
@@ -298,14 +209,75 @@ fn stack_may_change(
             Changed<ChildOf>,
         )>,
     >,
-    mut removed: RemovedStackInputs,
+    mut removed: RemovedUiInputs,
+    mut domains: ResMut<UiDirtyDomains>,
     counters: Res<RetainedUiMainWorldCounters>,
-) -> bool {
-    let changed = !added_nodes.is_empty() || !changed_order.is_empty() || removed.any();
-    if changed {
+) {
+    let removed_node = drain_removed(&mut removed.node);
+    let removed_content = drain_removed(&mut removed.content_size);
+    let removed_target = drain_removed(&mut removed.target);
+    let removed_transform = drain_removed(&mut removed.transform);
+    let removed_config = drain_removed(&mut removed.config);
+    let removed_outline = drain_removed(&mut removed.outline);
+    let removed_scroll = drain_removed(&mut removed.scroll);
+    let removed_ignore_scroll = drain_removed(&mut removed.ignore_scroll);
+    let removed_children = drain_removed(&mut removed.children);
+    let removed_parent = drain_removed(&mut removed.parent);
+    let removed_containment = drain_removed(&mut removed.containment);
+    let removed_global_z = drain_removed(&mut removed.global_z);
+    let removed_local_z = drain_removed(&mut removed.local_z);
+
+    let layout_removed = removed_node
+        | removed_content
+        | removed_target
+        | removed_children
+        | removed_parent
+        | removed_containment;
+    let layout = !layout_changes.is_empty() || layout_removed;
+
+    let geometry_removed = layout_removed
+        | removed_transform
+        | removed_config
+        | removed_outline
+        | removed_scroll
+        | removed_ignore_scroll;
+    let geometry = layout || !geometry_changes.is_empty() || geometry_removed;
+
+    let stack = !added_nodes.is_empty()
+        || !stack_changes.is_empty()
+        || removed_node
+        || removed_global_z
+        || removed_local_z
+        || removed_children
+        || removed_parent;
+
+    *domains = UiDirtyDomains {
+        layout,
+        geometry,
+        stack,
+    };
+
+    if layout {
+        counters.layout_runs.fetch_add(1, Ordering::Relaxed);
+    }
+    if geometry {
+        counters.geometry_runs.fetch_add(1, Ordering::Relaxed);
+    }
+    if stack {
         counters.stack_runs.fetch_add(1, Ordering::Relaxed);
     }
-    changed
+}
+
+fn layout_is_dirty(domains: Res<UiDirtyDomains>) -> bool {
+    domains.layout
+}
+
+fn geometry_is_dirty(domains: Res<UiDirtyDomains>) -> bool {
+    domains.geometry
+}
+
+fn stack_is_dirty(domains: Res<UiDirtyDomains>) -> bool {
+    domains.stack
 }
 
 #[derive(SystemParam)]
@@ -313,7 +285,6 @@ struct RemovedClippingInputs<'w, 's> {
     node: RemovedComponents<'w, 's, Node>,
     computed: RemovedComponents<'w, 's, ComputedNode>,
     transform: RemovedComponents<'w, 's, UiGlobalTransform>,
-    clip: RemovedComponents<'w, 's, CalculatedClip>,
     override_clip: RemovedComponents<'w, 's, OverrideClip>,
     children: RemovedComponents<'w, 's, Children>,
     parent: RemovedComponents<'w, 's, ChildOf>,
@@ -321,22 +292,12 @@ struct RemovedClippingInputs<'w, 's> {
 
 impl RemovedClippingInputs<'_, '_> {
     fn any(&mut self) -> bool {
-        let Self {
-            node,
-            computed,
-            transform,
-            clip,
-            override_clip,
-            children,
-            parent,
-        } = self;
-        drain_removed(node)
-            | drain_removed(computed)
-            | drain_removed(transform)
-            | drain_removed(clip)
-            | drain_removed(override_clip)
-            | drain_removed(children)
-            | drain_removed(parent)
+        drain_removed(&mut self.node)
+            | drain_removed(&mut self.computed)
+            | drain_removed(&mut self.transform)
+            | drain_removed(&mut self.override_clip)
+            | drain_removed(&mut self.children)
+            | drain_removed(&mut self.parent)
     }
 }
 
@@ -347,7 +308,6 @@ fn clipping_may_change(
             Changed<Node>,
             Changed<ComputedNode>,
             Changed<UiGlobalTransform>,
-            Changed<CalculatedClip>,
             Changed<OverrideClip>,
             Changed<Children>,
             Changed<ChildOf>,

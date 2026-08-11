@@ -11,16 +11,65 @@ use super::ComputedNode;
 use bevy_app::Propagate;
 use bevy_camera::Camera;
 use bevy_ecs::{
-    entity::Entity,
-    query::Has,
-    system::{Commands, Query, Res},
+    entity::{Entity, EntityHashMap, EntityHashSet},
+    hierarchy::{ChildOf, Children},
+    lifecycle::RemovedComponents,
+    query::{Changed, Has, Or, With},
+    system::{Commands, Local, Query, Res, SystemParam},
 };
 use bevy_math::{Rect, UVec2};
 
-/// Updates clipping for all nodes
+/// The complete subset of [`Node`] read by clipping.
+///
+/// Comparing it prevents unrelated fields, such as border radius, from invalidating a subtree.
+#[derive(Clone, Copy, PartialEq)]
+struct ClipStyle {
+    display: Display,
+    overflow: crate::Overflow,
+    overflow_clip_margin: crate::OverflowClipMargin,
+}
+
+impl From<&Node> for ClipStyle {
+    fn from(node: &Node) -> Self {
+        Self {
+            display: node.display,
+            overflow: node.overflow,
+            overflow_clip_margin: node.overflow_clip_margin,
+        }
+    }
+}
+
+#[derive(SystemParam)]
+#[doc(hidden)]
+pub struct ClippingChanges<'w, 's> {
+    clip_styles: Local<'s, EntityHashMap<ClipStyle>>,
+    nodes: Query<'w, 's, (Entity, &'static Node), Changed<Node>>,
+    subtrees: Query<
+        'w,
+        's,
+        Entity,
+        (
+            With<Node>,
+            Or<(
+                Changed<ComputedNode>,
+                Changed<UiGlobalTransform>,
+                Changed<OverrideClip>,
+            )>,
+        ),
+    >,
+    changed_children: Query<'w, 's, Entity, Changed<Children>>,
+    changed_parent: Query<'w, 's, Entity, Changed<ChildOf>>,
+    removed_node: RemovedComponents<'w, 's, Node>,
+    removed_computed: RemovedComponents<'w, 's, ComputedNode>,
+    removed_transform: RemovedComponents<'w, 's, UiGlobalTransform>,
+    removed_override: RemovedComponents<'w, 's, OverrideClip>,
+    removed_children: RemovedComponents<'w, 's, Children>,
+    removed_parent: RemovedComponents<'w, 's, ChildOf>,
+}
+
+/// Updates clipping for nodes whose clipping inputs may have changed.
 pub fn update_clipping_system(
     mut commands: Commands,
-    root_nodes: UiRootNodes,
     mut node_query: Query<(
         &Node,
         &ComputedNode,
@@ -29,15 +78,90 @@ pub fn update_clipping_system(
         Has<OverrideClip>,
     )>,
     ui_children: UiChildren,
+    mut changes: ClippingChanges,
+    mut dirty_subtrees: Local<EntityHashSet>,
+    mut subtree_roots: Local<Vec<Entity>>,
 ) {
-    for root_node in root_nodes.iter() {
+    dirty_subtrees.clear();
+    subtree_roots.clear();
+    dirty_subtrees.extend(changes.subtrees.iter());
+    dirty_subtrees.extend(changes.changed_children.iter());
+    dirty_subtrees.extend(changes.changed_parent.iter());
+    dirty_subtrees.extend(changes.removed_computed.read());
+    dirty_subtrees.extend(changes.removed_transform.read());
+    dirty_subtrees.extend(changes.removed_override.read());
+    dirty_subtrees.extend(changes.removed_children.read());
+    dirty_subtrees.extend(changes.removed_parent.read());
+    for (entity, node) in changes.nodes.iter() {
+        let style = ClipStyle::from(node);
+        if changes.clip_styles.insert(entity, style) != Some(style) {
+            dirty_subtrees.insert(entity);
+        }
+    }
+    for entity in changes.removed_node.read() {
+        changes.clip_styles.remove(&entity);
+        dirty_subtrees.remove(&entity);
+    }
+
+    for &entity in dirty_subtrees.iter() {
+        let mut ancestor = ui_children.get_parent(entity);
+        let mut covered_by_ancestor = false;
+        while let Some(parent) = ancestor {
+            if dirty_subtrees.contains(&parent) {
+                covered_by_ancestor = true;
+                break;
+            }
+            ancestor = ui_children.get_parent(parent);
+        }
+        if !covered_by_ancestor {
+            subtree_roots.push(entity);
+        }
+    }
+
+    for entity in subtree_roots.drain(..) {
+        let inherited_clip = inherited_clip(entity, &ui_children, &mut node_query);
         update_clipping(
             &mut commands,
             &ui_children,
             &mut node_query,
-            root_node,
-            None,
+            entity,
+            inherited_clip,
         );
+    }
+}
+
+fn inherited_clip(
+    entity: Entity,
+    ui_children: &UiChildren,
+    node_query: &mut Query<(
+        &Node,
+        &ComputedNode,
+        &UiGlobalTransform,
+        Option<&mut CalculatedClip>,
+        Has<OverrideClip>,
+    )>,
+) -> Option<Rect> {
+    let parent = ui_children.get_parent(entity)?;
+    let Ok((node, computed_node, transform, calculated_clip, has_override_clip)) =
+        node_query.get_mut(parent)
+    else {
+        return None;
+    };
+    let mut inherited = calculated_clip.map(|clip| clip.clip);
+    if has_override_clip {
+        inherited = None;
+    }
+    if node.display == Display::None {
+        inherited = Some(Rect::default());
+    }
+    if node.overflow.is_visible() {
+        inherited
+    } else {
+        let mut clip_rect =
+            computed_node.resolve_clip_rect(node.overflow, node.overflow_clip_margin);
+        clip_rect.min += transform.translation;
+        clip_rect.max += transform.translation;
+        Some(inherited.map_or(clip_rect, |clip| clip.intersect(clip_rect)))
     }
 }
 

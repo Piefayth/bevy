@@ -6,7 +6,7 @@ use bevy_image::ImagePlugin;
 use bevy_math::UVec2;
 use bevy_text::TextPlugin;
 use bevy_time::TimePlugin;
-use bevy_ui::{Node, UiPlugin, UiTransform, Val};
+use bevy_ui::{BorderRadius, LayoutContainment, Node, UiPlugin, UiTransform, Val};
 use bevy_ui_render_retained::RetainedUiMainWorldPlugin;
 use criterion::{
     criterion_group, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
@@ -16,21 +16,30 @@ use std::time::{Duration, Instant};
 const TARGET_SIZE: UVec2 = UVec2::new(1024, 1024);
 const FOREST_SIZE: usize = 100;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum TreeShape {
     Flat,
     Balanced,
     Forest,
+    Contained(usize),
     Deep,
 }
 
 impl TreeShape {
-    const fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Self::Flat => "flat",
-            Self::Balanced => "balanced",
-            Self::Forest => "forest_100",
-            Self::Deep => "deep",
+            Self::Flat => "flat".into(),
+            Self::Balanced => "balanced".into(),
+            Self::Forest => "forest_100".into(),
+            Self::Contained(size) => format!("contained_{size}"),
+            Self::Deep => "deep".into(),
+        }
+    }
+
+    const fn containment_size(self) -> Option<usize> {
+        match self {
+            Self::Contained(size) => Some(size),
+            _ => None,
         }
     }
 }
@@ -39,6 +48,8 @@ struct LayoutApp {
     app: App,
     nodes: Vec<Entity>,
     roots: Vec<Entity>,
+    boundaries: Vec<Entity>,
+    contained_leaves: Vec<Entity>,
 }
 
 fn node() -> Node {
@@ -93,18 +104,46 @@ fn layout_app(node_count: usize, retained: bool, shape: TreeShape) -> LayoutApp 
 
     let mut nodes = Vec::with_capacity(node_count);
     let mut roots = Vec::new();
+    let mut boundaries = Vec::new();
+    let mut contained_leaves = Vec::new();
+    let containment_size = shape.containment_size();
+    if let Some(size) = containment_size {
+        assert!(size >= 2);
+    }
     for index in 0..node_count {
-        let parent = match shape {
-            TreeShape::Flat if index > 0 => Some(nodes[0]),
-            TreeShape::Balanced if index > 0 => Some(nodes[(index - 1) / 4]),
-            TreeShape::Forest if index % FOREST_SIZE != 0 => {
-                Some(nodes[index - index % FOREST_SIZE])
+        let parent = if let Some(size) = containment_size {
+            (index > 0).then(|| {
+                if (index - 1) % size == 0 {
+                    nodes[0]
+                } else {
+                    nodes[index - (index - 1) % size]
+                }
+            })
+        } else {
+            match shape {
+                TreeShape::Flat if index > 0 => Some(nodes[0]),
+                TreeShape::Balanced if index > 0 => Some(nodes[(index - 1) / 4]),
+                TreeShape::Forest if index % FOREST_SIZE != 0 => {
+                    Some(nodes[index - index % FOREST_SIZE])
+                }
+                TreeShape::Deep if index > 0 => nodes.last().copied(),
+                _ => None,
             }
-            TreeShape::Deep if index > 0 => nodes.last().copied(),
-            _ => None,
         };
         let entity = if let Some(parent) = parent {
-            app.world_mut().spawn((node(), ChildOf(parent))).id()
+            let mut entity = app.world_mut().spawn((node(), ChildOf(parent)));
+            if containment_size.is_some_and(|size| (index - 1) % size == 0) {
+                entity.insert(LayoutContainment);
+            }
+            let entity = entity.id();
+            if let Some(size) = containment_size {
+                if (index - 1) % size == 0 {
+                    boundaries.push(entity);
+                } else {
+                    contained_leaves.push(entity);
+                }
+            }
+            entity
         } else {
             let entity = app.world_mut().spawn(root_node()).id();
             roots.push(entity);
@@ -114,7 +153,13 @@ fn layout_app(node_count: usize, retained: bool, shape: TreeShape) -> LayoutApp 
     }
 
     app.world_mut().run_schedule(PostUpdate);
-    LayoutApp { app, nodes, roots }
+    LayoutApp {
+        app,
+        nodes,
+        roots,
+        boundaries,
+        contained_leaves,
+    }
 }
 
 fn measure_updates(
@@ -189,6 +234,37 @@ fn bench_scene(
 
     if include_full_change {
         group.bench_with_input(
+            BenchmarkId::new("one_equal_node_write", node_count),
+            &node_count,
+            |bencher, _| {
+                let mut equal = layout_app(node_count, retained, shape);
+                let entity = *equal.nodes.last().unwrap();
+                bencher.iter_custom(|iterations| {
+                    measure_updates(&mut equal.app, iterations, |world| {
+                        world.get_mut::<Node>(entity).unwrap().width = Val::Px(8.0);
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("one_node_geometry_change", node_count),
+            &node_count,
+            |bencher, _| {
+                let mut local = layout_app(node_count, retained, shape);
+                let entity = *local.nodes.last().unwrap();
+                let mut radius = 0.0;
+                bencher.iter_custom(|iterations| {
+                    measure_updates(&mut local.app, iterations, |world| {
+                        radius = if radius == 0.0 { 1.0 } else { 0.0 };
+                        world.get_mut::<Node>(entity).unwrap().border_radius =
+                            BorderRadius::all(Val::Px(radius));
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
             BenchmarkId::new("all_layout_change", node_count),
             &node_count,
             |bencher, _| {
@@ -225,6 +301,63 @@ fn bench_scene(
             },
         );
     }
+    if let Some(containment_size) = shape.containment_size() {
+        group.bench_with_input(
+            BenchmarkId::new("one_boundary_layout_change", node_count),
+            &node_count,
+            |bencher, _| {
+                let mut boundary = layout_app(node_count, retained, shape);
+                let entity = *boundary.boundaries.last().unwrap();
+                let mut width = 8.0;
+                bencher.iter_custom(|iterations| {
+                    measure_updates(&mut boundary.app, iterations, |world| {
+                        width = if width == 8.0 { 9.0 } else { 8.0 };
+                        world.get_mut::<Node>(entity).unwrap().width = Val::Px(width);
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("one_change_per_boundary", node_count),
+            &node_count,
+            |bencher, _| {
+                let mut distributed = layout_app(node_count, retained, shape);
+                let entities: Vec<_> = distributed
+                    .contained_leaves
+                    .chunks(containment_size - 1)
+                    .filter_map(|chunk| chunk.last().copied())
+                    .collect();
+                let mut width = 8.0;
+                bencher.iter_custom(|iterations| {
+                    measure_updates(&mut distributed.app, iterations, |world| {
+                        width = if width == 8.0 { 9.0 } else { 8.0 };
+                        for &entity in &entities {
+                            world.get_mut::<Node>(entity).unwrap().width = Val::Px(width);
+                        }
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("all_contained_leaves_change", node_count),
+            &node_count,
+            |bencher, _| {
+                let mut all = layout_app(node_count, retained, shape);
+                let entities = all.contained_leaves.clone();
+                let mut width = 8.0;
+                bencher.iter_custom(|iterations| {
+                    measure_updates(&mut all.app, iterations, |world| {
+                        width = if width == 8.0 { 9.0 } else { 8.0 };
+                        for &entity in &entities {
+                            world.get_mut::<Node>(entity).unwrap().width = Val::Px(width);
+                        }
+                    })
+                });
+            },
+        );
+    }
 }
 
 fn layout(c: &mut Criterion) {
@@ -248,6 +381,9 @@ fn layout(c: &mut Criterion) {
         for (shape, node_count, reparent) in [
             (TreeShape::Balanced, 10_000, false),
             (TreeShape::Forest, 10_000, true),
+            (TreeShape::Contained(10), 10_000, false),
+            (TreeShape::Contained(100), 10_000, false),
+            (TreeShape::Contained(1_000), 10_000, false),
             (TreeShape::Deep, 256, false),
         ] {
             let mut group = c.benchmark_group(format!("ui_layout/{renderer}/{}", shape.name()));

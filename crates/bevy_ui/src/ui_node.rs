@@ -17,6 +17,19 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use tracing::warn;
 
+/// Makes this node a semantic layout boundary.
+///
+/// Descendants are laid out in an independent Taffy tree whose constraints come from this
+/// node's resolved border box. Descendant size and position changes therefore cannot change this
+/// node's size or the layout outside it. The boundary itself still participates normally in its
+/// parent's layout, and changing the boundary's own [`Node`] can relayout that parent.
+///
+/// This is size and layout containment, not a rendering or clipping boundary. Give the boundary
+/// an explicit size when an empty intrinsic size is not useful.
+#[derive(Component, Clone, Copy, Debug, Default, Reflect)]
+#[reflect(Component, Default, Debug, Clone)]
+pub struct LayoutContainment;
+
 /// Provides the computed size and layout properties of the node.
 ///
 /// Fields in this struct are public but should not be modified under most circumstances.
@@ -2403,7 +2416,10 @@ impl Default for Outline {
     }
 }
 
-/// The calculated clip of the node
+/// The clipping system's derived clip for this node.
+///
+/// Applications should change [`Node::overflow`] or [`OverrideClip`] rather than writing or
+/// removing this component directly.
 #[derive(Component, Default, Copy, Clone, Debug, Reflect)]
 #[reflect(Component, Default, Debug, Clone)]
 pub struct CalculatedClip {

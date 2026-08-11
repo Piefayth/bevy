@@ -4,10 +4,8 @@ use core::ops::{Deref, DerefMut};
 use bevy_platform::collections::hash_map::Entry;
 use taffy::TaffyTree;
 
-#[cfg(feature = "ghost_nodes")]
-use bevy_ecs::entity::EntityHashSet;
 use bevy_ecs::{
-    entity::{Entity, EntityHashMap},
+    entity::{Entity, EntityHashMap, EntityHashSet},
     prelude::Resource,
 };
 use bevy_math::{UVec2, Vec2};
@@ -22,6 +20,8 @@ pub struct LayoutNode {
     pub(super) viewport_id: Option<taffy::NodeId>,
     // The id of the node in the taffy tree
     pub(super) id: taffy::NodeId,
+    // A disconnected container root for descendants when this node has layout containment.
+    pub(super) container_id: Option<taffy::NodeId>,
 }
 
 impl From<taffy::NodeId> for LayoutNode {
@@ -29,6 +29,7 @@ impl From<taffy::NodeId> for LayoutNode {
         LayoutNode {
             viewport_id: None,
             id: value,
+            container_id: None,
         }
     }
 }
@@ -62,8 +63,12 @@ pub struct UiSurface {
     pub(super) entity_to_taffy: EntityHashMap<LayoutNode>,
     pub(super) taffy: UiTree<NodeMeasure>,
     taffy_children_scratch: Vec<taffy::NodeId>,
+    // One-frame handoff from layout computation to derived geometry resolution.
+    pub(super) layout_geometry_scopes: EntityHashSet,
     #[cfg(test)]
     pub(super) geometry_visits: usize,
+    #[cfg(test)]
+    pub(super) layout_computations: usize,
     #[cfg(feature = "ghost_nodes")]
     pub(super) dirty_ghost_children_scratch: EntityHashSet,
 }
@@ -98,8 +103,11 @@ impl Default for UiSurface {
             entity_to_taffy: Default::default(),
             taffy,
             taffy_children_scratch: Vec::new(),
+            layout_geometry_scopes: EntityHashSet::new(),
             #[cfg(test)]
             geometry_visits: 0,
+            #[cfg(test)]
+            layout_computations: 0,
             #[cfg(feature = "ghost_nodes")]
             dirty_ghost_children_scratch: EntityHashSet::new(),
         }
@@ -114,30 +122,84 @@ impl UiSurface {
         layout_context: &LayoutContext,
         entity: Entity,
         node: &Node,
+        new_node_context: Option<NodeMeasure>,
+    ) -> bool {
+        self.upsert_node_with_containment(layout_context, entity, node, new_node_context, false)
+    }
+
+    /// Inserts or updates a UI node and its independent descendant layout root.
+    pub fn upsert_node_with_containment(
+        &mut self,
+        layout_context: &LayoutContext,
+        entity: Entity,
+        node: &Node,
         mut new_node_context: Option<NodeMeasure>,
-    ) {
+        contained: bool,
+    ) -> bool {
+        let style = convert::from_node(node, layout_context);
         let taffy = &mut self.taffy;
 
         match self.entity_to_taffy.entry(entity) {
-            Entry::Occupied(entry) => {
-                let taffy_node = *entry.get();
+            Entry::Occupied(mut entry) => {
+                let taffy_node = entry.get_mut();
+                let mut changed = false;
                 if new_node_context.is_some() {
                     taffy
                         .set_node_context(taffy_node.id, new_node_context)
                         .unwrap();
+                    changed = true;
                 }
 
-                taffy
-                    .set_style(taffy_node.id, convert::from_node(node, layout_context))
-                    .unwrap();
+                let style_changed = taffy.style(taffy_node.id).unwrap() != &style;
+                if contained {
+                    if style_changed {
+                        taffy.set_style(taffy_node.id, style.clone()).unwrap();
+                        changed = true;
+                    }
+                    if let Some(container_id) = taffy_node.container_id {
+                        if style_changed {
+                            taffy
+                                .set_style(container_id, containment_style(style, Vec2::ZERO))
+                                .unwrap();
+                        }
+                    } else {
+                        let children = taffy.children(taffy_node.id).unwrap();
+                        let container_id = taffy
+                            .new_with_children(containment_style(style, Vec2::ZERO), &children)
+                            .unwrap();
+                        taffy.set_children(taffy_node.id, &[]).unwrap();
+                        taffy_node.container_id = Some(container_id);
+                        changed = true;
+                    }
+                } else {
+                    if style_changed {
+                        taffy.set_style(taffy_node.id, style).unwrap();
+                        changed = true;
+                    }
+                    if let Some(container_id) = taffy_node.container_id {
+                        let children = taffy.children(container_id).unwrap();
+                        taffy.set_children(taffy_node.id, &children).unwrap();
+                        taffy.remove(container_id).unwrap();
+                        taffy_node.container_id = None;
+                        changed = true;
+                    }
+                }
+                changed
             }
             Entry::Vacant(entry) => {
+                let container_style =
+                    contained.then(|| containment_style(style.clone(), Vec2::ZERO));
                 let taffy_node = if let Some(measure) = new_node_context.take() {
-                    taffy.new_leaf_with_context(convert::from_node(node, layout_context), measure)
+                    taffy.new_leaf_with_context(style, measure)
                 } else {
-                    taffy.new_leaf(convert::from_node(node, layout_context))
+                    taffy.new_leaf(style)
                 };
-                entry.insert(taffy_node.unwrap().into());
+                let mut layout_node: LayoutNode = taffy_node.unwrap().into();
+                if let Some(container_style) = container_style {
+                    layout_node.container_id = Some(taffy.new_leaf(container_style).unwrap());
+                }
+                entry.insert(layout_node);
+                true
             }
         }
     }
@@ -165,23 +227,30 @@ impl UiSurface {
         }
 
         let taffy_node = self.entity_to_taffy.get(&entity).unwrap();
+        let parent_id = taffy_node.container_id.unwrap_or(taffy_node.id);
         self.taffy
-            .set_children(taffy_node.id, &self.taffy_children_scratch)
+            .set_children(parent_id, &self.taffy_children_scratch)
             .unwrap();
     }
 
     /// Removes children from the entity's taffy node if it exists. Does nothing otherwise.
     pub fn try_remove_children(&mut self, entity: Entity) {
         if let Some(taffy_node) = self.entity_to_taffy.get(&entity) {
-            self.taffy.set_children(taffy_node.id, &[]).unwrap();
+            self.taffy
+                .set_children(taffy_node.container_id.unwrap_or(taffy_node.id), &[])
+                .unwrap();
         }
     }
 
     /// Removes the measure from the entity's taffy node if it exists. Does nothing otherwise.
-    pub fn try_remove_node_context(&mut self, entity: Entity) {
-        if let Some(taffy_node) = self.entity_to_taffy.get(&entity) {
+    pub fn try_remove_node_context(&mut self, entity: Entity) -> bool {
+        if let Some(taffy_node) = self.entity_to_taffy.get(&entity)
+            && self.taffy.get_node_context(taffy_node.id).is_some()
+        {
             self.taffy.set_node_context(taffy_node.id, None).unwrap();
+            return true;
         }
+        false
     }
 
     /// Gets or inserts an implicit taffy viewport node corresponding to the given UI root entity
@@ -220,6 +289,10 @@ impl UiSurface {
         buffer_query: &'a mut bevy_ecs::prelude::Query<&mut bevy_text::ComputedTextBlock>,
         font_system: &'a mut FontCx,
     ) {
+        #[cfg(test)]
+        {
+            self.layout_computations += 1;
+        }
         let implicit_viewport_node = self.get_or_insert_taffy_viewport_node(ui_root_entity);
 
         let available_space = taffy::geometry::Size {
@@ -227,44 +300,56 @@ impl UiSurface {
             height: taffy::style::AvailableSpace::Definite(render_target_resolution.y as f32),
         };
 
-        self.taffy
-            .compute_layout_with_measure(
-                implicit_viewport_node,
-                available_space,
-                |known_dimensions: taffy::Size<Option<f32>>,
-                 available_space: taffy::Size<taffy::AvailableSpace>,
-                 _node_id: taffy::NodeId,
-                 context: Option<&mut NodeMeasure>,
-                 style: &taffy::Style|
-                 -> taffy::Size<f32> {
-                    context
-                        .map(|ctx| {
-                            let buffer = get_text_buffer(
-                                crate::widget::TextMeasure::needs_buffer(
-                                    known_dimensions.height,
-                                    available_space.width,
-                                ),
-                                ctx,
-                                buffer_query,
-                            );
-                            let size = ctx.measure(MeasureArgs {
-                                known_width: known_dimensions.width,
-                                known_height: known_dimensions.height,
-                                available_width: available_space.width,
-                                available_height: available_space.height,
-                                font_system,
-                                buffer,
-                                style,
-                            });
-                            taffy::Size {
-                                width: size.x,
-                                height: size.y,
-                            }
-                        })
-                        .unwrap_or(taffy::Size::ZERO)
-                },
-            )
-            .unwrap();
+        compute_layout_with_measure(
+            &mut self.taffy,
+            implicit_viewport_node,
+            available_space,
+            buffer_query,
+            font_system,
+        );
+    }
+
+    /// Computes the disconnected descendant layout rooted at a contained node.
+    pub fn compute_contained_layout<'a>(
+        &mut self,
+        entity: Entity,
+        buffer_query: &'a mut bevy_ecs::prelude::Query<&mut bevy_text::ComputedTextBlock>,
+        font_system: &'a mut FontCx,
+    ) {
+        let Some(layout_node) = self.entity_to_taffy.get(&entity).copied() else {
+            return;
+        };
+        let Some(container_id) = layout_node.container_id else {
+            return;
+        };
+
+        let outer_layout = self.taffy.unrounded_layout(layout_node.id);
+        let outer_size = Vec2::new(outer_layout.size.width, outer_layout.size.height);
+        let outer_style = self.taffy.style(layout_node.id).unwrap().clone();
+        let container_style = containment_style(outer_style, outer_size);
+        if self.taffy.style(container_id).unwrap() != &container_style {
+            self.taffy.set_style(container_id, container_style).unwrap();
+        } else if !self.taffy.dirty(container_id).unwrap() {
+            return;
+        }
+
+        #[cfg(test)]
+        {
+            self.layout_computations += 1;
+        }
+
+        let available_space = taffy::geometry::Size {
+            width: taffy::style::AvailableSpace::Definite(outer_size.x),
+            height: taffy::style::AvailableSpace::Definite(outer_size.y),
+        };
+
+        compute_layout_with_measure(
+            &mut self.taffy,
+            container_id,
+            available_space,
+            buffer_query,
+            font_system,
+        );
     }
 
     /// Removes each entity from the internal map and then removes their associated nodes from taffy
@@ -272,6 +357,9 @@ impl UiSurface {
         for entity in entities {
             if let Some(node) = self.entity_to_taffy.remove(&entity) {
                 self.taffy.remove(node.id).unwrap();
+                if let Some(container_node) = node.container_id {
+                    self.taffy.remove(container_node).ok();
+                }
                 if let Some(viewport_node) = node.viewport_id {
                     self.taffy.remove(viewport_node).ok();
                 }
@@ -300,7 +388,12 @@ impl UiSurface {
         }
 
         let out = match self.taffy.layout(taffy_node.id).cloned() {
-            Ok(layout) => {
+            Ok(mut layout) => {
+                if let Some(container_id) = taffy_node.container_id {
+                    let container_layout = self.taffy.layout(container_id).unwrap();
+                    layout.content_size = container_layout.content_size;
+                    layout.scrollbar_size = container_layout.scrollbar_size;
+                }
                 self.taffy.disable_rounding();
                 let taffy_size = self.taffy.layout(taffy_node.id).unwrap().size;
                 let unrounded_size = Vec2::new(taffy_size.width, taffy_size.height);
@@ -312,6 +405,78 @@ impl UiSurface {
         self.taffy.enable_rounding();
         out
     }
+}
+
+fn compute_layout_with_measure<'a>(
+    taffy: &mut UiTree<NodeMeasure>,
+    node: taffy::NodeId,
+    available_space: taffy::Size<taffy::AvailableSpace>,
+    buffer_query: &'a mut bevy_ecs::prelude::Query<&mut bevy_text::ComputedTextBlock>,
+    font_system: &'a mut FontCx,
+) {
+    taffy
+        .compute_layout_with_measure(
+            node,
+            available_space,
+            |known_dimensions: taffy::Size<Option<f32>>,
+             available_space: taffy::Size<taffy::AvailableSpace>,
+             _node_id: taffy::NodeId,
+             context: Option<&mut NodeMeasure>,
+             style: &taffy::Style|
+             -> taffy::Size<f32> {
+                context
+                    .map(|ctx| {
+                        let buffer = get_text_buffer(
+                            crate::widget::TextMeasure::needs_buffer(
+                                known_dimensions.height,
+                                available_space.width,
+                            ),
+                            ctx,
+                            buffer_query,
+                        );
+                        let size = ctx.measure(MeasureArgs {
+                            known_width: known_dimensions.width,
+                            known_height: known_dimensions.height,
+                            available_width: available_space.width,
+                            available_height: available_space.height,
+                            font_system,
+                            buffer,
+                            style,
+                        });
+                        taffy::Size {
+                            width: size.x,
+                            height: size.y,
+                        }
+                    })
+                    .unwrap_or(taffy::Size::ZERO)
+            },
+        )
+        .unwrap();
+}
+
+fn containment_style(mut style: taffy::Style, size: Vec2) -> taffy::Style {
+    let defaults = taffy::Style::default();
+    style.item_is_table = defaults.item_is_table;
+    style.item_is_replaced = defaults.item_is_replaced;
+    style.box_sizing = defaults.box_sizing;
+    style.position = defaults.position;
+    style.inset = defaults.inset;
+    style.size = taffy::Size {
+        width: taffy::style_helpers::length(size.x),
+        height: taffy::style_helpers::length(size.y),
+    };
+    style.min_size = defaults.min_size;
+    style.max_size = defaults.max_size;
+    style.aspect_ratio = defaults.aspect_ratio;
+    style.margin = defaults.margin;
+    style.align_self = defaults.align_self;
+    style.justify_self = defaults.justify_self;
+    style.flex_basis = defaults.flex_basis;
+    style.flex_grow = defaults.flex_grow;
+    style.flex_shrink = defaults.flex_shrink;
+    style.grid_row = defaults.grid_row;
+    style.grid_column = defaults.grid_column;
+    style
 }
 
 pub fn get_text_buffer<'a>(
