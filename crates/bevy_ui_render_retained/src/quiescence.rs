@@ -10,7 +10,7 @@ use bevy::{
         system::{Query, Res, SystemParam},
     },
     ui::{
-        ui_layout_system, ui_stack_system, CalculatedClip, ComputedNode,
+        ui_geometry_system, ui_layout_system, ui_stack_system, CalculatedClip, ComputedNode,
         ComputedUiRenderTargetInfo, ContentSize, GlobalZIndex, IgnoreScroll, LayoutConfig, Node,
         Outline, OverrideClip, ScrollPosition, UiGlobalTransform, UiSystems, UiTransform, ZIndex,
     },
@@ -20,8 +20,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Main-world recursive work completed since startup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetainedUiMainWorldWork {
-    /// Bevy layout/geometry walks executed.
+    /// Taffy layout computations executed.
     pub layout_runs: u64,
+    /// Bevy derived-geometry placement walks executed.
+    pub geometry_runs: u64,
     /// Bevy paint-stack rebuilds executed.
     pub stack_runs: u64,
     /// Bevy recursive clipping walks executed.
@@ -32,6 +34,7 @@ pub struct RetainedUiMainWorldWork {
 #[derive(bevy::prelude::Resource, Default)]
 pub struct RetainedUiMainWorldCounters {
     layout_runs: AtomicU64,
+    geometry_runs: AtomicU64,
     stack_runs: AtomicU64,
     clip_runs: AtomicU64,
 }
@@ -41,16 +44,18 @@ impl RetainedUiMainWorldCounters {
     pub fn snapshot(&self) -> RetainedUiMainWorldWork {
         RetainedUiMainWorldWork {
             layout_runs: self.layout_runs.load(Ordering::Relaxed),
+            geometry_runs: self.geometry_runs.load(Ordering::Relaxed),
             stack_runs: self.stack_runs.load(Ordering::Relaxed),
             clip_runs: self.clip_runs.load(Ordering::Relaxed),
         }
     }
 }
 
-/// Prevents Bevy's recursive layout and stack walks when none of their inputs changed.
+/// Prevents Bevy's recursive layout, geometry, stack, and clipping walks when none of their
+/// inputs changed.
 ///
-/// Add this after [`bevy::ui::UiPlugin`]. Only the two stock systems are replaced; other systems
-/// placed in [`UiSystems::Layout`] or [`UiSystems::Stack`] keep their original schedule behavior.
+/// Add this after [`bevy::ui::UiPlugin`]. Only the four named stock systems are replaced; other
+/// systems placed in the same [`UiSystems`] sets keep their original schedule behavior.
 #[derive(Default)]
 pub struct RetainedUiMainWorldPlugin;
 
@@ -68,6 +73,17 @@ impl Plugin for RetainedUiMainWorldPlugin {
         assert_eq!(
             removed_layout, 1,
             "UiPlugin must contain exactly one stock layout system"
+        );
+        let removed_geometry = app
+            .remove_systems_in_set(
+                PostUpdate,
+                ui_geometry_system,
+                ScheduleCleanupPolicy::RemoveSystemsOnly,
+            )
+            .expect("UiPlugin must be added before RetainedUiMainWorldPlugin");
+        assert_eq!(
+            removed_geometry, 1,
+            "UiPlugin must contain exactly one stock geometry system"
         );
         let removed_stack = app
             .remove_systems_in_set(
@@ -101,6 +117,14 @@ impl Plugin for RetainedUiMainWorldPlugin {
         )
         .add_systems(
             PostUpdate,
+            ui_geometry_system
+                .in_set(UiSystems::Layout)
+                .after(ui_layout_system)
+                .ambiguous_with(bevy::sprite::update_text2d_layout)
+                .run_if(geometry_may_change),
+        )
+        .add_systems(
+            PostUpdate,
             ui_stack_system
                 .in_set(UiSystems::Stack)
                 .run_if(stack_may_change),
@@ -119,6 +143,55 @@ struct RemovedLayoutInputs<'w, 's> {
     node: RemovedComponents<'w, 's, Node>,
     content_size: RemovedComponents<'w, 's, ContentSize>,
     target: RemovedComponents<'w, 's, ComputedUiRenderTargetInfo>,
+    children: RemovedComponents<'w, 's, Children>,
+    parent: RemovedComponents<'w, 's, ChildOf>,
+}
+
+impl RemovedLayoutInputs<'_, '_> {
+    fn any(&mut self) -> bool {
+        let Self {
+            node,
+            content_size,
+            target,
+            children,
+            parent,
+        } = self;
+        node.read()
+            .chain(content_size.read())
+            .chain(target.read())
+            .chain(children.read())
+            .chain(parent.read())
+            .next()
+            .is_some()
+    }
+}
+
+fn layout_may_change(
+    changed_core: Query<
+        (),
+        Or<(
+            Changed<Node>,
+            Changed<ContentSize>,
+            Changed<ComputedUiRenderTargetInfo>,
+            Changed<Children>,
+            Changed<ChildOf>,
+        )>,
+    >,
+    mut removed: RemovedLayoutInputs,
+    counters: Res<RetainedUiMainWorldCounters>,
+) -> bool {
+    let changed = !changed_core.is_empty() || removed.any();
+    if changed {
+        counters.layout_runs.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
+}
+
+#[derive(SystemParam)]
+struct RemovedGeometryInputs<'w, 's> {
+    node: RemovedComponents<'w, 's, Node>,
+    content_size: RemovedComponents<'w, 's, ContentSize>,
+    target: RemovedComponents<'w, 's, ComputedUiRenderTargetInfo>,
     transform: RemovedComponents<'w, 's, UiTransform>,
     config: RemovedComponents<'w, 's, LayoutConfig>,
     outline: RemovedComponents<'w, 's, Outline>,
@@ -128,7 +201,7 @@ struct RemovedLayoutInputs<'w, 's> {
     parent: RemovedComponents<'w, 's, ChildOf>,
 }
 
-impl RemovedLayoutInputs<'_, '_> {
+impl RemovedGeometryInputs<'_, '_> {
     fn any(&mut self) -> bool {
         let Self {
             node,
@@ -157,7 +230,7 @@ impl RemovedLayoutInputs<'_, '_> {
     }
 }
 
-fn layout_may_change(
+fn geometry_may_change(
     changed_core: Query<
         (),
         Or<(
@@ -178,12 +251,12 @@ fn layout_may_change(
             Changed<IgnoreScroll>,
         )>,
     >,
-    mut removed: RemovedLayoutInputs,
+    mut removed: RemovedGeometryInputs,
     counters: Res<RetainedUiMainWorldCounters>,
 ) -> bool {
     let changed = !changed_core.is_empty() || !changed_optional.is_empty() || removed.any();
     if changed {
-        counters.layout_runs.fetch_add(1, Ordering::Relaxed);
+        counters.geometry_runs.fetch_add(1, Ordering::Relaxed);
     }
     changed
 }

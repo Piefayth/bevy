@@ -61,21 +61,25 @@ systems in that set were registered. The red/green regression test is
 `bevy_ui_render_retained/tests/ui_systems_scope.rs`. This is enough to stop all
 layout work for a wholly quiet tree without changing `bevy_ui`.
 
-It is not enough to separate layout from placement. `ui_layout_system`
-currently performs both Taffy layout and the recursive update of
+It was not enough to separate layout from placement externally.
+`ui_layout_system` performed both Taffy layout and the recursive update of
 `ComputedNode`/`UiGlobalTransform`, including transforms and scroll offsets.
-That recursive update is not a separately schedulable public system, and the
-`UiSurface` holding the Taffy state is private. Therefore
-a transform-only or scroll-only animation can avoid layout only by either:
+That recursive update was not a separately schedulable public system, and the
+`UiSurface` holding the Taffy state was private. Therefore a transform-only or
+scroll-only animation could avoid Taffy only by either:
 
 - moving that geometry update into an independently scheduled `bevy_ui`
   system; or
 - duplicating Bevy's geometry traversal in the third-party crate.
 
 The second choice creates two owners for the same derived state and is rejected.
-Unless a smaller public composition point appears during implementation,
-placement-domain quiescence justifies expanding scope to `bevy_ui`. Static-tree
-quiescence alone does not.
+The focused `bevy_ui` patch now splits the original function into public,
+ordered `ui_layout_system` and `ui_geometry_system` systems. The former owns
+Taffy synchronization and computation; the latter owns placement, scrolling,
+rounding, outlines, radii, and derived render geometry. This is the second
+justified `bevy_ui` expansion: it lets a `UiTransform` or scroll animation skip
+Taffy without duplicating Bevy internals. Static-tree quiescence alone would not
+have justified it.
 
 There is a second possible `bevy_ui` boundary for O(changes) candidate
 nomination. In Bevy 0.19, lifecycle hooks run for component insertion,
@@ -108,16 +112,16 @@ mutation journal or immutable render-affecting values replaced through an
 invalidating API. Manual dirty flags and periodic audits remain rejected
 because they permit permanent stale pixels.
 
-The first main-world quiescence increment replaces exactly three stock systems:
-`ui_layout_system`, `ui_stack_system`, and `update_clipping_system`. Each keeps
-its original public set membership and gains a complete changed/removed-input
-condition. Other application systems placed in `UiSystems::Layout`,
-`UiSystems::Stack`, or `UiSystems::PostLayout` remain ungated. Exact replacement
-requires naming the stock function; `ui_stack_system` was private, so the
-smallest `bevy_ui` patch publicly re-exports it and deletes its private cache
-wrapper in favor of the identical `Local<Vec<Vec<_>>>`. This is the first
-justified expansion beyond `bevy_ui_render`: gating the whole public set from a
-third-party crate would silently change unrelated systems' execution semantics.
+The main-world quiescence plugin replaces exactly four stock systems:
+`ui_layout_system`, `ui_geometry_system`, `ui_stack_system`, and
+`update_clipping_system`. Each keeps its original public set membership and
+gains a complete changed/removed-input condition. Other application systems
+placed in `UiSystems::Layout`, `UiSystems::Stack`, or `UiSystems::PostLayout`
+remain ungated. Exact replacement requires naming the stock function;
+`ui_stack_system` was private, so the smallest initial `bevy_ui` patch publicly
+re-exported it and deleted its private cache wrapper in favor of the identical
+`Local<Vec<Vec<_>>>`. Gating the whole public set from a third-party crate was
+rejected because it silently changes unrelated systems' execution semantics.
 
 The core-pipeline probe found a public and simpler interposition point than
 changing `CameraOutputMode` after target preparation. Bevy schedules the final
@@ -543,17 +547,21 @@ static stock path remains linear in tree size. The benchmark source is
 
 The main-world quiescence benchmark runs the same quiet/localized/full trees
 through `RetainedUiMainWorldPlugin`. On this machine, a short 10,000-node quiet
-run fell from approximately 1.145 ms to 0.200 ms after layout, stack, and
-clipping were gated. A localized width change remained approximately 3.7 ms,
-as expected: it still requires Bevy's whole-root Taffy and geometry walk. These
+run fell from approximately 1.145 ms to 0.200 ms after layout, geometry, stack,
+and clipping were gated. A localized width change still requires Bevy's
+whole-root Taffy and geometry walk. After splitting placement from Taffy, a
+localized `UiTransform` change at 10,000 nodes fell from approximately 1.27 ms
+on the stock path to 0.60 ms on the retained path. It still walks the whole UI
+tree for geometry, so it remains linear and is not the desired endpoint. These
 are local comparison points, not portable claims. The quiet remainder includes
 the exact `Changed<T>` scans and other ungated `PostUpdate` systems; it is not
-described as zero CPU work. Atomic counters separately prove zero layout walks,
-stack rebuilds, and clipping walks on static and paint-only frames. Tests also
-prove width and `UiTransform` changes wake layout plus clipping, `ZIndex` wakes
-only stack, `OverrideClip` wakes only clipping, hierarchy changes wake all three,
-removal cleans the stack, and custom systems in the public UI sets continue to
-run normally.
+described as zero CPU work. Atomic counters separately prove zero Taffy,
+geometry, stack, and clipping walks on static and paint-only frames. Tests also
+prove width changes wake Taffy, geometry, and clipping; `UiTransform` wakes
+geometry and clipping but not Taffy; `ZIndex` wakes only stack; `OverrideClip`
+wakes only clipping; hierarchy changes wake every recursive domain; removal
+cleans the stack; and custom systems in the public UI sets continue to run
+normally.
 
 The first retained-core benchmark on the same machine measured quiet repair
 planning at roughly 6 ns and one canonical record change plus exact damage at

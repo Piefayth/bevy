@@ -137,7 +137,7 @@ fn static_and_paint_only_ui_skip_layout_and_stack_walks() {
 }
 
 #[test]
-fn layout_transform_and_stack_inputs_wake_only_the_required_domain() {
+fn layout_placement_and_stack_inputs_wake_only_the_required_domain() {
     let (mut app, _, leaf) = test_app();
 
     let before = retained_work(&app);
@@ -145,6 +145,7 @@ fn layout_transform_and_stack_inputs_wake_only_the_required_domain() {
     app.world_mut().run_schedule(PostUpdate);
     let after = retained_work(&app);
     assert_eq!(after.layout_runs, before.layout_runs + 1);
+    assert_eq!(after.geometry_runs, before.geometry_runs + 1);
     assert_eq!(after.stack_runs, before.stack_runs);
     assert_eq!(after.clip_runs, before.clip_runs + 1);
     assert_eq!(
@@ -160,7 +161,8 @@ fn layout_transform_and_stack_inputs_wake_only_the_required_domain() {
         .x = Val::Px(3.0);
     app.world_mut().run_schedule(PostUpdate);
     let after = retained_work(&app);
-    assert_eq!(after.layout_runs, before.layout_runs + 1);
+    assert_eq!(after.layout_runs, before.layout_runs);
+    assert_eq!(after.geometry_runs, before.geometry_runs + 1);
     assert_eq!(after.stack_runs, before.stack_runs);
     assert_eq!(after.clip_runs, before.clip_runs + 1);
     assert_ne!(
@@ -176,6 +178,7 @@ fn layout_transform_and_stack_inputs_wake_only_the_required_domain() {
     app.world_mut().run_schedule(PostUpdate);
     let after = retained_work(&app);
     assert_eq!(after.layout_runs, before.layout_runs);
+    assert_eq!(after.geometry_runs, before.geometry_runs);
     assert_eq!(after.stack_runs, before.stack_runs + 1);
     assert_eq!(after.clip_runs, before.clip_runs);
     assert!(app.world().get::<ComputedStackIndex>(leaf).unwrap().0 > 0);
@@ -202,6 +205,7 @@ fn hierarchy_changes_wake_layout_and_stack() {
 
     let after = retained_work(&app);
     assert_eq!(after.layout_runs, before.layout_runs + 1);
+    assert_eq!(after.geometry_runs, before.geometry_runs + 1);
     assert_eq!(after.stack_runs, before.stack_runs + 1);
     assert_eq!(after.clip_runs, before.clip_runs + 1);
     assert_ne!(root, new_root);
@@ -217,6 +221,7 @@ fn clipping_only_inputs_do_not_wake_layout_or_stack() {
 
     let after = retained_work(&app);
     assert_eq!(after.layout_runs, before.layout_runs);
+    assert_eq!(after.geometry_runs, before.geometry_runs);
     assert_eq!(after.stack_runs, before.stack_runs);
     assert_eq!(after.clip_runs, before.clip_runs + 1);
 }
@@ -231,6 +236,7 @@ fn node_removal_wakes_every_recursive_domain_and_cleans_the_stack() {
 
     let after = retained_work(&app);
     assert_eq!(after.layout_runs, before.layout_runs + 1);
+    assert_eq!(after.geometry_runs, before.geometry_runs + 1);
     assert_eq!(after.stack_runs, before.stack_runs + 1);
     assert_eq!(after.clip_runs, before.clip_runs + 1);
     assert!(!app.world().resource::<UiStack>().uinodes.contains(&leaf));

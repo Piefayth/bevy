@@ -73,7 +73,7 @@ pub enum LayoutError {
     TaffyError(taffy::tree::TaffyError),
 }
 
-/// Updates the UI's layout tree, computes the new layout geometry and then updates the sizes and transforms of all the UI nodes.
+/// Synchronizes the UI layout tree and computes Taffy layout.
 pub fn ui_layout_system(
     mut ui_surface: ResMut<UiSurface>,
     ui_root_node_query: UiRootNodes,
@@ -85,16 +85,6 @@ pub fn ui_layout_system(
         Ref<ComputedUiRenderTargetInfo>,
     )>,
     added_node_query: Query<(), Added<Node>>,
-    mut node_update_query: Query<(
-        &mut ComputedNode,
-        &UiTransform,
-        &mut UiGlobalTransform,
-        &Node,
-        Option<&LayoutConfig>,
-        Option<&Outline>,
-        Option<&ScrollPosition>,
-        Option<&IgnoreScroll>,
-    )>,
     mut buffer_query: Query<&mut ComputedTextBlock>,
     mut font_system: ResMut<FontCx>,
     mut removed_children: RemovedComponents<Children>,
@@ -199,7 +189,30 @@ pub fn ui_layout_system(
             &mut buffer_query,
             &mut font_system,
         );
+    }
+}
 
+/// Resolves Taffy output, transforms, scrolling, outlines, and radii into render geometry.
+pub fn ui_geometry_system(
+    mut ui_surface: ResMut<UiSurface>,
+    ui_root_node_query: UiRootNodes,
+    ui_children: UiChildren,
+    target_query: Query<&ComputedUiRenderTargetInfo>,
+    mut node_update_query: Query<(
+        &mut ComputedNode,
+        &UiTransform,
+        &mut UiGlobalTransform,
+        &Node,
+        Option<&LayoutConfig>,
+        Option<&Outline>,
+        Option<&ScrollPosition>,
+        Option<&IgnoreScroll>,
+    )>,
+) {
+    for ui_root_entity in ui_root_node_query.iter() {
+        let Ok(computed_target) = target_query.get(ui_root_entity) else {
+            continue;
+        };
         update_uinode_geometry_recursive(
             ui_root_entity,
             &mut ui_surface,
@@ -213,175 +226,174 @@ pub fn ui_layout_system(
             Vec2::ZERO,
         );
     }
+}
 
-    // Returns the combined bounding box of the node and any of its overflowing children.
-    fn update_uinode_geometry_recursive(
-        entity: Entity,
-        ui_surface: &mut UiSurface,
-        inherited_use_rounding: bool,
-        target_size: Vec2,
-        mut inherited_transform: Affine2,
-        node_update_query: &mut Query<(
-            &mut ComputedNode,
-            &UiTransform,
-            &mut UiGlobalTransform,
-            &Node,
-            Option<&LayoutConfig>,
-            Option<&Outline>,
-            Option<&ScrollPosition>,
-            Option<&IgnoreScroll>,
-        )>,
-        ui_children: &UiChildren,
-        inverse_target_scale_factor: f32,
-        parent_size: Vec2,
-        parent_scroll_position: Vec2,
-    ) {
-        if let Ok((
-            mut node,
-            transform,
-            mut global_transform,
-            style,
-            maybe_layout_config,
-            maybe_outline,
-            maybe_scroll_position,
-            maybe_scroll_sticky,
-        )) = node_update_query.get_mut(entity)
+fn update_uinode_geometry_recursive(
+    entity: Entity,
+    ui_surface: &mut UiSurface,
+    inherited_use_rounding: bool,
+    target_size: Vec2,
+    mut inherited_transform: Affine2,
+    node_update_query: &mut Query<(
+        &mut ComputedNode,
+        &UiTransform,
+        &mut UiGlobalTransform,
+        &Node,
+        Option<&LayoutConfig>,
+        Option<&Outline>,
+        Option<&ScrollPosition>,
+        Option<&IgnoreScroll>,
+    )>,
+    ui_children: &UiChildren,
+    inverse_target_scale_factor: f32,
+    parent_size: Vec2,
+    parent_scroll_position: Vec2,
+) {
+    if let Ok((
+        mut node,
+        transform,
+        mut global_transform,
+        style,
+        maybe_layout_config,
+        maybe_outline,
+        maybe_scroll_position,
+        maybe_scroll_sticky,
+    )) = node_update_query.get_mut(entity)
+    {
+        let use_rounding = maybe_layout_config
+            .map(|layout_config| layout_config.use_rounding)
+            .unwrap_or(inherited_use_rounding);
+
+        let Ok((layout, unrounded_size)) = ui_surface.get_layout(entity, use_rounding) else {
+            return;
+        };
+
+        let layout_size = Vec2::new(layout.size.width, layout.size.height);
+
+        // Taffy layout position of the top-left corner of the node, relative to its parent.
+        let layout_location = Vec2::new(layout.location.x, layout.location.y);
+
+        // If IgnoreScroll is set, parent scroll position is ignored along the specified axes.
+        let effective_parent_scroll = maybe_scroll_sticky
+            .map(|scroll_sticky| parent_scroll_position * Vec2::from(!scroll_sticky.0))
+            .unwrap_or(parent_scroll_position);
+
+        // The position of the center of the node relative to its top-left corner.
+        let local_center =
+            layout_location - effective_parent_scroll + 0.5 * (layout_size - parent_size);
+
+        // only trigger change detection when the new values are different
+        if node.size != layout_size
+            || node.unrounded_size != unrounded_size
+            || node.inverse_scale_factor != inverse_target_scale_factor
         {
-            let use_rounding = maybe_layout_config
-                .map(|layout_config| layout_config.use_rounding)
-                .unwrap_or(inherited_use_rounding);
+            node.size = layout_size;
+            node.unrounded_size = unrounded_size;
+            node.inverse_scale_factor = inverse_target_scale_factor;
+        }
 
-            let Ok((layout, unrounded_size)) = ui_surface.get_layout(entity, use_rounding) else {
-                return;
-            };
+        let content_size = Vec2::new(layout.content_size.width, layout.content_size.height);
+        node.bypass_change_detection().content_size = content_size;
 
-            let layout_size = Vec2::new(layout.size.width, layout.size.height);
+        let taffy_rect_to_border_rect = |rect: taffy::Rect<f32>| BorderRect {
+            min_inset: Vec2::new(rect.left, rect.top),
+            max_inset: Vec2::new(rect.right, rect.bottom),
+        };
 
-            // Taffy layout position of the top-left corner of the node, relative to its parent.
-            let layout_location = Vec2::new(layout.location.x, layout.location.y);
+        node.bypass_change_detection().border = taffy_rect_to_border_rect(layout.border);
+        node.bypass_change_detection().padding = taffy_rect_to_border_rect(layout.padding);
 
-            // If IgnoreScroll is set, parent scroll position is ignored along the specified axes.
-            let effective_parent_scroll = maybe_scroll_sticky
-                .map(|scroll_sticky| parent_scroll_position * Vec2::from(!scroll_sticky.0))
-                .unwrap_or(parent_scroll_position);
+        // Compute the node's new global transform
+        let mut local_transform = transform.compute_affine(
+            inverse_target_scale_factor.recip(),
+            layout_size,
+            target_size,
+        );
+        local_transform.translation += local_center;
+        inherited_transform *= local_transform;
 
-            // The position of the center of the node relative to its top-left corner.
-            let local_center =
-                layout_location - effective_parent_scroll + 0.5 * (layout_size - parent_size);
+        if inherited_transform != **global_transform {
+            *global_transform = inherited_transform.into();
+        }
 
-            // only trigger change detection when the new values are different
-            if node.size != layout_size
-                || node.unrounded_size != unrounded_size
-                || node.inverse_scale_factor != inverse_target_scale_factor
-            {
-                node.size = layout_size;
-                node.unrounded_size = unrounded_size;
-                node.inverse_scale_factor = inverse_target_scale_factor;
-            }
+        // We don't trigger change detection for changes to border radius
+        node.bypass_change_detection().border_radius = style.border_radius.resolve(
+            inverse_target_scale_factor.recip(),
+            node.size,
+            target_size,
+        );
 
-            let content_size = Vec2::new(layout.content_size.width, layout.content_size.height);
-            node.bypass_change_detection().content_size = content_size;
-
-            let taffy_rect_to_border_rect = |rect: taffy::Rect<f32>| BorderRect {
-                min_inset: Vec2::new(rect.left, rect.top),
-                max_inset: Vec2::new(rect.right, rect.bottom),
-            };
-
-            node.bypass_change_detection().border = taffy_rect_to_border_rect(layout.border);
-            node.bypass_change_detection().padding = taffy_rect_to_border_rect(layout.padding);
-
-            // Compute the node's new global transform
-            let mut local_transform = transform.compute_affine(
-                inverse_target_scale_factor.recip(),
-                layout_size,
-                target_size,
-            );
-            local_transform.translation += local_center;
-            inherited_transform *= local_transform;
-
-            if inherited_transform != **global_transform {
-                *global_transform = inherited_transform.into();
-            }
-
-            // We don't trigger change detection for changes to border radius
-            node.bypass_change_detection().border_radius = style.border_radius.resolve(
-                inverse_target_scale_factor.recip(),
-                node.size,
-                target_size,
-            );
-
-            if let Some(outline) = maybe_outline {
-                // don't trigger change detection when only outlines are changed
-                let node = node.bypass_change_detection();
-                node.outline_width = if style.display != Display::None {
-                    outline
-                        .width
-                        .resolve(
-                            inverse_target_scale_factor.recip(),
-                            node.size().x,
-                            target_size,
-                        )
-                        .unwrap_or(0.)
-                        .max(0.)
-                } else {
-                    0.
-                };
-
-                node.outline_offset = outline
-                    .offset
+        if let Some(outline) = maybe_outline {
+            // don't trigger change detection when only outlines are changed
+            let node = node.bypass_change_detection();
+            node.outline_width = if style.display != Display::None {
+                outline
+                    .width
                     .resolve(
                         inverse_target_scale_factor.recip(),
                         node.size().x,
                         target_size,
                     )
                     .unwrap_or(0.)
-                    // Clamp outline offsets to at least the length of the node's shorter side
-                    // Negative offset outlines can be useful to create thing like in-set focus indicators
-                    .max(-0.5 * node.size.min_element());
-            }
+                    .max(0.)
+            } else {
+                0.
+            };
 
-            node.bypass_change_detection().scrollbar_size =
-                Vec2::new(layout.scrollbar_size.width, layout.scrollbar_size.height);
-
-            let scroll_position: Vec2 = maybe_scroll_position
-                .map(|scroll_pos| {
-                    Vec2::new(
-                        if style.overflow.x == OverflowAxis::Scroll {
-                            scroll_pos.x * inverse_target_scale_factor.recip()
-                        } else {
-                            0.0
-                        },
-                        if style.overflow.y == OverflowAxis::Scroll {
-                            scroll_pos.y * inverse_target_scale_factor.recip()
-                        } else {
-                            0.0
-                        },
-                    )
-                })
-                .unwrap_or_default();
-
-            let max_possible_offset =
-                (content_size - layout_size + node.scrollbar_size).max(Vec2::ZERO);
-            let clamped_scroll_position = scroll_position.clamp(Vec2::ZERO, max_possible_offset);
-
-            let physical_scroll_position = clamped_scroll_position.floor();
-
-            node.bypass_change_detection().scroll_position = physical_scroll_position;
-
-            for child_uinode in ui_children.iter_ui_children(entity) {
-                update_uinode_geometry_recursive(
-                    child_uinode,
-                    ui_surface,
-                    use_rounding,
+            node.outline_offset = outline
+                .offset
+                .resolve(
+                    inverse_target_scale_factor.recip(),
+                    node.size().x,
                     target_size,
-                    inherited_transform,
-                    node_update_query,
-                    ui_children,
-                    inverse_target_scale_factor,
-                    layout_size,
-                    physical_scroll_position,
-                );
-            }
+                )
+                .unwrap_or(0.)
+                // Clamp outline offsets to at least the length of the node's shorter side
+                // Negative offset outlines can be useful to create thing like in-set focus indicators
+                .max(-0.5 * node.size.min_element());
+        }
+
+        node.bypass_change_detection().scrollbar_size =
+            Vec2::new(layout.scrollbar_size.width, layout.scrollbar_size.height);
+
+        let scroll_position: Vec2 = maybe_scroll_position
+            .map(|scroll_pos| {
+                Vec2::new(
+                    if style.overflow.x == OverflowAxis::Scroll {
+                        scroll_pos.x * inverse_target_scale_factor.recip()
+                    } else {
+                        0.0
+                    },
+                    if style.overflow.y == OverflowAxis::Scroll {
+                        scroll_pos.y * inverse_target_scale_factor.recip()
+                    } else {
+                        0.0
+                    },
+                )
+            })
+            .unwrap_or_default();
+
+        let max_possible_offset =
+            (content_size - layout_size + node.scrollbar_size).max(Vec2::ZERO);
+        let clamped_scroll_position = scroll_position.clamp(Vec2::ZERO, max_possible_offset);
+
+        let physical_scroll_position = clamped_scroll_position.floor();
+
+        node.bypass_change_detection().scroll_position = physical_scroll_position;
+
+        for child_uinode in ui_children.iter_ui_children(entity) {
+            update_uinode_geometry_recursive(
+                child_uinode,
+                ui_surface,
+                use_rounding,
+                target_size,
+                inherited_transform,
+                node_update_query,
+                ui_children,
+                inverse_target_scale_factor,
+                layout_size,
+                physical_scroll_position,
+            );
         }
     }
 }
@@ -389,7 +401,7 @@ pub fn ui_layout_system(
 #[cfg(test)]
 mod tests {
     use crate::{
-        layout::ui_surface::UiSurface, prelude::*, ui_layout_system,
+        layout::ui_surface::UiSurface, prelude::*, ui_geometry_system, ui_layout_system,
         update::propagate_ui_target_cameras, ContentSize, LayoutContext,
     };
     use bevy_app::{App, HierarchyPropagatePlugin, PostUpdate, PropagateSet, TaskPoolPlugin};
@@ -430,6 +442,7 @@ mod tests {
                 ApplyDeferred,
                 propagate_ui_target_cameras,
                 ui_layout_system,
+                ui_geometry_system,
                 mark_dirty_trees,
                 sync_simple_transforms,
                 propagate_parent_transforms,
@@ -1203,7 +1216,13 @@ mod tests {
 
         app.add_systems(
             PostUpdate,
-            (propagate_ui_target_cameras, ApplyDeferred, ui_layout_system).chain(),
+            (
+                propagate_ui_target_cameras,
+                ApplyDeferred,
+                ui_layout_system,
+                ui_geometry_system,
+            )
+                .chain(),
         );
 
         app.add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(

@@ -6,7 +6,7 @@ use bevy_image::ImagePlugin;
 use bevy_math::UVec2;
 use bevy_text::TextPlugin;
 use bevy_time::TimePlugin;
-use bevy_ui::{Node, UiPlugin, Val};
+use bevy_ui::{Node, UiPlugin, UiTransform, Val};
 use bevy_ui_render_retained::RetainedUiMainWorldPlugin;
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use std::time::{Duration, Instant};
@@ -117,6 +117,26 @@ fn layout_group(c: &mut Criterion, name: &str, retained: bool) {
                     measure_updates(&mut localized_app, iterations, |world| {
                         localized_width = if localized_width == 8.0 { 9.0 } else { 8.0 };
                         world.get_mut::<Node>(localized).unwrap().width = Val::Px(localized_width);
+                    })
+                });
+            },
+        );
+
+        let (mut placement_app, placement_nodes) = layout_app(node_count, retained);
+        let placement = *placement_nodes.last().unwrap();
+        let mut placement_x = 0.0;
+        group.bench_with_input(
+            BenchmarkId::new("placement_change", node_count),
+            &node_count,
+            |bencher, _| {
+                bencher.iter_custom(|iterations| {
+                    measure_updates(&mut placement_app, iterations, |world| {
+                        placement_x = if placement_x == 0.0 { 1.0 } else { 0.0 };
+                        world
+                            .get_mut::<UiTransform>(placement)
+                            .unwrap()
+                            .translation
+                            .x = Val::Px(placement_x);
                     })
                 });
             },

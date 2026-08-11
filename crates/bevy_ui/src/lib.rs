@@ -80,7 +80,6 @@ use bevy_app::{prelude::*, AnimationSystems, HierarchyPropagatePlugin, Propagate
 use bevy_camera::CameraUpdateSystems;
 use bevy_ecs::prelude::*;
 use bevy_input::InputSystems;
-use bevy_transform::TransformSystems;
 use layout::ui_surface::UiSurface;
 pub use stack::{ui_stack_system, ComputedStackIndex, UiStack};
 use update::{propagate_ui_target_cameras, update_clipping_system};
@@ -181,17 +180,12 @@ impl Plugin for UiPlugin {
                 widget::viewport_picking.in_set(PickingSystems::PostInput),
             );
 
-        ui_layout_system
-            .in_set(UiSystems::Layout)
-            .before(TransformSystems::Propagate)
-            // Text and Text2D operate on disjoint sets of entities
-            .ambiguous_with(bevy_sprite::update_text2d_layout);
-
         app.add_systems(
             PostUpdate,
             (
                 propagate_ui_target_cameras.in_set(UiSystems::Prepare),
-                ui_layout_system
+                (ui_layout_system, ui_geometry_system)
+                    .chain()
                     .in_set(UiSystems::Layout)
                     .ambiguous_with(bevy_sprite::update_text2d_layout),
                 ui_stack_system.in_set(UiSystems::Stack),
