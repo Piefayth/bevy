@@ -3,11 +3,13 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use bevy::ui_render::ui_material::{MaterialNode, UiMaterial};
 use bevy::ui_render::{
-    BoxShadowSamples, RenderUiSystems, UiRenderInfrastructurePlugin, UiRenderPlugin,
+    BoxShadowSamples, RenderUiSystems, UiMaterialPlugin, UiRenderInfrastructurePlugin,
+    UiRenderPlugin,
 };
 use bevy::{
-    asset::{AssetId, RenderAssetUsages},
+    asset::{embedded_asset, AssetId, RenderAssetUsages},
     camera::{CameraOutputMode, ClearColorConfig, RenderTarget, Viewport},
     input_focus::InputFocus,
     log::LogPlugin,
@@ -15,16 +17,20 @@ use bevy::{
     render::{
         gpu_readback::{Readback, ReadbackComplete},
         render_asset::RenderAssetBytesPerFrame,
-        render_resource::{Extent3d, PollType, TextureDimension, TextureFormat, TextureUsages},
+        render_resource::{
+            AsBindGroup, Extent3d, PollType, TextureDimension, TextureFormat, TextureUsages,
+        },
         renderer::RenderDevice,
         ExtractSchedule, RenderApp, RenderPlugin,
     },
+    shader::ShaderRef,
     text::{EditableText, TextCursorStyle, TextEdit, TextLayoutInfo},
     window::{ExitCondition, WindowPlugin},
 };
 use bevy_ui_render_retained::{
-    RetainedUiLayerCounters, RetainedUiLayerWork, RetainedUiPaintCounters, RetainedUiRenderPlugin,
-    WorkCounters,
+    RetainedUiLayerCounters, RetainedUiLayerWork, RetainedUiMaterial, RetainedUiMaterialCoverage,
+    RetainedUiMaterialImage, RetainedUiMaterialPlugin, RetainedUiMaterialSnapshot,
+    RetainedUiPaintCounters, RetainedUiRenderPlugin, WorkCounters,
 };
 use core::time::Duration;
 use std::{
@@ -123,9 +129,26 @@ fn paint_work(app: &App) -> Option<WorkCounters> {
         .map(RetainedUiPaintCounters::snapshot)
 }
 
+fn assert_no_layer_repair(before: RetainedUiLayerWork, after: RetainedUiLayerWork) {
+    assert_eq!(after.repairs, before.repairs);
+    assert_eq!(after.repair_pixels, before.repair_pixels);
+    assert_eq!(after.items_replayed, before.items_replayed);
+    assert_eq!(after.quads_replayed, before.quads_replayed);
+}
+
 fn render_scene<S>(
     renderer: UiRenderer,
     paint_schedule: PaintSchedule,
+    setup: impl FnOnce(&mut World, Entity) -> S,
+    mutate: impl FnOnce(&mut World, S),
+) -> RenderOutput {
+    render_scene_configured(renderer, paint_schedule, |_, _| {}, setup, mutate)
+}
+
+fn render_scene_configured<S>(
+    renderer: UiRenderer,
+    paint_schedule: PaintSchedule,
+    configure: impl FnOnce(&mut App, UiRenderer),
     setup: impl FnOnce(&mut World, Entity) -> S,
     mutate: impl FnOnce(&mut World, S),
 ) -> RenderOutput {
@@ -148,6 +171,7 @@ fn render_scene<S>(
     if matches!(renderer, UiRenderer::Retained) {
         app.add_plugins((UiRenderInfrastructurePlugin, RetainedUiRenderPlugin));
     }
+    configure(&mut app, renderer);
     if matches!(
         paint_schedule,
         PaintSchedule::UntilInitialCapture | PaintSchedule::UntilInitialCaptureThenDisableCamera
@@ -3908,5 +3932,420 @@ fn stock_image_target_persists_only_when_the_whole_camera_is_inactive() {
             &camera_inactive.pixels[center..center + BYTES_PER_PIXEL],
             &[255, 0, 0, 255]
         );
+    });
+}
+
+#[derive(Asset, TypePath, AsBindGroup, Clone)]
+struct TestUiMaterial {
+    #[uniform(0)]
+    color: Vec4,
+    #[texture(1)]
+    #[sampler(2)]
+    image: Handle<Image>,
+    volatile: bool,
+    target_coverage: bool,
+}
+
+impl UiMaterial for TestUiMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://gpu_ui/test_ui_material.wgsl".into()
+    }
+}
+
+impl RetainedUiMaterial for TestUiMaterial {
+    type PaintKey = [u32; 4];
+
+    fn retained_ui(&self) -> RetainedUiMaterialSnapshot<Self::PaintKey> {
+        let coverage = if self.target_coverage {
+            RetainedUiMaterialCoverage::Target
+        } else {
+            RetainedUiMaterialCoverage::Node
+        };
+        if self.volatile {
+            RetainedUiMaterialSnapshot::volatile(
+                coverage,
+                vec![RetainedUiMaterialImage::all(self.image.id())],
+            )
+        } else {
+            RetainedUiMaterialSnapshot::exact(
+                self.color.to_array().map(f32::to_bits),
+                coverage,
+                vec![RetainedUiMaterialImage::all(self.image.id())],
+            )
+        }
+    }
+}
+
+fn configure_test_ui_material(app: &mut App, renderer: UiRenderer) {
+    embedded_asset!(app, "tests", "test_ui_material.wgsl");
+    match renderer {
+        UiRenderer::Stock => app.add_plugins(UiMaterialPlugin::<TestUiMaterial>::default()),
+        UiRenderer::Retained => {
+            app.add_plugins(RetainedUiMaterialPlugin::<TestUiMaterial>::default())
+        }
+    };
+}
+
+fn configure_unretained_test_ui_material(app: &mut App, _: UiRenderer) {
+    embedded_asset!(app, "tests", "test_ui_material.wgsl");
+    app.add_plugins(UiMaterialPlugin::<TestUiMaterial>::default());
+}
+
+struct TestMaterialScene {
+    entity: Entity,
+    material: Handle<TestUiMaterial>,
+    image: Handle<Image>,
+}
+
+fn spawn_test_ui_material(
+    world: &mut World,
+    camera: Entity,
+    color: Color,
+    volatile: bool,
+    target_coverage: bool,
+) -> TestMaterialScene {
+    let image = add_solid_image(world, [255; 4]);
+    let material = world
+        .resource_mut::<Assets<TestUiMaterial>>()
+        .add(TestUiMaterial {
+            color: color.to_linear().to_vec4(),
+            image: image.clone(),
+            volatile,
+            target_coverage,
+        });
+    let entity = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(8),
+                top: px(9),
+                width: px(20),
+                height: px(20),
+                ..default()
+            },
+            MaterialNode(material.clone()),
+            UiTargetCamera(camera),
+        ))
+        .id();
+    TestMaterialScene {
+        entity,
+        material,
+        image,
+    }
+}
+
+fn render_test_ui_material(
+    renderer: UiRenderer,
+    color: Color,
+    volatile: bool,
+    target_coverage: bool,
+    mutate: impl FnOnce(&mut World, TestMaterialScene),
+) -> RenderOutput {
+    render_scene_configured(
+        renderer,
+        PaintSchedule::EveryFrame,
+        configure_test_ui_material,
+        move |world, camera| {
+            spawn_test_ui_material(world, camera, color, volatile, target_coverage)
+        },
+        mutate,
+    )
+}
+
+#[test]
+fn exact_custom_material_is_quiet_after_its_first_paint() {
+    with_gpu_lock(|| {
+        let stock = render_test_ui_material(
+            UiRenderer::Stock,
+            Color::srgb_u8(220, 45, 28),
+            false,
+            false,
+            |_, _| {},
+        );
+        let retained = render_test_ui_material(
+            UiRenderer::Retained,
+            Color::srgb_u8(220, 45, 28),
+            false,
+            false,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &retained.pixels[sample..sample + BYTES_PER_PIXEL],
+            &[220, 45, 28, 255]
+        );
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_no_layer_repair(before, after);
+        assert!(after.composites > before.composites);
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn unretained_custom_material_uses_the_safe_full_repaint_fallback() {
+    with_gpu_lock(|| {
+        let output = render_scene_configured(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            configure_unretained_test_ui_material,
+            |world, camera| {
+                spawn_test_ui_material(world, camera, Color::srgb_u8(220, 45, 28), false, false)
+            },
+            |_, _| {},
+        );
+
+        let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &output.pixels[sample..sample + BYTES_PER_PIXEL],
+            &[220, 45, 28, 255]
+        );
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert!(after.repairs > before.repairs);
+        assert!(after.repair_pixels >= before.repair_pixels + u64::from(WIDTH * HEIGHT));
+    });
+}
+
+#[test]
+fn exact_custom_material_change_repairs_only_its_node() {
+    with_gpu_lock(|| {
+        let mutate = |world: &mut World, scene: TestMaterialScene| {
+            world
+                .resource_mut::<Assets<TestUiMaterial>>()
+                .get_mut(&scene.material)
+                .unwrap()
+                .color = Color::srgb_u8(20, 190, 80).to_linear().to_vec4();
+        };
+        let stock = render_test_ui_material(
+            UiRenderer::Stock,
+            Color::srgb_u8(220, 45, 28),
+            false,
+            false,
+            mutate,
+        );
+        let retained = render_test_ui_material(
+            UiRenderer::Retained,
+            Color::srgb_u8(220, 45, 28),
+            false,
+            false,
+            mutate,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &retained.pixels[sample..sample + BYTES_PER_PIXEL],
+            &[20, 190, 80, 255]
+        );
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+    });
+}
+
+#[test]
+fn equal_custom_material_asset_write_does_no_paint_work() {
+    with_gpu_lock(|| {
+        let retained = render_test_ui_material(
+            UiRenderer::Retained,
+            Color::srgb_u8(220, 45, 28),
+            false,
+            false,
+            |world, scene| {
+                let mut materials = world.resource_mut::<Assets<TestUiMaterial>>();
+                let color = materials.get(&scene.material).unwrap().color;
+                materials.get_mut(&scene.material).unwrap().color = color;
+            },
+        );
+
+        assert_no_layer_repair(
+            retained.before_mutation.unwrap(),
+            retained.after_mutation.unwrap(),
+        );
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn volatile_custom_material_repaints_while_visible() {
+    with_gpu_lock(|| {
+        let stock = render_test_ui_material(
+            UiRenderer::Stock,
+            Color::srgb_u8(220, 45, 28),
+            true,
+            false,
+            |_, _| {},
+        );
+        let retained = render_test_ui_material(
+            UiRenderer::Retained,
+            Color::srgb_u8(220, 45, 28),
+            true,
+            false,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert!(after.repairs > before.repairs);
+        assert!(after.items_replayed > before.items_replayed);
+    });
+}
+
+#[test]
+fn target_coverage_custom_material_repairs_the_declared_target() {
+    with_gpu_lock(|| {
+        let retained = render_test_ui_material(
+            UiRenderer::Retained,
+            Color::srgb_u8(220, 45, 28),
+            false,
+            true,
+            |world, scene| {
+                world
+                    .resource_mut::<Assets<TestUiMaterial>>()
+                    .get_mut(&scene.material)
+                    .unwrap()
+                    .color = Color::srgb_u8(20, 190, 80).to_linear().to_vec4();
+            },
+        );
+
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(
+            after.repair_pixels,
+            before.repair_pixels + u64::from(WIDTH * HEIGHT)
+        );
+    });
+}
+
+#[test]
+fn custom_material_sample_change_repairs_only_its_reader() {
+    with_gpu_lock(|| {
+        let mutate = |world: &mut World, scene: TestMaterialScene| {
+            world
+                .resource_mut::<Assets<Image>>()
+                .get_mut(&scene.image)
+                .unwrap()
+                .data
+                .as_mut()
+                .unwrap()
+                .copy_from_slice(&[20, 190, 80, 255]);
+        };
+        let stock = render_test_ui_material(UiRenderer::Stock, Color::WHITE, false, false, mutate);
+        let retained =
+            render_test_ui_material(UiRenderer::Retained, Color::WHITE, false, false, mutate);
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &retained.pixels[sample..sample + BYTES_PER_PIXEL],
+            &[20, 190, 80, 255]
+        );
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+    });
+}
+
+#[test]
+fn custom_material_waits_for_a_changed_image_binding() {
+    with_gpu_lock(|| {
+        let mutate = |world: &mut World, scene: TestMaterialScene| {
+            let image = add_solid_image(world, [30, 70, 210, 255]);
+            world
+                .resource_mut::<Assets<TestUiMaterial>>()
+                .get_mut(&scene.material)
+                .unwrap()
+                .image = image;
+        };
+        let stock = render_test_ui_material(UiRenderer::Stock, Color::WHITE, false, false, mutate);
+        let retained =
+            render_test_ui_material(UiRenderer::Retained, Color::WHITE, false, false, mutate);
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &retained.pixels[sample..sample + BYTES_PER_PIXEL],
+            &[30, 70, 210, 255]
+        );
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+    });
+}
+
+#[test]
+fn unprepared_custom_material_binding_keeps_old_pixels_and_damage_owed() {
+    with_gpu_lock(|| {
+        let retained = render_test_ui_material(
+            UiRenderer::Retained,
+            Color::WHITE,
+            false,
+            false,
+            |world, scene| {
+                world.insert_resource(RenderAssetBytesPerFrame::new(0));
+                let image = add_solid_image(world, [30, 70, 210, 255]);
+                world
+                    .resource_mut::<Assets<TestUiMaterial>>()
+                    .get_mut(&scene.material)
+                    .unwrap()
+                    .image = image;
+            },
+        );
+
+        let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &retained.pixels[sample..sample + BYTES_PER_PIXEL],
+            &[255, 255, 255, 255]
+        );
+        assert_no_layer_repair(
+            retained.before_mutation.unwrap(),
+            retained.after_mutation.unwrap(),
+        );
+        let before = retained.paint_before_mutation.unwrap();
+        let after = retained.paint_after_mutation.unwrap();
+        assert_eq!(after.records_changed, before.records_changed + 1);
+    });
+}
+
+#[test]
+fn removing_a_custom_material_repairs_its_previous_pixels() {
+    with_gpu_lock(|| {
+        let retained = render_test_ui_material(
+            UiRenderer::Retained,
+            Color::srgb_u8(220, 45, 28),
+            false,
+            false,
+            |world, scene| {
+                world
+                    .entity_mut(scene.entity)
+                    .remove::<MaterialNode<TestUiMaterial>>();
+            },
+        );
+
+        let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &retained.pixels[sample..sample + BYTES_PER_PIXEL],
+            &[0, 0, 0, 255]
+        );
+        let before = retained.paint_before_mutation.unwrap();
+        let after = retained.paint_after_mutation.unwrap();
+        assert_eq!(after.records_removed, before.records_removed + 1);
     });
 }

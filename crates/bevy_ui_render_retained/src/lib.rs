@@ -18,6 +18,7 @@ mod damage;
 mod gradient;
 mod image;
 mod layer;
+mod material;
 mod paint;
 mod sampled_image;
 mod scene;
@@ -27,6 +28,10 @@ mod viewport;
 
 pub use damage::{DamageJournal, PhysicalRect, RepairPlan};
 pub use layer::{RetainedUiLayerCounters, RetainedUiLayerWork, RetainedUiRenderPlugin};
+pub use material::{
+    RetainedUiMaterial, RetainedUiMaterialCoverage, RetainedUiMaterialImage, RetainedUiMaterialKey,
+    RetainedUiMaterialPlugin, RetainedUiMaterialSnapshot,
+};
 pub use paint::{
     FloatBits, PaintCoverage, PaintRecord, RetainedPaint, UpdateOutcome, WorkCounters,
 };

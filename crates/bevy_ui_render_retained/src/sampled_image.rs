@@ -17,6 +17,7 @@ use bevy::{
         Extract,
     },
 };
+use core::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 
@@ -86,6 +87,7 @@ pub(crate) enum ImageReader {
     Node(Entity),
     Text(Entity),
     Viewport(Entity),
+    Material(TypeId, Entity),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -317,21 +319,35 @@ impl RetainedSampledImages {
     pub(crate) fn take_nodes(&mut self) -> HashSet<Entity> {
         self.take(|reader| match reader {
             ImageReader::Node(entity) => Some(entity),
-            ImageReader::Text(_) | ImageReader::Viewport(_) => None,
+            ImageReader::Text(_) | ImageReader::Viewport(_) | ImageReader::Material(_, _) => None,
         })
     }
 
     pub(crate) fn take_text(&mut self) -> HashSet<Entity> {
         self.take(|reader| match reader {
             ImageReader::Text(entity) => Some(entity),
-            ImageReader::Node(_) | ImageReader::Viewport(_) => None,
+            ImageReader::Node(_) | ImageReader::Viewport(_) | ImageReader::Material(_, _) => None,
         })
     }
 
     pub(crate) fn take_viewports(&mut self) -> HashSet<Entity> {
         self.take(|reader| match reader {
             ImageReader::Viewport(entity) => Some(entity),
-            ImageReader::Node(_) | ImageReader::Text(_) => None,
+            ImageReader::Node(_) | ImageReader::Text(_) | ImageReader::Material(_, _) => None,
+        })
+    }
+
+    pub(crate) fn take_materials<M: bevy::ui_render::ui_material::UiMaterial>(
+        &mut self,
+    ) -> HashSet<Entity> {
+        self.take(|reader| match reader {
+            ImageReader::Material(material, entity) if material == TypeId::of::<M>() => {
+                Some(entity)
+            }
+            ImageReader::Node(_)
+            | ImageReader::Text(_)
+            | ImageReader::Viewport(_)
+            | ImageReader::Material(_, _) => None,
         })
     }
 

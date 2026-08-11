@@ -44,6 +44,31 @@ where
     M::Data: PartialEq + Eq + Hash + Clone,
 {
     fn build(&self, app: &mut App) {
+        app.add_plugins(UiMaterialInfrastructurePlugin::<M>::default());
+
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.add_systems(
+                ExtractSchedule,
+                extract_ui_material_nodes::<M>.in_set(RenderUiSystems::ExtractBackgrounds),
+            );
+        }
+    }
+}
+
+/// Asset preparation and GPU pipeline shared by UI material render policies.
+pub struct UiMaterialInfrastructurePlugin<M: UiMaterial>(PhantomData<M>);
+
+impl<M: UiMaterial> Default for UiMaterialInfrastructurePlugin<M> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<M: UiMaterial> Plugin for UiMaterialInfrastructurePlugin<M>
+where
+    M::Data: PartialEq + Eq + Hash + Clone,
+{
+    fn build(&self, app: &mut App) {
         load_shader_library!(app, "ui_vertex_output.wgsl");
 
         embedded_asset!(app, "ui_material.wgsl");
@@ -59,10 +84,6 @@ where
                 .init_gpu_resource::<UiMaterialMeta<M>>()
                 .init_gpu_resource::<SpecializedRenderPipelines<UiMaterialPipeline<M>>>()
                 .add_systems(RenderStartup, init_ui_material_pipeline::<M>)
-                .add_systems(
-                    ExtractSchedule,
-                    extract_ui_material_nodes::<M>.in_set(RenderUiSystems::ExtractBackgrounds),
-                )
                 .add_systems(
                     Render,
                     (
@@ -108,6 +129,12 @@ pub struct UiMaterialBatch<M: UiMaterial> {
     /// The range of vertices inside the [`UiMaterialMeta`]
     pub range: Range<u32>,
     pub material: AssetId<M>,
+}
+
+/// Type-erased prepared vertex range for render policies that do not know the material type.
+#[derive(Component)]
+pub struct UiMaterialBatchRange {
+    pub range: Range<u32>,
 }
 
 /// Render pipeline data for a given [`UiMaterial`]
@@ -542,7 +569,19 @@ pub fn prepare_uimaterial_nodes<M: UiMaterial>(
         }
         ui_meta.vertices.write_buffer(&render_device, &render_queue);
         *previous_len = batches.len();
+        let ranges = batches
+            .iter()
+            .map(|(entity, batch)| {
+                (
+                    *entity,
+                    UiMaterialBatchRange {
+                        range: batch.range.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
         commands.try_insert_batch(batches);
+        commands.try_insert_batch(ranges);
     }
     extracted_uinodes.uinodes.clear();
 }
@@ -551,6 +590,8 @@ pub struct PreparedUiMaterial<T: UiMaterial> {
     pub bindings: BindingResources,
     pub bind_group: BindGroup,
     pub key: T::Data,
+    /// Source value used to prove that retained paint matches the prepared bind group.
+    pub source: T,
 }
 
 impl<M: UiMaterial> RenderAsset for PreparedUiMaterial<M> {
@@ -582,6 +623,7 @@ impl<M: UiMaterial> RenderAsset for PreparedUiMaterial<M> {
                 bindings: prepared.bindings,
                 bind_group: prepared.bind_group,
                 key: bind_group_data,
+                source: material,
             }),
             Err(AsBindGroupError::RetryNextUpdate) => {
                 Err(PrepareAssetError::RetryNextUpdate(material))

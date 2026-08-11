@@ -1,8 +1,8 @@
 # Retained UI design record
 
 This document records the research and design constraints for a damage-tracked
-retained renderer for Bevy UI. It is a working contract for the implementation,
-not a description of code that already exists.
+retained renderer for Bevy UI. It records both the governing contract and the
+capabilities already established by executable proofs.
 
 The objective is stricter than ordinary "retained mode":
 
@@ -168,6 +168,18 @@ This is still entirely inside the focused `bevy_ui_render` replacement patch.
 `ViewportNode` needs no additional Bevy patch. It resolves to the existing UI
 image command, so the retained crate replaces only its extractor and reuses the
 same node pipeline and sampled-image dependency index.
+
+Custom `UiMaterial` exposed one final reusable boundary inside
+`bevy_ui_render`. `UiMaterialPlugin<M>` now composes a public
+`UiMaterialInfrastructurePlugin<M>` with stock extraction, and material
+preparation emits one type-erased vertex-range component beside its typed
+batch. The retained crate can therefore reuse arbitrary material pipelines and
+draw commands without a callback registry or knowledge of `M`. Existing
+`UiMaterialPlugin<M>` integrations remain correct under the retained renderer:
+unknown material phase items conservatively force a full-target repaint every
+frame. Replacing that plugin with `RetainedUiMaterialPlugin<M>` opts into exact
+retention. This is a focused `bevy_ui_render` composition patch, not a reason
+to vendor `bevy_ui` or `bevy_core_pipeline`.
 
 ## Model learned from other UI systems
 
@@ -531,7 +543,8 @@ through movement, recoloring, and removal, including translucent overlap.
 The integrated retained families are box shadows, backgrounds
 (`BackgroundColor` and `OuterColor`), ordinary, sliced, and tiled `ImageNode`s,
 camera-backed `ViewportNode`s, background and border gradients, solid borders
-and outlines, and all stock UI text paint. They share one scene, one stable
+and outlines, all stock UI text paint, and opted-in custom `UiMaterial`s. They
+share one scene, one stable
 `(entity, family, ordinal)` identity space, and one damage journal per camera.
 Family extractors only update canonical records; a single later replay stage
 sorts every visible family together. This is required for correctness:
@@ -661,6 +674,39 @@ contains the new revision; while a byte-upload budget deliberately holds it
 back, the old retained pixels stay visible and the damage remains owed.
 Per-item batch components are cleared before preparation so readiness can never
 be satisfied by stale metadata from a previous frame.
+
+Custom materials use an explicit correctness contract because arbitrary WGSL
+cannot be invalidated safely by inspecting an asset handle. `RetainedUiMaterial`
+declares three things:
+
+- an exact, collision-free key containing every non-image shader input, or
+  `Volatile` when globals, time, or other per-frame state may affect output;
+- `Node` coverage only when the vertex shader cannot rasterize outside the
+  transformed node quad, otherwise conservative `Target` coverage;
+- every sampled image, optionally narrowed to a physical-texel read rectangle.
+
+The renderer canonicalizes and deduplicates image declarations. The complete
+declaration, not merely the paint key, participates in asset revision and
+prepared-bind-group readiness. Sample bytes and metadata use the same exact
+reverse dependency index as built-in images, so an equal image write does no
+work and a relevant write nominates only its material readers. If a new image
+binding is not GPU-ready, old pixels remain visible and damage remains owed.
+Ten focused GPU tests cover exact quiet paint, equal and real asset writes,
+sample mutation, binding replacement and unavailability, removal, explicit
+volatility, conservative target coverage, and the full-repaint fallback for an
+ordinary `UiMaterialPlugin`.
+
+The engine can test that it obeys a declaration, but cannot prove that an
+arbitrary shader declaration is truthful: WGSL reflection cannot determine
+whether a uniform contains time, how a custom vertex shader expands coverage,
+or which dynamically indexed texels can affect which output pixels. That is a
+real API proof boundary. The safe declarations are `Volatile`, `Target`, and a
+full-image sample; narrower promises are application contracts and should have
+retained-versus-stock GPU differentials for each custom shader. A changed texel
+inside a declared material sample currently invalidates the material's entire
+declared output coverage because an arbitrary shader may broadcast that texel
+everywhere. A future output-region mapping API is justified only when an
+application can prove a narrower influence relation.
 
 Solid borders and outlines retain four fixed edge records per visible family.
 This deliberately separates damage identity from GPU draw grouping. A first

@@ -1,10 +1,11 @@
 //! Retained UI paint records shared by every paint family.
 
 use crate::{
-    FloatBits, PaintCoverage, PaintRecord, PhysicalRect, RepairPlan, RetainedPaint, WorkCounters,
+    material::RetainedPendingMaterials, FloatBits, PaintCoverage, PaintRecord, PhysicalRect,
+    RepairPlan, RetainedPaint, WorkCounters,
 };
 use bevy::{
-    asset::AssetId,
+    asset::{AssetId, UntypedAssetId},
     color::ColorToComponents,
     ecs::{
         entity::Entity,
@@ -23,7 +24,10 @@ use bevy::{
         ExtractedGlyph, ExtractedUiItem, ExtractedUiNode, ExtractedUiNodes, NodeType,
     },
 };
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    any::TypeId,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Mutex, MutexGuard, PoisonError},
@@ -36,6 +40,7 @@ pub(crate) enum PaintFamily {
     Border,
     Image,
     Viewport,
+    Material(TypeId),
     Gradient,
     BorderGradient,
     TextBackground,
@@ -78,9 +83,63 @@ pub(crate) enum ResourceFingerprint {
 pub(crate) enum RetainedDrawItem {
     BoxShadow(RetainedBoxShadowItem),
     Gradient(RetainedGradientItem),
+    Material(RetainedMaterialItem),
     Node(RetainedNodeItem),
     Glyphs(Box<[RetainedGlyph]>),
     TextureSlice(RetainedTextureSliceItem),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RetainedMaterialItem {
+    pub(crate) material_type: TypeId,
+    pub(crate) material: UntypedAssetId,
+    pub(crate) stack_index: u32,
+    rect: [FloatBits; 4],
+    border: [FloatBits; 4],
+    border_radius: [FloatBits; 4],
+    pub(crate) sampled_images: Box<[AssetId<Image>]>,
+}
+
+impl RetainedMaterialItem {
+    pub(crate) fn new<M: bevy::ui_render::ui_material::UiMaterial>(
+        material: AssetId<M>,
+        stack_index: u32,
+        rect: Rect,
+        border: BorderRect,
+        border_radius: ResolvedBorderRadius,
+        sampled_images: Box<[AssetId<Image>]>,
+    ) -> Self {
+        Self {
+            material_type: TypeId::of::<M>(),
+            material: material.untyped(),
+            stack_index,
+            rect: rect_fingerprint(rect),
+            border: [
+                border.min_inset.x,
+                border.min_inset.y,
+                border.max_inset.x,
+                border.max_inset.y,
+            ]
+            .map(FloatBits::new),
+            border_radius: <[f32; 4]>::from(border_radius).map(FloatBits::new),
+            sampled_images,
+        }
+    }
+
+    pub(crate) fn rect(&self) -> Rect {
+        rect_from_fingerprint(self.rect)
+    }
+
+    pub(crate) fn border(&self) -> BorderRect {
+        BorderRect {
+            min_inset: Vec2::new(self.border[0].get(), self.border[1].get()),
+            max_inset: Vec2::new(self.border[2].get(), self.border[3].get()),
+        }
+    }
+
+    pub(crate) fn border_radius(&self) -> [f32; 4] {
+        self.border_radius.map(FloatBits::get)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -366,6 +425,7 @@ struct RetainedNodeFingerprint {
 enum RetainedItemFingerprint {
     BoxShadow,
     Gradient,
+    Material,
     Node(RetainedNodeFingerprint),
     Glyphs,
     TextureSlice(RetainedTextureSliceFingerprint),
@@ -422,6 +482,9 @@ impl PartialEq for RetainedRecord {
                 (RetainedDrawItem::Gradient(left), RetainedDrawItem::Gradient(right)) => {
                     left == right
                 }
+                (RetainedDrawItem::Material(left), RetainedDrawItem::Material(right)) => {
+                    left == right
+                }
                 _ => true,
             }
     }
@@ -472,6 +535,7 @@ impl RetainedRecord {
             RetainedDrawItem::Glyphs(_) => RetainedItemFingerprint::Glyphs,
             RetainedDrawItem::BoxShadow(_) => RetainedItemFingerprint::BoxShadow,
             RetainedDrawItem::Gradient(_) => RetainedItemFingerprint::Gradient,
+            RetainedDrawItem::Material(_) => RetainedItemFingerprint::Material,
             RetainedDrawItem::TextureSlice(item) => {
                 RetainedItemFingerprint::TextureSlice(RetainedTextureSliceFingerprint {
                     rect: rect_fingerprint(item.rect),
@@ -705,8 +769,17 @@ pub(crate) struct RetainedItems(pub(crate) Mutex<HashMap<Entity, RetainedItem>>)
 #[derive(Clone)]
 pub(crate) struct RetainedItem {
     pub(crate) coverage: PaintCoverage,
-    pub(crate) image: AssetId<Image>,
+    pub(crate) sampled_images: Box<[AssetId<Image>]>,
 }
+
+#[derive(Clone)]
+pub(crate) struct RetainedMaterialReplay {
+    pub(crate) draw: RetainedDraw,
+    pub(crate) item: RetainedMaterialItem,
+}
+
+#[derive(bevy::prelude::Resource, Default)]
+pub(crate) struct RetainedMaterialReplays(pub(crate) Vec<RetainedMaterialReplay>);
 
 /// Atomic render-world counters for change-driven paint extraction.
 #[derive(bevy::prelude::Resource, Default)]
@@ -778,16 +851,21 @@ pub(crate) fn replay_retained_ui(
     mut extracted_gradients: ResMut<ExtractedGradients>,
     mut extracted_stops: ResMut<ExtractedColorStops>,
     mut extracted_shadows: ResMut<ExtractedBoxShadows>,
+    mut extracted_materials: ResMut<RetainedMaterialReplays>,
+    pending_materials: Res<RetainedPendingMaterials>,
 ) {
     let mut surfaces = state.lock();
     let mut items = items.0.lock().unwrap_or_else(PoisonError::into_inner);
     items.clear();
+    extracted_materials.0.clear();
+    pending_materials.clear();
     let mut buffers = ReplayBuffers {
         nodes: &mut extracted,
         slices: &mut extracted_slices,
         gradients: &mut extracted_gradients,
         stops: &mut extracted_stops,
         shadows: &mut extracted_shadows,
+        materials: &mut extracted_materials,
     };
 
     for paint in surfaces.paint.values_mut() {
@@ -861,6 +939,7 @@ struct ReplayBuffers<'a> {
     gradients: &'a mut ExtractedGradients,
     stops: &'a mut ExtractedColorStops,
     shadows: &'a mut ExtractedBoxShadows,
+    materials: &'a mut RetainedMaterialReplays,
 }
 
 fn push_replayed(
@@ -889,7 +968,7 @@ fn push_replayed(
                 draw.render_entity,
                 RetainedItem {
                     coverage,
-                    image: draw.image,
+                    sampled_images: core_sampled_images(draw.image),
                 },
             );
             return;
@@ -927,7 +1006,21 @@ fn push_replayed(
                 draw.render_entity,
                 RetainedItem {
                     coverage,
-                    image: draw.image,
+                    sampled_images: core_sampled_images(draw.image),
+                },
+            );
+            return;
+        }
+        RetainedDrawItem::Material(item) => {
+            buffers.materials.0.push(RetainedMaterialReplay {
+                draw: draw.clone(),
+                item: item.clone(),
+            });
+            items.insert(
+                draw.render_entity,
+                RetainedItem {
+                    coverage,
+                    sampled_images: item.sampled_images.clone(),
                 },
             );
             return;
@@ -977,7 +1070,7 @@ fn push_replayed(
                 draw.render_entity,
                 RetainedItem {
                     coverage,
-                    image: draw.image,
+                    sampled_images: core_sampled_images(draw.image),
                 },
             );
             return;
@@ -987,7 +1080,7 @@ fn push_replayed(
         draw.render_entity,
         RetainedItem {
             coverage,
-            image: draw.image,
+            sampled_images: core_sampled_images(draw.image),
         },
     );
     buffers.nodes.uinodes.push(ExtractedUiNode {
@@ -1000,4 +1093,11 @@ fn push_replayed(
         item,
         main_entity: draw.main_entity,
     });
+}
+
+fn core_sampled_images(image: AssetId<Image>) -> Box<[AssetId<Image>]> {
+    (image != AssetId::default())
+        .then_some(image)
+        .into_iter()
+        .collect()
 }

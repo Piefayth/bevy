@@ -4,13 +4,14 @@ use crate::background::extract_retained_backgrounds;
 use crate::border::extract_retained_borders;
 use crate::gradient::{extract_retained_gradients, RetainedGradientDependencies};
 use crate::image::{extract_retained_images, RetainedImageDependencies};
+use crate::material::RetainedPendingMaterials;
 use crate::sampled_image::{
     extract_sampled_image_changes, resolve_ready_sampled_images, RetainedSampledImages,
     RetainedUiImageWrites,
 };
 use crate::scene::{
-    cleanup_retained_ui, replay_retained_ui, RetainedItem, RetainedItems, RetainedUiPaintCounters,
-    RetainedUiScene,
+    cleanup_retained_ui, replay_retained_ui, RetainedItem, RetainedItems, RetainedMaterialReplays,
+    RetainedUiPaintCounters, RetainedUiScene,
 };
 use crate::shadow::{extract_retained_shadows, RetainedShadowDependencies};
 use crate::text::{extract_retained_text, RetainedTextDependencies};
@@ -59,7 +60,7 @@ use bevy::{
             UiTextureSlicerInfrastructurePlugin,
         },
         DrawUiItem, ExtractedUiNodes, RenderUiSystems, TransparentUi, UiAntiAlias, UiCameraView,
-        UiItemBatch, UiPipeline, UiPipelineKey, UiViewTarget,
+        UiItemBatch, UiMaterialBatchRange, UiPipeline, UiPipelineKey, UiViewTarget,
     },
 };
 use core::{
@@ -92,6 +93,8 @@ impl Plugin for RetainedUiRenderPlugin {
             .init_resource::<RetainedUiScene>()
             .init_resource::<RetainedGradientDependencies>()
             .init_resource::<RetainedImageDependencies>()
+            .init_resource::<RetainedMaterialReplays>()
+            .init_resource::<RetainedPendingMaterials>()
             .init_resource::<RetainedSampledImages>()
             .init_resource::<RetainedUiImageWrites>()
             .init_resource::<RetainedShadowDependencies>()
@@ -491,16 +494,21 @@ fn phase_is_ready(
     let gpu_images = world.resource::<RenderAssets<GpuImage>>();
     for index in 0..phase.items.len() {
         let item = phase.items.get_index(index).unwrap().1;
-        let Some(metadata) = items.get(&item.entity()) else {
-            return false;
-        };
         if item_batch_range(world, item, draw_functions).is_none() {
-            let unavailable_image = metadata.image
-                != bevy::asset::AssetId::<bevy::image::Image>::default()
-                && gpu_images.get(metadata.image).is_none()
-                && !sampled_images.is_pending(metadata.image);
-            if unavailable_image {
-                continue;
+            if let Some(metadata) = items.get(&item.entity()) {
+                let mut unavailable_image = false;
+                for image in &metadata.sampled_images {
+                    if gpu_images.get(*image).is_some() {
+                        continue;
+                    }
+                    if sampled_images.is_pending(*image) {
+                        return false;
+                    }
+                    unavailable_image = true;
+                }
+                if unavailable_image {
+                    continue;
+                }
             }
             return false;
         }
@@ -551,7 +559,9 @@ fn item_batch_range(
             .get::<UiTextureSlicerBatch>(item.entity())
             .map(|batch| batch.range.clone())
     } else {
-        None
+        world
+            .get::<UiMaterialBatchRange>(item.entity())
+            .map(|batch| batch.range.clone())
     }
 }
 
@@ -742,11 +752,15 @@ fn retained_ui_pass(
         scene.acknowledge(ui_view_target.0, plan);
     }
     let repair_requested = phase_has_items || (repair_plan.is_some() && !damage_regions.is_empty());
-    let repair_ready = if phase_has_items {
-        phase.is_some_and(|phase| phase_is_ready(phase, &pipeline_cache, world, draw_functions))
-    } else {
-        repair_plan.is_some()
-    };
+    let material_pending = world
+        .resource::<RetainedPendingMaterials>()
+        .contains(ui_view_target.0);
+    let repair_ready = !material_pending
+        && if phase_has_items {
+            phase.is_some_and(|phase| phase_is_ready(phase, &pipeline_cache, world, draw_functions))
+        } else {
+            repair_plan.is_some()
+        };
 
     let mut surfaces = surfaces.0.lock().unwrap_or_else(PoisonError::into_inner);
     let existing_matches = surfaces
