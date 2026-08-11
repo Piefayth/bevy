@@ -1,8 +1,8 @@
 //! Retained UI paint records shared by every paint family.
 
 use crate::{
-    material::RetainedPendingMaterials, FloatBits, PaintCoverage, PaintRecord, PhysicalRect,
-    RepairPlan, RetainedPaint, WorkCounters,
+    damage::DamageIndex, material::RetainedPendingMaterials, paint::coverage_is_fully_damaged,
+    FloatBits, PaintCoverage, PaintRecord, PhysicalRect, RepairPlan, RetainedPaint, WorkCounters,
 };
 use bevy::{
     asset::{AssetId, UntypedAssetId},
@@ -730,13 +730,6 @@ impl RetainedUiScene {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn repair_plan(&self, camera: Entity) -> Option<RepairPlan> {
-        self.lock()
-            .paint
-            .get(&camera)
-            .and_then(RetainedPaint::repair_plan)
-    }
-
     pub(crate) fn acknowledge(&self, camera: Entity, plan: &RepairPlan) {
         let mut surfaces = self.lock();
         let Some(paint) = surfaces.paint.get_mut(&camera) else {
@@ -764,12 +757,16 @@ impl RetainedUiScene {
 }
 
 #[derive(bevy::prelude::Resource, Default)]
+pub(crate) struct RetainedRepairPlans(pub(crate) HashMap<Entity, RepairPlan>);
+
+#[derive(bevy::prelude::Resource, Default)]
 pub(crate) struct RetainedItems(pub(crate) Mutex<HashMap<Entity, RetainedItem>>);
 
 #[derive(Clone)]
 pub(crate) struct RetainedItem {
     pub(crate) coverage: PaintCoverage,
     pub(crate) sampled_images: Box<[AssetId<Image>]>,
+    pub(crate) fully_damaged: bool,
 }
 
 #[derive(Clone)]
@@ -787,6 +784,7 @@ pub struct RetainedUiPaintCounters {
     candidates: AtomicU64,
     records_compared: AtomicU64,
     records_changed: AtomicU64,
+    records_staged: AtomicU64,
     records_removed: AtomicU64,
     damage_events: AtomicU64,
 }
@@ -798,6 +796,7 @@ impl RetainedUiPaintCounters {
             candidates: self.candidates.load(Ordering::Relaxed),
             records_compared: self.records_compared.load(Ordering::Relaxed),
             records_changed: self.records_changed.load(Ordering::Relaxed),
+            records_staged: self.records_staged.load(Ordering::Relaxed),
             records_removed: self.records_removed.load(Ordering::Relaxed),
             damage_events: self.damage_events.load(Ordering::Relaxed),
         }
@@ -810,10 +809,19 @@ impl RetainedUiPaintCounters {
             .fetch_add(work.records_compared, Ordering::Relaxed);
         self.records_changed
             .fetch_add(work.records_changed, Ordering::Relaxed);
+        self.records_staged
+            .fetch_add(work.records_staged, Ordering::Relaxed);
         self.records_removed
             .fetch_add(work.records_removed, Ordering::Relaxed);
         self.damage_events
             .fetch_add(work.damage_events, Ordering::Relaxed);
+    }
+
+    fn add_staged(&self, count: usize) {
+        self.records_staged.fetch_add(
+            u64::try_from(count).expect("staged retained record count exceeds u64"),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -853,12 +861,14 @@ pub(crate) fn replay_retained_ui(
     mut extracted_shadows: ResMut<ExtractedBoxShadows>,
     mut extracted_materials: ResMut<RetainedMaterialReplays>,
     pending_materials: Res<RetainedPendingMaterials>,
+    mut repair_plans: ResMut<RetainedRepairPlans>,
 ) {
     let mut surfaces = state.lock();
     let mut items = items.0.lock().unwrap_or_else(PoisonError::into_inner);
     items.clear();
     extracted_materials.0.clear();
     pending_materials.clear();
+    repair_plans.0.clear();
     let mut buffers = ReplayBuffers {
         nodes: &mut extracted,
         slices: &mut extracted_slices,
@@ -872,11 +882,22 @@ pub(crate) fn replay_retained_ui(
         counters.add(paint.take_counters());
     }
 
-    for paint in surfaces.paint.values() {
-        if paint.repair_plan().is_none() {
+    for (&camera, paint) in &surfaces.paint {
+        let Some(repair) = paint.repair_plan() else {
             continue;
-        }
-        let mut records: Vec<_> = paint.iter().collect();
+        };
+        repair_plans.0.insert(camera, repair.clone());
+        let damage_index = DamageIndex::new(repair.regions());
+        let mut records: Vec<_> = paint
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .coverage
+                    .iter()
+                    .any(|coverage| damage_index.intersects(repair.regions(), *coverage))
+            })
+            .collect();
+        counters.add_staged(records.len());
         records.sort_by(|(left_id, left), (right_id, right)| {
             left.value
                 .draw
@@ -915,6 +936,7 @@ pub(crate) fn replay_retained_ui(
                     &mut buffers,
                     &mut items,
                     &record.value.draw,
+                    coverage_is_fully_damaged(&coverage, repair.regions(), &damage_index, None),
                     coverage,
                     Some(NodeType::Border(flags)),
                 );
@@ -925,6 +947,7 @@ pub(crate) fn replay_retained_ui(
                 &mut buffers,
                 &mut items,
                 &record.value.draw,
+                coverage_is_fully_damaged(&record.coverage, repair.regions(), &damage_index, None),
                 record.coverage.clone(),
                 None,
             );
@@ -946,6 +969,7 @@ fn push_replayed(
     buffers: &mut ReplayBuffers,
     items: &mut HashMap<Entity, RetainedItem>,
     draw: &RetainedDraw,
+    fully_damaged: bool,
     coverage: PaintCoverage,
     node_type: Option<NodeType>,
 ) {
@@ -969,6 +993,7 @@ fn push_replayed(
                 RetainedItem {
                     coverage,
                     sampled_images: core_sampled_images(draw.image),
+                    fully_damaged,
                 },
             );
             return;
@@ -1007,6 +1032,7 @@ fn push_replayed(
                 RetainedItem {
                     coverage,
                     sampled_images: core_sampled_images(draw.image),
+                    fully_damaged,
                 },
             );
             return;
@@ -1021,6 +1047,7 @@ fn push_replayed(
                 RetainedItem {
                     coverage,
                     sampled_images: item.sampled_images.clone(),
+                    fully_damaged,
                 },
             );
             return;
@@ -1071,6 +1098,7 @@ fn push_replayed(
                 RetainedItem {
                     coverage,
                     sampled_images: core_sampled_images(draw.image),
+                    fully_damaged,
                 },
             );
             return;
@@ -1081,6 +1109,7 @@ fn push_replayed(
         RetainedItem {
             coverage,
             sampled_images: core_sampled_images(draw.image),
+            fully_damaged,
         },
     );
     buffers.nodes.uinodes.push(ExtractedUiNode {

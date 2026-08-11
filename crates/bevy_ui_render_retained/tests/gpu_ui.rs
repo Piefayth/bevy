@@ -152,37 +152,8 @@ fn render_scene_configured<S>(
     setup: impl FnOnce(&mut World, Entity) -> S,
     mutate: impl FnOnce(&mut World, S),
 ) -> RenderOutput {
-    let mut app = App::new();
-    let mut default_plugins = DefaultPlugins
-        .set(WindowPlugin {
-            primary_window: None,
-            exit_condition: ExitCondition::DontExit,
-            ..default()
-        })
-        .set(RenderPlugin {
-            synchronous_pipeline_compilation: true,
-            ..default()
-        })
-        .disable::<LogPlugin>();
-    if matches!(renderer, UiRenderer::Retained) {
-        default_plugins = default_plugins.disable::<UiRenderPlugin>();
-    }
-    app.add_plugins(default_plugins);
-    if matches!(renderer, UiRenderer::Retained) {
-        app.add_plugins((UiRenderInfrastructurePlugin, RetainedUiRenderPlugin));
-    }
+    let mut app = gpu_app(renderer, paint_schedule);
     configure(&mut app, renderer);
-    if matches!(
-        paint_schedule,
-        PaintSchedule::UntilInitialCapture | PaintSchedule::UntilInitialCaptureThenDisableCamera
-    ) {
-        let render_app = app.sub_app_mut(RenderApp);
-        render_app.insert_resource(PaintEnabled(true));
-        render_app.configure_sets(
-            ExtractSchedule,
-            RenderUiSystems::ExtractBackgrounds.run_if(paint_enabled),
-        );
-    }
 
     let mut image = Image::new_fill(
         Extent3d {
@@ -267,6 +238,198 @@ fn render_scene_configured<S>(
         paint_before_mutation,
         paint_after_mutation,
     }
+}
+
+fn gpu_app(renderer: UiRenderer, paint_schedule: PaintSchedule) -> App {
+    let mut app = App::new();
+    let mut default_plugins = DefaultPlugins
+        .set(WindowPlugin {
+            primary_window: None,
+            exit_condition: ExitCondition::DontExit,
+            ..default()
+        })
+        .set(RenderPlugin {
+            synchronous_pipeline_compilation: true,
+            ..default()
+        })
+        .disable::<LogPlugin>();
+    if matches!(renderer, UiRenderer::Retained) {
+        default_plugins = default_plugins.disable::<UiRenderPlugin>();
+    }
+    app.add_plugins(default_plugins);
+    if matches!(renderer, UiRenderer::Retained) {
+        app.add_plugins((UiRenderInfrastructurePlugin, RetainedUiRenderPlugin));
+    }
+    if matches!(
+        paint_schedule,
+        PaintSchedule::UntilInitialCapture | PaintSchedule::UntilInitialCaptureThenDisableCamera
+    ) {
+        let render_app = app.sub_app_mut(RenderApp);
+        render_app.insert_resource(PaintEnabled(true));
+        render_app.configure_sets(
+            ExtractSchedule,
+            RenderUiSystems::ExtractBackgrounds.run_if(paint_enabled),
+        );
+    }
+    app
+}
+
+#[derive(Component)]
+struct FlickerProbe;
+
+#[derive(Component)]
+struct BatchedFlickerProbe;
+
+fn animate_flicker_probe(
+    mut probe: Single<&mut Node, With<FlickerProbe>>,
+    mut position: Local<usize>,
+) {
+    const POSITIONS: [f32; 3] = [5.0, 21.0, 37.0];
+    *position = (*position + 1) % POSITIONS.len();
+    probe.left = px(POSITIONS[*position]);
+}
+
+fn batched_flicker_color(position: usize) -> Color {
+    [
+        Color::srgba_u8(24, 48, 96, 184),
+        Color::srgba_u8(72, 32, 104, 184),
+        Color::srgba_u8(28, 88, 68, 184),
+    ][position]
+}
+
+fn animate_batched_flicker_probe(
+    mut probe: Single<&mut BackgroundColor, With<BatchedFlickerProbe>>,
+    mut position: Local<usize>,
+) {
+    *position = (*position + 1) % 3;
+    probe.0 = batched_flicker_color(*position);
+}
+
+fn spawn_flicker_scene(world: &mut World, camera: Entity, left: f32) -> Entity {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(left),
+                top: px(8),
+                width: px(10),
+                height: px(10),
+                ..default()
+            },
+            BackgroundColor(Color::srgba_u8(220, 45, 28, 160)),
+            ChildOf(root),
+        ))
+        .id()
+}
+
+fn spawn_batched_flicker_scene(world: &mut World, camera: Entity, position: usize) -> Entity {
+    let root = spawn_full_background(world, camera, batched_flicker_color(position));
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(19),
+            top: px(15),
+            width: px(18),
+            height: px(14),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(230, 170, 35, 144)),
+        ChildOf(root),
+    ));
+    root
+}
+
+fn capture_retained_stream(
+    configure: impl FnOnce(&mut App),
+    setup: impl FnOnce(&mut World, Entity),
+) -> Vec<Vec<u8>> {
+    let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+    configure(&mut app);
+
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: WIDTH,
+            height: HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+        | TextureUsages::COPY_DST
+        | TextureUsages::COPY_SRC
+        | TextureUsages::RENDER_ATTACHMENT;
+    let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+    let camera = app
+        .world_mut()
+        .spawn((
+            Camera2d,
+            Camera {
+                clear_color: ClearColorConfig::Custom(Color::BLACK),
+                ..default()
+            },
+            RenderTarget::Image(image.clone().into()),
+        ))
+        .id();
+    setup(app.world_mut(), camera);
+
+    let frames = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let observer_frames = Arc::clone(&frames);
+    app.world_mut()
+        .spawn(Readback::texture(image))
+        .observe(move |event: On<ReadbackComplete>| {
+            observer_frames
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event.data.clone());
+        });
+    app.finish();
+    app.cleanup();
+
+    for _ in 0..30 {
+        step_and_wait(&mut app);
+    }
+    frames
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    for _ in 0..32 {
+        step_and_wait(&mut app);
+    }
+
+    frames
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+fn assert_complete_cycle(frames: &[Vec<u8>], references: &[Vec<u8>]) {
+    assert!(
+        frames.len() >= 24,
+        "readback must capture the animation stream"
+    );
+    let states: Vec<_> = frames
+        .iter()
+        .map(|frame| {
+            references
+                .iter()
+                .position(|expected| frame == expected)
+                .unwrap_or_else(|| {
+                    assert_pixels_eq(frame, &references[0]);
+                    unreachable!()
+                })
+        })
+        .collect();
+    assert!((0..references.len()).all(|state| states.contains(&state)));
+    assert!(
+        states
+            .windows(2)
+            .all(|pair| pair[1] == (pair[0] + 1) % references.len()),
+        "each submitted animation frame must present the next complete state"
+    );
 }
 
 fn assert_pixels_eq(actual: &[u8], expected: &[u8]) {
@@ -361,6 +524,9 @@ fn assert_layout_motion(output: RenderOutput) {
     assert_eq!(after.repairs, before.repairs + 1);
     assert_eq!(after.repair_pixels, before.repair_pixels + 200);
     assert_eq!(after.items_replayed, before.items_replayed + 3);
+    let paint_before = output.paint_before_mutation.unwrap();
+    let paint_after = output.paint_after_mutation.unwrap();
+    assert_eq!(paint_after.records_staged, paint_before.records_staged + 2);
 
     let old_center = ((13 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
     let new_center = ((13 * WIDTH + 35) as usize) * BYTES_PER_PIXEL;
@@ -1905,8 +2071,8 @@ fn changed_border_gradient_repairs_only_border_pixels() {
         let after = retained.after_mutation.unwrap();
         assert_eq!(after.repairs, before.repairs + 1);
         assert_eq!(after.repair_pixels, before.repair_pixels + 340);
-        assert_eq!(after.items_replayed, before.items_replayed + 4);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 8);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 2);
     });
 }
 
@@ -3514,6 +3680,59 @@ fn changed_background_encodes_exactly_one_full_repair() {
 }
 
 #[test]
+fn fully_damaged_nodes_share_one_prepared_batch() {
+    with_gpu_lock(|| {
+        let initial = Color::srgba_u8(30, 80, 180, 160);
+        let final_color = Color::srgba_u8(210, 55, 40, 176);
+        let setup = |world: &mut World, camera, color| {
+            [px(5), px(31)].map(|left| {
+                world
+                    .spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left,
+                            top: px(9),
+                            width: px(10),
+                            height: px(10),
+                            ..default()
+                        },
+                        BackgroundColor(color),
+                        UiTargetCamera(camera),
+                    ))
+                    .id()
+            })
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, final_color),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, initial),
+            move |world, nodes| {
+                for node in nodes {
+                    world.entity_mut(node).insert(BackgroundColor(final_color));
+                }
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 200);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 2);
+        let paint_before = retained.paint_before_mutation.unwrap();
+        let paint_after = retained.paint_after_mutation.unwrap();
+        assert_eq!(paint_after.records_staged, paint_before.records_staged + 2);
+    });
+}
+
+#[test]
 fn moving_one_leaf_repairs_only_old_and_new_pixels_and_intersecting_items() {
     with_gpu_lock(|| {
         assert_layout_motion(render_layout_motion(false));
@@ -3524,6 +3743,58 @@ fn moving_one_leaf_repairs_only_old_and_new_pixels_and_intersecting_items() {
 fn contained_layout_motion_repairs_the_same_exact_pixels() {
     with_gpu_lock(|| {
         assert_layout_motion(render_layout_motion(true));
+    });
+}
+
+#[test]
+fn repeated_repairs_never_present_an_incomplete_or_stale_layer() {
+    with_gpu_lock(|| {
+        let reference = |left| {
+            render_scene(
+                UiRenderer::Stock,
+                PaintSchedule::EveryFrame,
+                move |world, camera| spawn_flicker_scene(world, camera, left),
+                |_, _| {},
+            )
+            .pixels
+        };
+        let references = [reference(5.0), reference(21.0), reference(37.0)];
+        let frames = capture_retained_stream(
+            |app| {
+                app.add_systems(Update, animate_flicker_probe);
+            },
+            |world, camera| {
+                let probe = spawn_flicker_scene(world, camera, 5.0);
+                world.entity_mut(probe).insert(FlickerProbe);
+            },
+        );
+        assert_complete_cycle(&frames, &references);
+    });
+}
+
+#[test]
+fn batched_full_repairs_never_present_mixed_generations() {
+    with_gpu_lock(|| {
+        let reference = |position| {
+            render_scene(
+                UiRenderer::Stock,
+                PaintSchedule::EveryFrame,
+                move |world, camera| spawn_batched_flicker_scene(world, camera, position),
+                |_, _| {},
+            )
+            .pixels
+        };
+        let references = [reference(0), reference(1), reference(2)];
+        let frames = capture_retained_stream(
+            |app| {
+                app.add_systems(Update, animate_batched_flicker_probe);
+            },
+            |world, camera| {
+                let root = spawn_batched_flicker_scene(world, camera, 0);
+                world.entity_mut(root).insert(BatchedFlickerProbe);
+            },
+        );
+        assert_complete_cycle(&frames, &references);
     });
 }
 

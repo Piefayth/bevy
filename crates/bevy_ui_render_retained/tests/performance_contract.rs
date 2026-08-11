@@ -1,8 +1,6 @@
 //! Deterministic large-scene work contracts complementing wall-clock benchmarks.
 
-use bevy_ui_render_retained::{
-    PaintCoverage, PaintRecord, PhysicalRect, ReplayItem, ReplayPlan, RetainedPaint, WorkCounters,
-};
+use bevy_ui_render_retained::{PaintRecord, PhysicalRect, RetainedPaint, WorkCounters};
 
 const ITEM_COUNT: u32 = 10_000;
 
@@ -48,7 +46,7 @@ fn one_animation_among_ten_thousand_submits_one_candidate() {
             candidates: 1,
             records_compared: 1,
             records_changed: 1,
-            damage_events: 2,
+            damage_events: 1,
             ..Default::default()
         }
     );
@@ -71,53 +69,13 @@ fn ten_thousand_animations_submit_exactly_ten_thousand_candidates() {
             candidates: ITEM_COUNT.into(),
             records_compared: ITEM_COUNT.into(),
             records_changed: ITEM_COUNT.into(),
-            damage_events: (ITEM_COUNT * 2).into(),
+            damage_events: ITEM_COUNT.into(),
             ..Default::default()
         }
     );
     let repair = paint.repair_plan().unwrap();
     assert_eq!(repair.damaged_pixels(), 100);
     assert_eq!(repair.regions(), &[rect(0, 0, 10, 10)]);
-}
-
-#[test]
-fn replay_cardinality_tracks_overlap_not_total_scene_size() {
-    let damage = rect(0, 0, 10, 10);
-    let hit = PaintCoverage::one(damage);
-    let miss = PaintCoverage::one(rect(20, 20, 21, 21));
-
-    let one_hit = ReplayPlan::for_region(
-        damage,
-        (0..ITEM_COUNT).map(|index| {
-            if index + 1 == ITEM_COUNT {
-                ReplayItem::Bounded(&hit)
-            } else {
-                ReplayItem::Bounded(&miss)
-            }
-        }),
-    );
-    assert_eq!(one_hit.item_count(), 1);
-    assert_eq!(one_hit.runs().len(), 1);
-    assert_eq!(one_hit.runs()[0], 9_999..10_000);
-
-    let all_hit =
-        ReplayPlan::for_region(damage, (0..ITEM_COUNT).map(|_| ReplayItem::Bounded(&hit)));
-    assert_eq!(all_hit.item_count(), ITEM_COUNT as usize);
-    assert_eq!(all_hit.runs().len(), 1);
-    assert_eq!(all_hit.runs()[0], 0..10_000);
-
-    let fragmented = ReplayPlan::for_region(
-        damage,
-        (0..ITEM_COUNT).map(|index| {
-            if index.is_multiple_of(2) {
-                ReplayItem::Bounded(&hit)
-            } else {
-                ReplayItem::Bounded(&miss)
-            }
-        }),
-    );
-    assert_eq!(fragmented.item_count(), ITEM_COUNT as usize / 2);
-    assert_eq!(fragmented.runs().len(), ITEM_COUNT as usize / 2);
 }
 
 #[test]

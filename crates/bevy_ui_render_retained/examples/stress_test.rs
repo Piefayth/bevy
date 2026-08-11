@@ -7,12 +7,12 @@
 
 use bevy::{
     asset::RenderAssetUsages,
-    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     prelude::*,
     render::{
         render_resource::{Extent3d, TextureDimension, TextureFormat},
         Render, RenderApp,
     },
+    time::Real,
     ui_render::{UiRenderInfrastructurePlugin, UiRenderPlugin},
     window::{PresentMode, WindowResolution},
     winit::WinitSettings,
@@ -90,6 +90,7 @@ struct Config {
     nodes: usize,
     layout_group: Option<usize>,
     frames: Option<u32>,
+    warmup_frames: u32,
 }
 
 impl Default for Config {
@@ -102,6 +103,7 @@ impl Default for Config {
             nodes: 10_000,
             layout_group: None,
             frames: None,
+            warmup_frames: 120,
         }
     }
 }
@@ -163,12 +165,16 @@ impl Config {
                 "--frames" => {
                     config.frames = Some(value().parse().expect("--frames must be an integer"));
                 }
+                "--warmup" => {
+                    config.warmup_frames = value().parse().expect("--warmup must be an integer");
+                }
                 "--help" => {
                     println!(
                         "--renderer stock|retained --geometry grid|overlap|alternating \
                          --family background|text|image|effects|mixed \
                          --workload quiet|one-paint|all-paint|one-placement|all-placement|\
-                         one-layout|all-layout|one-churn --nodes N [--layout-group N] [--frames N]"
+                         one-layout|all-layout|one-churn --nodes N [--layout-group N] [--frames N] \
+                         [--warmup N]"
                     );
                     std::process::exit(0);
                 }
@@ -180,8 +186,20 @@ impl Config {
             config.layout_group.is_none_or(|size| size > 0),
             "--layout-group must be nonzero"
         );
+        assert!(
+            config
+                .frames
+                .is_none_or(|frames| frames > config.warmup_frames),
+            "--frames must exceed --warmup"
+        );
         config
     }
+}
+
+#[derive(Resource, Default)]
+struct FrameTiming {
+    frames: u32,
+    milliseconds: Vec<f64>,
 }
 
 #[derive(Resource)]
@@ -220,18 +238,16 @@ fn main() {
 
     let mut app = App::new();
     app.add_plugins(plugins)
-        .add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            LogDiagnosticsPlugin::default(),
-        ))
         .insert_resource(WinitSettings::continuous())
         .insert_resource(config.clone())
+        .init_resource::<FrameTiming>()
         .add_systems(Startup, setup);
 
     if config.renderer == Renderer::Retained {
         app.add_plugins((UiRenderInfrastructurePlugin, RetainedUiRenderPlugin));
         app.add_systems(Update, report_main_work);
         app.sub_app_mut(RenderApp)
+            .insert_resource(config.clone())
             .add_systems(Render, report_render_work);
     }
 
@@ -260,7 +276,7 @@ fn main() {
         }
     };
     if config.frames.is_some() {
-        app.add_systems(Update, exit_after_frames);
+        app.add_systems(Update, (record_frame_time, exit_after_frames).chain());
     }
     app.run();
 }
@@ -406,9 +422,9 @@ fn spawn_item(
 
 fn colors(alternate: bool) -> Color {
     if alternate {
-        Color::srgba(0.8, 0.3, 0.2, 0.5)
+        Color::srgba(0.36, 0.42, 0.52, 0.5)
     } else {
-        Color::srgba(0.2, 0.5, 0.8, 0.5)
+        Color::srgba(0.34, 0.42, 0.52, 0.5)
     }
 }
 
@@ -507,9 +523,13 @@ fn churn_one(mut commands: Commands, config: Res<Config>, mut stress: ResMut<Str
     };
 }
 
-fn report_main_work(main: Res<RetainedUiMainWorldCounters>, mut frames: Local<u32>) {
+fn report_main_work(
+    config: Res<Config>,
+    main: Res<RetainedUiMainWorldCounters>,
+    mut frames: Local<u32>,
+) {
     *frames += 1;
-    if (*frames).is_multiple_of(120) {
+    if config.frames.is_none() && (*frames).is_multiple_of(120) {
         info!("retained main={:?}", main.snapshot());
     }
 }
@@ -517,10 +537,17 @@ fn report_main_work(main: Res<RetainedUiMainWorldCounters>, mut frames: Local<u3
 fn report_render_work(
     paint: Res<RetainedUiPaintCounters>,
     layer: Res<RetainedUiLayerCounters>,
+    config: Res<Config>,
     mut frames: Local<u32>,
+    mut final_reported: Local<bool>,
 ) {
     *frames += 1;
-    if (*frames).is_multiple_of(120) {
+    let report = config.frames.map_or_else(
+        || (*frames).is_multiple_of(120),
+        |limit| *frames >= limit && !*final_reported,
+    );
+    if report {
+        *final_reported = true;
         info!(
             "retained paint={:?} layer={:?}",
             paint.snapshot(),
@@ -529,13 +556,70 @@ fn report_render_work(
     }
 }
 
+fn record_frame_time(config: Res<Config>, time: Res<Time<Real>>, mut timing: ResMut<FrameTiming>) {
+    timing.frames += 1;
+    if timing.frames > config.warmup_frames {
+        let milliseconds = time.delta_secs_f64() * 1_000.0;
+        if milliseconds > 0.0 {
+            timing.milliseconds.push(milliseconds);
+        }
+    }
+}
+
+fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+    let rank = (percentile * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn report_frame_times(timing: &FrameTiming) {
+    if timing.milliseconds.is_empty() {
+        println!("frame-time: no samples");
+        return;
+    }
+
+    let mut sorted = timing.milliseconds.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    let over_4ms = timing
+        .milliseconds
+        .iter()
+        .filter(|time| **time >= 4.0)
+        .count();
+    let mut longest_over_4ms = 0;
+    let mut current_over_4ms = 0;
+    for time in &timing.milliseconds {
+        if *time >= 4.0 {
+            current_over_4ms += 1;
+            longest_over_4ms = longest_over_4ms.max(current_over_4ms);
+        } else {
+            current_over_4ms = 0;
+        }
+    }
+
+    println!(
+        "frame-time: samples={} mean={mean:.3}ms p50={:.3}ms p95={:.3}ms p99={:.3}ms \
+         max={:.3}ms over_4ms={over_4ms} longest_over_4ms={longest_over_4ms}",
+        sorted.len(),
+        percentile(&sorted, 0.50),
+        percentile(&sorted, 0.95),
+        percentile(&sorted, 0.99),
+        sorted[sorted.len() - 1],
+    );
+}
+
 fn exit_after_frames(
     config: Res<Config>,
+    timing: Res<FrameTiming>,
+    main: Option<Res<RetainedUiMainWorldCounters>>,
     mut frames: Local<u32>,
     mut exit: MessageWriter<AppExit>,
 ) {
     *frames += 1;
     if config.frames.is_some_and(|limit| *frames >= limit) {
+        report_frame_times(&timing);
+        if let Some(main) = main {
+            println!("retained main={:?}", main.snapshot());
+        }
         exit.write(AppExit::Success);
     }
 }

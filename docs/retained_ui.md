@@ -565,12 +565,14 @@ allows it:
   dependency propagation, order changes, removals, and owed damage;
 - schedule tests proving static systems and extraction do not run;
 - GPU readback tests for blending, wipe/repair, old/new movement, clipping,
-  text transforms, sampled surfaces, resize, and resource unavailability;
+  text transforms, sampled surfaces, resize, resource unavailability, and every
+  presented state of repeated animations;
 - a deterministic adversarial scene rendered once with retention and once with
   full redraw, followed by an exact pixel comparison;
-- counters asserted by tests: entities extracted, paint records changed, items
-  and prepared quads replayed, damaged pixels, surfaces repaired, retained
-  texture bytes, fused composites, and physical UI texture samples.
+- counters asserted by tests: entities extracted, paint records changed,
+  canonical records staged, items and prepared quads replayed, damaged pixels,
+  surfaces repaired, retained texture bytes, fused composites, and physical UI
+  texture samples.
 
 Every regression test must first fail with the named defect reintroduced.
 
@@ -578,7 +580,7 @@ Performance has two separate test layers. Large-scene deterministic contracts
 run with the normal test suite and assert exact work cardinality, so timing
 noise cannot hide an asymptotic regression. Criterion measures constant factors
 and supports named baselines through Bevy's existing
-`cargo bench --bench <name> -- --save-baseline <baseline>` workflow. The
+`cargo bench -p benches --bench ui -- --save-baseline <baseline>` workflow. The
 retained renderer adds the first dedicated `ui` benchmark target in this tree.
 
 The current matrix is exact about what it includes:
@@ -586,9 +588,8 @@ The current matrix is exact about what it includes:
 | Layer | Sizes | Shapes | Mutations | Deliberately excluded |
 |---|---:|---|---|---|
 | `Changed<T>` nomination | 100, 1,000, 10,000 entities | one archetype | quiet, one changed, all changed; one input and an eight-input `Or` | canonical extraction and rendering |
-| Main-world UI work | 100, 1,000, 10,000 nodes | flat, four-way balanced, 100-node independent roots, explicit containment groups of 10/100/1,000; a 256-deep chain | quiet, equal `Node` write, one/all layout, one local node-geometry change, one placement, one change per boundary, all contained leaves; one reparent for the forest | render extraction and GPU work |
-| Canonical paint and damage union | 100, 1,000, 10,000 records | adjacent tiles, separated pixels, full overlap | quiet, one paint change, all paint changes | Bevy extraction and rasterization |
-| Sorted replay selection | 100, 1,000, 10,000 items | one disjoint hit, a contiguous 10% cluster, alternating 50% hits, full overlap | one damage region | draw-command execution and rasterization |
+| Main-world UI work | 100, 1,000, 10,000 nodes | flat, four-way balanced, 100-node independent roots, explicit containment groups of 10/100/1,000; a 256-deep chain | quiet, equal `Node` write, one/all layout, one local node-geometry change, one placement, one change per boundary, all contained leaves; one reparent for the forest; 64 consecutive contained-layout frames | render extraction and GPU work |
+| Canonical paint and exact damage | 100, 1,000, 10,000 records | adjacent tiles, separated pixels, full overlap | quiet, one paint change, all paint changes; indexed intersection and area against 10,000 separated regions | Bevy extraction and rasterization |
 | GPU acceptance | small 64-by-64 scenes | disjoint and translucent overlap across every integrated family | quiet and targeted changes | stable wall-clock timing |
 | Windowed stress executable | configurable, 10,000 by default | grid, full overlap, alternating overlap; background, text, image, gradients/shadows/borders, or mixed | quiet, one/all paint, one/all placement, one/all layout, one churn | automated pass/fail timing thresholds |
 
@@ -599,17 +600,22 @@ example) 10,000 fully overlapping nodes, 100-node layout containment, mixed
 paint families, and one or all layout animations in the same run.
 
 The deterministic 10,000-record tests prove that quiet retained paint submits
-zero candidates, one animation submits one candidate, and 10,000 animations
-submit exactly 10,000 candidates. They also prove that one disjoint hit selects
-one replay item, full overlap selects all 10,000, alternating overlap selects
-5,000 items in 5,000 ranges, and one remove/reinsert performs constant record
-work. GPU tests separately assert records and quads replayed, damaged pixels,
-surface repairs, fused composites, and physical UI texture samples. Main-world
-counters prove that quiet and paint-only frames execute no Taffy, recursive
-geometry, stack, or clipping walk. Layout-scope unit tests assert exact Taffy
+zero candidates, one animation submits one candidate, 10,000 animations submit
+exactly 10,000 candidates, and one remove/reinsert performs constant record
+work. Exact damage-index tests compare every indexed result with exhaustive
+intersection and area calculations, including a 10,000-region separated case.
+GPU tests separately assert staged records, records and quads replayed, damaged
+pixels, surface repairs, fused composites, and physical UI texture samples.
+Main-world counters prove that quiet and paint-only frames execute no Taffy,
+recursive geometry, stack, or clipping walk. Layout-scope unit tests assert exact Taffy
 computation and geometry-visit counts for multiple roots, nested containment,
-marker insertion/removal, and reparenting between boundaries. They do not
-pretend the remaining change-detection scans cost zero.
+marker insertion/removal, reparenting between boundaries, target-scale changes,
+and ghost-node flattening. A repeated-frame contract animates one leaf for 64
+consecutive frames and requires exactly one Taffy computation and nine geometry
+visits on every frame; an unrelated subtree may never enter the work set. Grid,
+intrinsic measurement, percentage sizing, absolute placement, and hidden nodes
+are compared directly against the same tree without containment. These tests do
+not pretend the remaining change-detection scans cost zero.
 
 - [Bevy benchmark instructions](../benches/README.md)
 
@@ -632,6 +638,18 @@ baselines:
 | contained 100, one internal change in every boundary | 2.868 ms | 2.778 ms |
 | contained 100, all internal leaves change | 4.453 ms | 4.236 ms |
 
+Each Criterion iteration mutates the next state and immediately runs
+`PostUpdate`, so every change row is sustained consecutive-frame work rather
+than a single cold spike. Consequently, a width animation inside one genuinely
+coupled 10,000-node flex root can cost about 4.1 ms on every animation frame on
+this machine; changing all 10,000 widths can sustain about 5.6 ms. Retention did
+not cause that cost, and it no longer regresses either case, but it cannot skip
+a real Taffy dependency. Containment changes the dependency: one changed leaf
+inside a 100-node widget measured 0.173 ms retained, one changed leaf in every
+100-node widget measured 2.778 ms, and changing every leaf measured 4.236 ms.
+Independent dirty widgets therefore add; containment bounds the term but does
+not make an actually changing whole interface free.
+
 The contained results show the intended scaling law: a mutation pays for the
 changed candidate scan plus the smallest semantically coupled widget, not the
 whole menu. Changing one leaf in every boundary or every contained leaf remains
@@ -652,21 +670,21 @@ entity measured 8.97 and 28.31 microseconds respectively; returning all 10,000
 measured 17.99 and 24.23 microseconds. These scans explain much of the retained
 quiet path's remaining size dependence.
 
-Canonical paint repair planning remains about 2 ns when quiet and 0.257
+Canonical paint repair planning measured about 6.43 ns when quiet and 0.246
 microseconds for one change, independent of whether 100 or 10,000 records are
-retained. Changing all 10,000 adjacent records measured 1.73 ms; 10,000
-separated one-pixel records measured 2.48 ms, while 10,000 records with identical
-coverage measured 0.490 ms. The common zero/one-region coverage forms allocate
-nothing.
+retained. Changing all 10,000 adjacent records measured 0.971 ms; 10,000
+separated one-pixel records measured 1.545 ms, while 10,000 records with
+identical coverage measured 0.327 ms. Equal old/new coverage is journaled once,
+not duplicated as separate old and new damage events. The common zero/one-region
+coverage forms allocate nothing.
 
-Replay selection over 10,000 sorted items measured 20.4 microseconds for one
-disjoint hit, 20.4 microseconds for a contiguous 10% hit, 23.9 microseconds for
-5,000 alternating hits, and 19.1 microseconds when every item overlapped. The
-selected draw count is exact, but selection currently scans the full sorted
-phase. This is the next architectural pressure point: a disjoint one-item repair
-is still O(total phase items) on the render CPU even though it submits only one
-draw item. An exact spatial index could remove that scan; the benchmark now
-makes any such change directly measurable.
+The former sorted-phase replay benchmark was deleted when production stopped
+using that algorithm. Canonical records are now filtered through an augmented
+exact interval index before entering Bevy's transient extraction, queue, and
+prepare buffers. A one-item repair therefore stages the intersecting records
+rather than building a 10,000-item phase and culling it at draw time. The index
+has no tile-size or count threshold: it prunes by exact interval bounds and
+returns the same intersections and covered area as exhaustive comparison.
 
 The GPU acceptance harness uses a 64-by-64 image target, synchronous pipeline
 compilation, explicit device polling, an in-process mutex, and a cross-process
@@ -910,12 +928,34 @@ The owned UI layer is double-buffered. A repair encodes into the inactive
 texture and replaces the visible texture only after every region succeeds.
 Each slot carries a committed generation; bringing an older slot current
 copies only damage committed since that generation, rather than copying the
-whole layer. Failed or not-yet-compiled work remains owed. On a quiet
+whole layer. Those exact rectangles are copied by one instanced GPU draw; an
+early implementation emitted one texture-copy command per rectangle and the
+10,000-separated-region stress case exposed that command-count cliff. The same
+instance buffer wipes every current damage rectangle before repaint. Failed or
+not-yet-compiled work remains owed. On a quiet
 background-only frame, GPU counters prove zero additional repairs, repair
 pixels, and replayed items while composition continues. An equal component
 replacement nominates and compares exactly one record but changes zero records
 and causes zero repairs; a real color change repairs exactly that record's old
 and new physical coverage.
+
+Only records intersecting exact damage are staged into Bevy's transient draw
+machinery. Normal UI records are independently drawable when any contributor
+is only partially damaged. When every staged normal item for a camera is proven
+wholly inside the exact damage, the same records use Bevy's ordinary batch draw
+instead: two disjoint changed quads are proven to stage two records, repair 200
+pixels, submit one prepared batch, and draw two quads. This classification is a
+coverage proof, not a node-count or area heuristic.
+
+Two readback tests inspect animation streams rather than only final frames. One
+moves a translucent item through three disjoint positions and requires at least
+24 captured frames to cycle through three stock-rendered complete states with
+no stale repeat, ghost, partial repair, or skipped state. It was confirmed red
+by removing inactive-slot synchronization. The other cycles a translucent
+full-surface repair through three states on the batched path and enforces the
+same generation ordering; it was confirmed red by removing the wipe, which
+immediately exposed alpha accumulation. These tests exercise Bevy's pipelined
+render app against an image target, not a window-system compositor.
 
 Each layer is sized in viewport-local physical pixels. UI repair uses that
 local surface directly; only composition applies the camera viewport. A
@@ -941,7 +981,8 @@ The windowed stress matrix is intended to run unchanged on the target device:
 cargo run --profile stress-test -p bevy_ui_render_retained --features stress_test \
   --example stress_test -- \
   --renderer retained --geometry overlap --family mixed \
-  --workload one-layout --nodes 10000 --layout-group 100 --frames 1200
+  --workload one-layout --nodes 10000 --layout-group 100 \
+  --frames 1200 --warmup 120
 ```
 
 Run the same command with `--renderer stock` for the A/B. Geometry accepts
@@ -952,18 +993,70 @@ Omitting `--layout-group` creates one coupled root; supplying a positive size
 partitions the nodes into explicit `LayoutContainment` widgets of that size.
 The 10/100/1,000 sweep used by Criterion can therefore be repeated on physical
 target hardware without changing code.
-It prints Bevy frame-time diagnostics and, on the retained path, cumulative
-main-world, extraction, damage, replay, composite, and UI-sample counters every
-120 frames, plus the current retained texture payload bytes. The byte gauge is
-exact for the two layer textures but excludes driver bookkeeping. This
+Paint animation deliberately alternates two nearby slate colors. The values are
+bit-distinct and exercise the same changed-record path without turning an
+unattended performance run into a visually ambiguous full-window strobe.
+An unbounded run reports retained work counters every 120 frames. A finite run
+does no periodic logging during its measured interval; after `--warmup` frames
+it records every full-frame duration and finally prints the mean, p50, p95,
+p99, maximum, number of frames at or above 4 ms, and longest consecutive run at
+or above 4 ms. This distinguishes a single setup spike from a sustained busy-UI
+failure without making log output create the tail it is measuring. The retained
+counter report includes the current retained texture payload bytes; that gauge
+is exact for the two layer textures but excludes driver bookkeeping. This
 executable has no universal pass/fail frame-time threshold:
 the same command is the measurement instrument, while the acceptable budget is
 chosen for the game's target hardware and frame rate.
+
+The same development machine's release-profile Vulkan runs on 2026-08-11 found
+both the intended win and an unresolved busy-scene failure:
+
+| 10,000-node end-to-end windowed workload | Stock | Retained |
+|---|---:|---:|
+| grid background, one placement per frame | 3.100 ms | 0.823 ms |
+| grid mixed paint, one contained layout change per frame | 17.585 ms | 1.111 ms |
+| grid background, all colors change per frame | 3.078 ms | 16.756 ms |
+| grid background, all widths change per frame | 5.766 ms | 20.958 ms |
+| fully overlapping mixed paint, one layout change per frame | not yet recorded | 26.092 ms |
+
+These are 120 or 240 consecutive measured frames after a 60-frame warmup, not
+single events. The all-color and all-layout retained rows exceeded 4 ms on every
+measured frame. The overlap row must rebuild every translucent contributor
+bottom-up and also exceeded 4 ms throughout. This does not satisfy the
+across-the-board performance requirement. Exact pre-staging removed the
+10,000-record quiet/localized replay, exact interval indexing reduced a
+separated all-color run from about 116 ms to 17 ms, and coverage-proven batching
+reduced 10,000 normal UI draw items to one batch, but every-changing scenes still
+translate and prepare all canonical records through Bevy's transient UI buffers.
+The next renderer architecture must retain prepared geometry/batch ownership and
+update only changed slots; another threshold, full-redraw fallback, or tuning
+constant would hide rather than remove this structural cost.
+
+Known portable test gaps remain. They are missing proofs, not known failures:
+
+- containment still lacks differentials for min/max/aspect constraints and real
+  glyph reflow. Flex-wrap reverse, right-to-left layout, percentages, absolute
+  descendants, hidden nodes, intrinsic `ContentSize`, and scrollbar appearance
+  and disappearance are covered;
+- despawning a containment boundary itself and changing target cameras in a
+  multi-camera contained hierarchy lack dedicated regression tests. Boundary
+  reparenting, leaf reparenting, marker removal, target-scale changes, and
+  ghost-node flattening are covered;
+- the windowed matrix does not yet automate burst scenarios for text reflow,
+  grid-track mutation, or repeated spawn/despawn, and timing thresholds remain
+  target-product decisions;
+- GPU acceptance deliberately compiles pipelines synchronously. Pending image,
+  font-atlas, and material resources prove that owed damage survives delayed
+  readiness, but real asynchronous pipeline compilation still needs a separate
+  integration proof.
 
 Some behavior cannot be established by portable automated tests:
 
 - DRAM traffic, tile-memory behavior, energy use, and battery impact require
   profiling on each physical GPU architecture;
+- swapchain presentation and the fused final blit must be exercised through a
+  real window on every supported backend; automated pixel tests use image
+  targets, although they do run Bevy's native pipelined render app;
 - operating-system compositor behavior and partial presentation are hidden by
   `wgpu`;
 - device/driver command-buffer failures may only be observable through

@@ -1,6 +1,6 @@
 //! Canonical retained paint records.
 
-use crate::{DamageJournal, PhysicalRect, RepairPlan};
+use crate::{damage::DamageIndex, DamageJournal, PhysicalRect, RepairPlan};
 use core::hash::Hash;
 use std::collections::{hash_map::Entry, HashMap};
 
@@ -79,6 +79,30 @@ impl FromIterator<PhysicalRect> for PaintCoverage {
     }
 }
 
+pub(crate) fn coverage_is_fully_damaged(
+    coverage: &PaintCoverage,
+    damage: &[PhysicalRect],
+    damage_index: &DamageIndex,
+    target: Option<PhysicalRect>,
+) -> bool {
+    let mut visible = false;
+    for coverage in coverage.iter() {
+        let coverage = match target {
+            Some(target) => coverage.intersection(target),
+            None => Some(*coverage),
+        };
+        let Some(coverage) = coverage else {
+            continue;
+        };
+        visible = true;
+        let damaged_area = damage_index.intersection_area(damage, coverage);
+        if damaged_area != coverage.area() {
+            return false;
+        }
+    }
+    visible
+}
+
 impl<'a> IntoIterator for &'a PaintCoverage {
     type Item = &'a PhysicalRect;
     type IntoIter = core::slice::Iter<'a, PhysicalRect>;
@@ -133,6 +157,8 @@ pub struct WorkCounters {
     pub records_compared: u64,
     /// Records inserted or changed.
     pub records_changed: u64,
+    /// Canonical records staged into Bevy's transient draw machinery.
+    pub records_staged: u64,
     /// Records removed.
     pub records_removed: u64,
     /// Old or new coverage rectangles added to owed damage.
@@ -172,8 +198,12 @@ impl<K: Eq + Hash, V: PartialEq> RetainedPaint<K, V> {
                 if entry.get() == &record {
                     return UpdateOutcome::Unchanged;
                 }
-                record_damage(damage, counters, entry.get().coverage.as_slice());
-                record_damage(damage, counters, record.coverage.as_slice());
+                if entry.get().coverage == record.coverage {
+                    record_damage(damage, counters, record.coverage.as_slice());
+                } else {
+                    record_damage(damage, counters, entry.get().coverage.as_slice());
+                    record_damage(damage, counters, record.coverage.as_slice());
+                }
                 entry.insert(record);
                 counters.records_changed += 1;
                 UpdateOutcome::Changed

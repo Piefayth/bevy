@@ -1023,6 +1023,63 @@ mod tests {
     }
 
     #[test]
+    fn contained_animation_has_constant_work_on_every_frame() {
+        let mut app = setup_ui_test_app();
+        let root = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(500.0),
+                height: Val::Px(100.0),
+                ..default()
+            })
+            .id();
+        let boundary = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(200.0),
+                    height: Val::Px(100.0),
+                    ..default()
+                },
+                LayoutContainment,
+                ChildOf(root),
+            ))
+            .id();
+        let leaves: Vec<_> = (0..8)
+            .map(|_| {
+                app.world_mut()
+                    .spawn((
+                        Node {
+                            width: Val::Px(20.0),
+                            height: Val::Px(20.0),
+                            ..default()
+                        },
+                        ChildOf(boundary),
+                    ))
+                    .id()
+            })
+            .collect();
+        let unrelated = app.world_mut().spawn((Node::default(), ChildOf(root))).id();
+        for _ in 0..8 {
+            app.world_mut().spawn((Node::default(), ChildOf(unrelated)));
+        }
+        app.update();
+
+        for frame in 0..64 {
+            let mut surface = app.world_mut().resource_mut::<UiSurface>();
+            surface.layout_computations = 0;
+            surface.geometry_visits = 0;
+            app.world_mut().get_mut::<Node>(leaves[0]).unwrap().width =
+                Val::Px(if frame % 2 == 0 { 21.0 } else { 20.0 });
+            app.update();
+
+            let surface = app.world().resource::<UiSurface>();
+            assert_eq!(surface.layout_computations, 1, "frame {frame}");
+            assert_eq!(surface.geometry_visits, 9, "frame {frame}");
+        }
+    }
+
+    #[test]
     fn reparenting_between_contained_layouts_updates_only_both_boundaries() {
         let mut app = setup_ui_test_app();
         let root = app.world_mut().spawn(Node::default()).id();
@@ -1065,6 +1122,52 @@ mod tests {
         let surface = app.world().resource::<UiSurface>();
         assert_eq!(surface.layout_computations, 2);
         assert_eq!(surface.geometry_visits, 3);
+    }
+
+    #[test]
+    fn reparenting_a_containment_boundary_preserves_its_inner_tree() {
+        let mut app = setup_ui_test_app();
+        let root_a = app.world_mut().spawn(Node::default()).id();
+        let root_b = app.world_mut().spawn(Node::default()).id();
+        let boundary = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(100.0),
+                    height: Val::Px(50.0),
+                    ..default()
+                },
+                LayoutContainment,
+                ChildOf(root_a),
+            ))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(boundary)))
+            .id();
+        app.update();
+
+        let mut surface = app.world_mut().resource_mut::<UiSurface>();
+        surface.layout_computations = 0;
+        surface.geometry_visits = 0;
+        app.world_mut().entity_mut(boundary).insert(ChildOf(root_b));
+        app.update();
+
+        let surface = app.world().resource::<UiSurface>();
+        let boundary_layout = surface.entity_to_taffy[&boundary];
+        assert_eq!(
+            surface.taffy.parent(boundary_layout.id),
+            Some(surface.entity_to_taffy[&root_b].id)
+        );
+        assert_eq!(
+            surface
+                .taffy
+                .children(boundary_layout.container_id.unwrap())
+                .unwrap(),
+            vec![surface.entity_to_taffy[&child].id]
+        );
+        assert_eq!(surface.layout_computations, 2);
+        assert_eq!(surface.geometry_visits, 4);
     }
 
     #[test]
@@ -1233,6 +1336,8 @@ mod tests {
                 overflow: Overflow::scroll_x(),
                 scrollbar_width: 7.0,
                 column_gap: Val::Px(5.0),
+                direction: InlineDirection::Rtl,
+                flex_wrap: FlexWrap::WrapReverse,
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 ..default()
@@ -1261,6 +1366,121 @@ mod tests {
         let (contained, contained_children) = spawn_tree(app.world_mut(), true);
         app.update();
 
+        fn assert_same(
+            app: &App,
+            plain: Entity,
+            contained: Entity,
+            plain_children: [Entity; 2],
+            contained_children: [Entity; 2],
+        ) {
+            assert_eq!(
+                app.world().get::<ComputedNode>(plain).unwrap(),
+                app.world().get::<ComputedNode>(contained).unwrap()
+            );
+            for (plain_child, contained_child) in plain_children.into_iter().zip(contained_children)
+            {
+                assert_eq!(
+                    app.world().get::<ComputedNode>(plain_child).unwrap(),
+                    app.world().get::<ComputedNode>(contained_child).unwrap()
+                );
+                assert_eq!(
+                    app.world().get::<UiGlobalTransform>(plain_child).unwrap(),
+                    app.world()
+                        .get::<UiGlobalTransform>(contained_child)
+                        .unwrap()
+                );
+            }
+        }
+
+        assert_same(&app, plain, contained, plain_children, contained_children);
+
+        app.world_mut()
+            .get_mut::<Node>(plain_children[0])
+            .unwrap()
+            .width = Val::Px(20.0);
+        app.world_mut()
+            .get_mut::<Node>(contained_children[0])
+            .unwrap()
+            .width = Val::Px(20.0);
+        app.update();
+        assert_same(&app, plain, contained, plain_children, contained_children);
+    }
+
+    #[test]
+    fn contained_grid_and_measured_content_match_plain_layout() {
+        let mut app = setup_ui_test_app();
+
+        fn spawn_tree(world: &mut World, contained: bool) -> (Entity, [Entity; 4]) {
+            let mut boundary = world.spawn(Node {
+                display: Display::Grid,
+                width: Val::Px(240.0),
+                height: Val::Px(120.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                grid_template_columns: RepeatedGridTrack::fr(2, 1.0),
+                grid_template_rows: vec![RepeatedGridTrack::auto(1), RepeatedGridTrack::fr(1, 1.0)],
+                row_gap: Val::Px(3.0),
+                column_gap: Val::Px(5.0),
+                ..default()
+            });
+            if contained {
+                boundary.insert(LayoutContainment);
+            }
+            let boundary = boundary.id();
+            let measured = world
+                .spawn((
+                    Node {
+                        grid_row: GridPlacement::start(1),
+                        grid_column: GridPlacement::start(1),
+                        ..default()
+                    },
+                    ContentSize::fixed_size(Vec2::new(31.0, 17.0)),
+                    ChildOf(boundary),
+                ))
+                .id();
+            let percentage = world
+                .spawn((
+                    Node {
+                        width: Val::Percent(50.0),
+                        height: Val::Px(11.0),
+                        justify_self: JustifySelf::End,
+                        grid_row: GridPlacement::start(2),
+                        grid_column: GridPlacement::start(2),
+                        ..default()
+                    },
+                    ChildOf(boundary),
+                ))
+                .id();
+            let absolute = world
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        right: Val::Px(7.0),
+                        bottom: Val::Px(9.0),
+                        width: Val::Px(13.0),
+                        height: Val::Px(15.0),
+                        ..default()
+                    },
+                    ChildOf(boundary),
+                ))
+                .id();
+            let hidden = world
+                .spawn((
+                    Node {
+                        display: Display::None,
+                        width: Val::Px(99.0),
+                        height: Val::Px(99.0),
+                        ..default()
+                    },
+                    ChildOf(boundary),
+                ))
+                .id();
+            (boundary, [measured, percentage, absolute, hidden])
+        }
+
+        let (plain, plain_children) = spawn_tree(app.world_mut(), false);
+        let (contained, contained_children) = spawn_tree(app.world_mut(), true);
+        app.update();
+
         assert_eq!(
             app.world().get::<ComputedNode>(plain).unwrap(),
             app.world().get::<ComputedNode>(contained).unwrap()
@@ -1277,6 +1497,46 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn target_scale_change_recomputes_contained_layout() {
+        let mut app = setup_ui_test_app();
+        let boundary = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(100.0),
+                    height: Val::Px(50.0),
+                    ..default()
+                },
+                LayoutContainment,
+            ))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(20.0),
+                    height: Val::Px(10.0),
+                    ..default()
+                },
+                ChildOf(boundary),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<ComputedNode>(child).unwrap().size(),
+            Vec2::new(20.0, 10.0)
+        );
+
+        app.world_mut().resource_mut::<UiScale>().0 = 2.0;
+        app.update();
+
+        assert_eq!(
+            app.world().get::<ComputedNode>(child).unwrap().size(),
+            Vec2::new(40.0, 20.0)
+        );
     }
 
     #[test]
@@ -2398,6 +2658,51 @@ mod tests {
             assert!(compare_taffy_children(ui_surface, root, &[]));
             assert!(compare_taffy_parent(ui_surface, child, None));
             assert!(!ui_surface.root_entity_to_viewport_node.contains_key(&child));
+        }
+
+        #[test]
+        fn containment_flattens_ghost_children_into_its_inner_layout() {
+            let mut app = setup_ui_test_app();
+            let child = app
+                .world_mut()
+                .spawn(Node {
+                    width: Val::Px(20.0),
+                    height: Val::Px(10.0),
+                    ..default()
+                })
+                .id();
+            let ghost = app.world_mut().spawn(GhostNode).add_child(child).id();
+            let boundary = app
+                .world_mut()
+                .spawn((
+                    Node {
+                        width: Val::Px(100.0),
+                        height: Val::Px(50.0),
+                        ..default()
+                    },
+                    LayoutContainment,
+                ))
+                .add_child(ghost)
+                .id();
+            app.update();
+
+            let surface = app.world().resource::<UiSurface>();
+            let boundary_layout = surface.entity_to_taffy[&boundary];
+            let container = boundary_layout.container_id.unwrap();
+            assert_eq!(
+                surface.taffy.children(container).unwrap(),
+                vec![surface.entity_to_taffy[&child].id]
+            );
+
+            let mut surface = app.world_mut().resource_mut::<UiSurface>();
+            surface.layout_computations = 0;
+            surface.geometry_visits = 0;
+            app.world_mut().get_mut::<Node>(child).unwrap().width = Val::Px(21.0);
+            app.update();
+
+            let surface = app.world().resource::<UiSurface>();
+            assert_eq!(surface.layout_computations, 1);
+            assert_eq!(surface.geometry_visits, 2);
         }
     }
 }

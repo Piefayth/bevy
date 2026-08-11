@@ -8,9 +8,32 @@
 
 @group(0) @binding(0) var retained_ui: texture_2d<f32>;
 
+struct RectVertexInput {
+    @builtin(vertex_index) vertex_index: u32,
+    @location(0) rect: vec4<f32>,
+}
+
+@vertex
+fn rect_vertex(in: RectVertexInput) -> @builtin(position) vec4<f32> {
+    let positions = array(
+        vec2(in.rect.x, in.rect.y),
+        vec2(in.rect.z, in.rect.y),
+        vec2(in.rect.z, in.rect.w),
+        vec2(in.rect.x, in.rect.y),
+        vec2(in.rect.z, in.rect.w),
+        vec2(in.rect.x, in.rect.w),
+    );
+    return vec4(positions[in.vertex_index], 0.0, 1.0);
+}
+
 @fragment
 fn wipe() -> @location(0) vec4<f32> {
     return vec4<f32>(0.0);
+}
+
+@fragment
+fn copy_retained(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(retained_ui, vec2<i32>(position.xy), 0);
 }
 
 @group(0) @binding(1) var final_world: texture_2d<f32>;

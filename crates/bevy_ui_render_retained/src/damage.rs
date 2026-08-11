@@ -98,6 +98,102 @@ pub struct RepairPlan {
     damaged_pixels: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DamageIndex {
+    order: Vec<usize>,
+    subtree_max_x: Vec<i32>,
+    leaf_base: usize,
+}
+
+impl DamageIndex {
+    pub(crate) fn new(regions: &[PhysicalRect]) -> Self {
+        let mut order: Vec<_> = (0..regions.len()).collect();
+        order.sort_unstable_by_key(|&index| {
+            let region = regions[index];
+            (
+                region.min_x(),
+                region.max_x(),
+                region.min_y(),
+                region.max_y(),
+            )
+        });
+        let leaf_base = order.len().next_power_of_two().max(1);
+        let mut subtree_max_x = vec![i32::MIN; leaf_base * 2];
+        for (position, &index) in order.iter().enumerate() {
+            subtree_max_x[leaf_base + position] = regions[index].max_x();
+        }
+        for node in (1..leaf_base).rev() {
+            subtree_max_x[node] = subtree_max_x[node * 2].max(subtree_max_x[node * 2 + 1]);
+        }
+        Self {
+            order,
+            subtree_max_x,
+            leaf_base,
+        }
+    }
+
+    pub(crate) fn intersects(&self, regions: &[PhysicalRect], query: PhysicalRect) -> bool {
+        let limit = self
+            .order
+            .partition_point(|&index| regions[index].min_x() < query.max_x());
+        self.intersects_node(regions, query, 1, 0, self.leaf_base, limit)
+    }
+
+    pub(crate) fn intersection_area(&self, regions: &[PhysicalRect], query: PhysicalRect) -> u64 {
+        let limit = self
+            .order
+            .partition_point(|&index| regions[index].min_x() < query.max_x());
+        self.area_node(regions, query, 1, 0, self.leaf_base, limit)
+    }
+
+    fn intersects_node(
+        &self,
+        regions: &[PhysicalRect],
+        query: PhysicalRect,
+        node: usize,
+        start: usize,
+        end: usize,
+        limit: usize,
+    ) -> bool {
+        if start >= limit || self.subtree_max_x[node] <= query.min_x() {
+            return false;
+        }
+        if end - start == 1 {
+            return self
+                .order
+                .get(start)
+                .is_some_and(|&index| regions[index].intersection(query).is_some());
+        }
+        let middle = (start + end) / 2;
+        self.intersects_node(regions, query, node * 2, start, middle, limit)
+            || self.intersects_node(regions, query, node * 2 + 1, middle, end, limit)
+    }
+
+    fn area_node(
+        &self,
+        regions: &[PhysicalRect],
+        query: PhysicalRect,
+        node: usize,
+        start: usize,
+        end: usize,
+        limit: usize,
+    ) -> u64 {
+        if start >= limit || self.subtree_max_x[node] <= query.min_x() {
+            return 0;
+        }
+        if end - start == 1 {
+            return self
+                .order
+                .get(start)
+                .and_then(|&index| regions[index].intersection(query))
+                .map_or(0, |intersection| intersection.area());
+        }
+        let middle = (start + end) / 2;
+        self.area_node(regions, query, node * 2, start, middle, limit)
+            + self.area_node(regions, query, node * 2 + 1, middle, end, limit)
+    }
+}
+
 impl RepairPlan {
     /// Returns the non-overlapping rectangles whose union is exactly the damage.
     pub fn regions(&self) -> &[PhysicalRect] {
@@ -412,6 +508,45 @@ mod tests {
 
         assert_eq!(regions.len(), 10_000);
         assert_eq!(regions.iter().map(PhysicalRect::area).sum::<u64>(), 10_000);
+    }
+
+    #[test]
+    fn damage_index_matches_exhaustive_intersection_and_area() {
+        let regions = exact_union([
+            rect(-4, -2, 2, 1),
+            rect(0, -4, 5, 3),
+            rect(7, 1, 9, 6),
+            rect(-3, 4, 8, 5),
+        ]);
+        let index = DamageIndex::new(&regions);
+
+        for min_y in -6..7 {
+            for min_x in -6..10 {
+                let query = rect(min_x, min_y, min_x + 3, min_y + 2);
+                let intersections: Vec<_> = regions
+                    .iter()
+                    .filter_map(|region| region.intersection(query))
+                    .collect();
+                assert_eq!(index.intersects(&regions, query), !intersections.is_empty());
+                assert_eq!(
+                    index.intersection_area(&regions, query),
+                    intersections.iter().map(PhysicalRect::area).sum::<u64>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn damage_index_prunes_ten_thousand_separated_regions_exactly() {
+        let regions: Vec<_> = (0..10_000).map(|x| rect(x * 2, 0, x * 2 + 1, 1)).collect();
+        let index = DamageIndex::new(&regions);
+
+        assert!(index.intersects(&regions, rect(19_998, 0, 19_999, 1)));
+        assert_eq!(
+            index.intersection_area(&regions, rect(19_997, 0, 20_000, 1)),
+            1
+        );
+        assert!(!index.intersects(&regions, rect(19_999, 0, 20_000, 1)));
     }
 
     #[test]
