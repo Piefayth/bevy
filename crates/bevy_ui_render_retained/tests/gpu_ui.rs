@@ -852,6 +852,7 @@ fn a_camera_without_ui_uses_the_stock_final_blit_without_a_retained_surface() {
 
         let work = retained.after_mutation.unwrap();
         assert_eq!(work.surfaces_created, 0);
+        assert_eq!(work.surface_bytes, 0);
         assert_eq!(work.repairs, 0);
         assert_eq!(work.composites, 0);
     });
@@ -986,6 +987,10 @@ fn quiet_image_pixels_match_stock_without_another_repair() {
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
         assert_eq!(after.surfaces_created, 1);
+        let expected_surface_bytes =
+            u64::from(WIDTH) * u64::from(HEIGHT) * BYTES_PER_PIXEL as u64 * 2;
+        assert_eq!(before.surface_bytes, expected_surface_bytes);
+        assert_eq!(after.surface_bytes, expected_surface_bytes);
         assert_eq!(after.repairs, before.repairs);
         assert_eq!(
             retained.paint_after_mutation,
@@ -3968,6 +3973,14 @@ fn resizing_a_viewport_reconstructs_its_retained_surface() {
         let before = resized.before_mutation.unwrap();
         let after = resized.after_mutation.unwrap();
         assert_eq!(after.surfaces_created, before.surfaces_created + 1);
+        assert_eq!(
+            before.surface_bytes,
+            32_u64 * 40 * BYTES_PER_PIXEL as u64 * 2
+        );
+        assert_eq!(
+            after.surface_bytes,
+            40_u64 * 40 * BYTES_PER_PIXEL as u64 * 2
+        );
         assert_eq!(after.repairs, before.repairs + 1);
     });
 }

@@ -21,6 +21,7 @@ mod layer;
 mod material;
 mod paint;
 mod quiescence;
+mod replay;
 mod sampled_image;
 mod scene;
 mod shadow;
@@ -39,5 +40,6 @@ pub use paint::{
 pub use quiescence::{
     RetainedUiMainWorldCounters, RetainedUiMainWorldPlugin, RetainedUiMainWorldWork,
 };
+pub use replay::{ReplayItem, ReplayPlan};
 pub use sampled_image::RetainedUiImageWrites;
 pub use scene::RetainedUiPaintCounters;

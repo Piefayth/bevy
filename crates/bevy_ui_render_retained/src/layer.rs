@@ -244,6 +244,8 @@ fn queue_retained_uinodes(
 pub struct RetainedUiLayerWork {
     /// Persistent layer surfaces allocated or replaced.
     pub surfaces_created: u64,
+    /// Current texture payload bytes owned by persistent layer surfaces.
+    pub surface_bytes: u64,
     /// Atomic UI-layer repair transactions encoded.
     pub repairs: u64,
     /// Physical pixels cleared and repainted across exact repair regions.
@@ -262,6 +264,7 @@ pub struct RetainedUiLayerWork {
 #[derive(Resource, Default)]
 pub struct RetainedUiLayerCounters {
     surfaces_created: AtomicU64,
+    surface_bytes: AtomicU64,
     repairs: AtomicU64,
     repair_pixels: AtomicU64,
     items_replayed: AtomicU64,
@@ -275,6 +278,7 @@ impl RetainedUiLayerCounters {
     pub fn snapshot(&self) -> RetainedUiLayerWork {
         RetainedUiLayerWork {
             surfaces_created: self.surfaces_created.load(Ordering::Relaxed),
+            surface_bytes: self.surface_bytes.load(Ordering::Relaxed),
             repairs: self.repairs.load(Ordering::Relaxed),
             repair_pixels: self.repair_pixels.load(Ordering::Relaxed),
             items_replayed: self.items_replayed.load(Ordering::Relaxed),
@@ -509,6 +513,17 @@ impl LayerSurface {
         self.size == size && self.format == format
     }
 
+    fn payload_bytes(&self) -> u64 {
+        u64::from(self.size.x)
+            * u64::from(self.size.y)
+            * u64::from(
+                self.format
+                    .block_copy_size(None)
+                    .expect("render-attachment formats have a fixed texel size"),
+            )
+            * self.slots.len() as u64
+    }
+
     fn commit(&mut self, active: usize, regions: Vec<PhysicalRect>, has_content: bool) {
         self.generation += 1;
         self.active = active;
@@ -533,13 +548,22 @@ impl LayerSurface {
 #[derive(Resource, Default)]
 struct LayerSurfaces(Mutex<HashMap<RetainedViewEntity, LayerSurface>>);
 
-fn cleanup_layer_surfaces(views: Query<&ExtractedView>, surfaces: Res<LayerSurfaces>) {
+fn cleanup_layer_surfaces(
+    views: Query<&ExtractedView>,
+    surfaces: Res<LayerSurfaces>,
+    counters: Res<RetainedUiLayerCounters>,
+) {
     let live: HashSet<_> = views.iter().map(|view| view.retained_view_entity).collect();
-    surfaces
-        .0
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .retain(|view, _| live.contains(view));
+    let mut surfaces = surfaces.0.lock().unwrap_or_else(PoisonError::into_inner);
+    let removed_bytes = surfaces
+        .iter()
+        .filter(|(view, _)| !live.contains(view))
+        .map(|(_, surface)| surface.payload_bytes())
+        .sum();
+    surfaces.retain(|view, _| live.contains(view));
+    counters
+        .surface_bytes
+        .fetch_sub(removed_bytes, Ordering::Relaxed);
 }
 
 fn phase_is_ready(
@@ -715,36 +739,26 @@ fn synchronize_pending_layer(surface: &LayerSurface, pending: usize, ctx: &mut R
     }
 }
 
-fn replay_runs(
+fn replay_plan(
     phase: &bevy::render::render_phase::SortedRenderPhase<TransparentUi>,
     items: &HashMap<Entity, RetainedItem>,
     region: PhysicalRect,
     world: &World,
     draw_functions: RetainedDrawFunctionIds,
-) -> Vec<Range<usize>> {
-    let mut runs = Vec::new();
-    let mut start = None;
-    for index in 0..phase.items.len() {
-        let item = phase.items.get_index(index).unwrap().1;
-        let intersects = item_batch_range(world, item, draw_functions).is_some()
-            && items.get(&item.entity()).is_none_or(|item| {
-                item.coverage
-                    .iter()
-                    .any(|coverage| coverage.intersection(region).is_some())
-            });
-        match (start, intersects) {
-            (None, true) => start = Some(index),
-            (Some(run_start), false) => {
-                runs.push(run_start..index);
-                start = None;
+) -> crate::ReplayPlan {
+    crate::ReplayPlan::for_region(
+        region,
+        (0..phase.items.len()).map(|index| {
+            let item = phase.items.get_index(index).unwrap().1;
+            if item_batch_range(world, item, draw_functions).is_none() {
+                crate::ReplayItem::Culled
+            } else if let Some(item) = items.get(&item.entity()) {
+                crate::ReplayItem::Bounded(&item.coverage)
+            } else {
+                crate::ReplayItem::Unbounded
             }
-            _ => {}
-        }
-    }
-    if let Some(run_start) = start {
-        runs.push(run_start..phase.items.len());
-    }
-    runs
+        }),
+    )
 }
 
 fn phase_has_drawable_items(
@@ -962,11 +976,27 @@ fn retained_ui_pass(
         .entry(extracted_view.retained_view_entity)
         .or_insert_with(|| {
             counters.surfaces_created.fetch_add(1, Ordering::Relaxed);
-            LayerSurface::new(ctx.render_device(), size, extracted_view.target_format)
+            let surface =
+                LayerSurface::new(ctx.render_device(), size, extracted_view.target_format);
+            counters
+                .surface_bytes
+                .fetch_add(surface.payload_bytes(), Ordering::Relaxed);
+            surface
         });
     if !surface.matches(size, extracted_view.target_format) {
+        let previous_bytes = surface.payload_bytes();
         *surface = LayerSurface::new(ctx.render_device(), size, extracted_view.target_format);
         counters.surfaces_created.fetch_add(1, Ordering::Relaxed);
+        let current_bytes = surface.payload_bytes();
+        if current_bytes >= previous_bytes {
+            counters
+                .surface_bytes
+                .fetch_add(current_bytes - previous_bytes, Ordering::Relaxed);
+        } else {
+            counters
+                .surface_bytes
+                .fetch_sub(previous_bytes - current_bytes, Ordering::Relaxed);
+        }
     }
 
     let wipe_pipeline = (repair_requested && repair_ready)
@@ -1011,7 +1041,11 @@ fn retained_ui_pass(
             pass.draw(0..3, 0..1);
 
             if let Some(phase) = phase.filter(|phase| !phase.items.is_empty()) {
-                for run in replay_runs(phase, &items, *region, world, draw_functions) {
+                for run in replay_plan(phase, &items, *region, world, draw_functions)
+                    .runs()
+                    .iter()
+                    .cloned()
+                {
                     replayed += run.len() as u64;
                     for index in run.clone() {
                         let item = phase.items.get_index(index).unwrap().1;

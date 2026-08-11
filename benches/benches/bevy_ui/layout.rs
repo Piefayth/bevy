@@ -8,12 +8,57 @@ use bevy_text::TextPlugin;
 use bevy_time::TimePlugin;
 use bevy_ui::{Node, UiPlugin, UiTransform, Val};
 use bevy_ui_render_retained::RetainedUiMainWorldPlugin;
-use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    criterion_group, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+};
 use std::time::{Duration, Instant};
 
 const TARGET_SIZE: UVec2 = UVec2::new(1024, 1024);
+const FOREST_SIZE: usize = 100;
 
-fn layout_app(node_count: usize, retained: bool) -> (App, Vec<Entity>) {
+#[derive(Clone, Copy)]
+enum TreeShape {
+    Flat,
+    Balanced,
+    Forest,
+    Deep,
+}
+
+impl TreeShape {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Balanced => "balanced",
+            Self::Forest => "forest_100",
+            Self::Deep => "deep",
+        }
+    }
+}
+
+struct LayoutApp {
+    app: App,
+    nodes: Vec<Entity>,
+    roots: Vec<Entity>,
+}
+
+fn node() -> Node {
+    Node {
+        width: Val::Px(8.0),
+        height: Val::Px(8.0),
+        ..Default::default()
+    }
+}
+
+fn root_node() -> Node {
+    Node {
+        width: Val::Px(TARGET_SIZE.x as f32),
+        height: Val::Px(TARGET_SIZE.y as f32),
+        ..Default::default()
+    }
+}
+
+fn layout_app(node_count: usize, retained: bool, shape: TreeShape) -> LayoutApp {
+    assert!(node_count > 0);
     let mut app = App::new();
     app.add_plugins((
         TaskPoolPlugin::default(),
@@ -46,33 +91,30 @@ fn layout_app(node_count: usize, retained: bool) -> (App, Vec<Entity>) {
         },
     ));
 
-    let root = app
-        .world_mut()
-        .spawn(Node {
-            width: Val::Px(TARGET_SIZE.x as f32),
-            height: Val::Px(TARGET_SIZE.y as f32),
-            ..Default::default()
-        })
-        .id();
     let mut nodes = Vec::with_capacity(node_count);
-    nodes.push(root);
-    for _ in 1..node_count {
-        nodes.push(
-            app.world_mut()
-                .spawn((
-                    Node {
-                        width: Val::Px(8.0),
-                        height: Val::Px(8.0),
-                        ..Default::default()
-                    },
-                    ChildOf(root),
-                ))
-                .id(),
-        );
+    let mut roots = Vec::new();
+    for index in 0..node_count {
+        let parent = match shape {
+            TreeShape::Flat if index > 0 => Some(nodes[0]),
+            TreeShape::Balanced if index > 0 => Some(nodes[(index - 1) / 4]),
+            TreeShape::Forest if index % FOREST_SIZE != 0 => {
+                Some(nodes[index - index % FOREST_SIZE])
+            }
+            TreeShape::Deep if index > 0 => nodes.last().copied(),
+            _ => None,
+        };
+        let entity = if let Some(parent) = parent {
+            app.world_mut().spawn((node(), ChildOf(parent))).id()
+        } else {
+            let entity = app.world_mut().spawn(root_node()).id();
+            roots.push(entity);
+            entity
+        };
+        nodes.push(entity);
     }
 
     app.world_mut().run_schedule(PostUpdate);
-    (app, nodes)
+    LayoutApp { app, nodes, roots }
 }
 
 fn measure_updates(
@@ -90,69 +132,73 @@ fn measure_updates(
     elapsed
 }
 
-fn layout_group(c: &mut Criterion, name: &str, retained: bool) {
-    let mut group = c.benchmark_group(name);
+fn bench_scene(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    node_count: usize,
+    retained: bool,
+    shape: TreeShape,
+    include_full_change: bool,
+    include_reparent: bool,
+) {
+    group.throughput(Throughput::Elements(node_count as u64));
 
-    for node_count in [100, 1_000, 10_000] {
-        group.throughput(Throughput::Elements(node_count as u64));
+    group.bench_with_input(
+        BenchmarkId::new("quiet", node_count),
+        &node_count,
+        |bencher, _| {
+            let mut quiet = layout_app(node_count, retained, shape);
+            bencher.iter_custom(|iterations| measure_updates(&mut quiet.app, iterations, |_| {}));
+        },
+    );
 
-        let (mut quiet_app, _) = layout_app(node_count, retained);
+    group.bench_with_input(
+        BenchmarkId::new("one_layout_change", node_count),
+        &node_count,
+        |bencher, _| {
+            let mut localized = layout_app(node_count, retained, shape);
+            let localized_node = *localized.nodes.last().unwrap();
+            let mut localized_width = 8.0;
+            bencher.iter_custom(|iterations| {
+                measure_updates(&mut localized.app, iterations, |world| {
+                    localized_width = if localized_width == 8.0 { 9.0 } else { 8.0 };
+                    world.get_mut::<Node>(localized_node).unwrap().width = Val::Px(localized_width);
+                })
+            });
+        },
+    );
+
+    group.bench_with_input(
+        BenchmarkId::new("one_placement_change", node_count),
+        &node_count,
+        |bencher, _| {
+            let mut placement = layout_app(node_count, retained, shape);
+            let placement_node = *placement.nodes.last().unwrap();
+            let mut placement_x = 0.0;
+            bencher.iter_custom(|iterations| {
+                measure_updates(&mut placement.app, iterations, |world| {
+                    placement_x = if placement_x == 0.0 { 1.0 } else { 0.0 };
+                    world
+                        .get_mut::<UiTransform>(placement_node)
+                        .unwrap()
+                        .translation
+                        .x = Val::Px(placement_x);
+                })
+            });
+        },
+    );
+
+    if include_full_change {
         group.bench_with_input(
-            BenchmarkId::new("quiet", node_count),
+            BenchmarkId::new("all_layout_change", node_count),
             &node_count,
             |bencher, _| {
-                bencher
-                    .iter_custom(|iterations| measure_updates(&mut quiet_app, iterations, |_| {}));
-            },
-        );
-
-        let (mut localized_app, localized_nodes) = layout_app(node_count, retained);
-        let localized = *localized_nodes.last().unwrap();
-        let mut localized_width = 8.0;
-        group.bench_with_input(
-            BenchmarkId::new("localized_change", node_count),
-            &node_count,
-            |bencher, _| {
+                let mut full = layout_app(node_count, retained, shape);
+                let mut full_width = 8.0;
                 bencher.iter_custom(|iterations| {
-                    measure_updates(&mut localized_app, iterations, |world| {
-                        localized_width = if localized_width == 8.0 { 9.0 } else { 8.0 };
-                        world.get_mut::<Node>(localized).unwrap().width = Val::Px(localized_width);
-                    })
-                });
-            },
-        );
-
-        let (mut placement_app, placement_nodes) = layout_app(node_count, retained);
-        let placement = *placement_nodes.last().unwrap();
-        let mut placement_x = 0.0;
-        group.bench_with_input(
-            BenchmarkId::new("placement_change", node_count),
-            &node_count,
-            |bencher, _| {
-                bencher.iter_custom(|iterations| {
-                    measure_updates(&mut placement_app, iterations, |world| {
-                        placement_x = if placement_x == 0.0 { 1.0 } else { 0.0 };
-                        world
-                            .get_mut::<UiTransform>(placement)
-                            .unwrap()
-                            .translation
-                            .x = Val::Px(placement_x);
-                    })
-                });
-            },
-        );
-
-        let (mut full_app, full_nodes) = layout_app(node_count, retained);
-        let mut full_width = 8.0;
-        group.bench_with_input(
-            BenchmarkId::new("full_change", node_count),
-            &node_count,
-            |bencher, _| {
-                bencher.iter_custom(|iterations| {
-                    measure_updates(&mut full_app, iterations, |world| {
+                    measure_updates(&mut full.app, iterations, |world| {
                         full_width = if full_width == 8.0 { 9.0 } else { 8.0 };
-                        for entity in full_nodes.iter().skip(1) {
-                            world.get_mut::<Node>(*entity).unwrap().width = Val::Px(full_width);
+                        for &entity in &full.nodes {
+                            world.get_mut::<Node>(entity).unwrap().width = Val::Px(full_width);
                         }
                     })
                 });
@@ -160,12 +206,55 @@ fn layout_group(c: &mut Criterion, name: &str, retained: bool) {
         );
     }
 
-    group.finish();
+    if include_reparent {
+        group.bench_with_input(
+            BenchmarkId::new("one_reparent", node_count),
+            &node_count,
+            |bencher, _| {
+                let mut reparent = layout_app(node_count, retained, shape);
+                assert!(reparent.roots.len() >= 2);
+                let child = *reparent.nodes.last().unwrap();
+                let parents = [reparent.roots[0], reparent.roots[1]];
+                let mut parent = 0;
+                bencher.iter_custom(|iterations| {
+                    measure_updates(&mut reparent.app, iterations, |world| {
+                        parent ^= 1;
+                        world.entity_mut(child).insert(ChildOf(parents[parent]));
+                    })
+                });
+            },
+        );
+    }
 }
 
 fn layout(c: &mut Criterion) {
-    layout_group(c, "ui_layout", false);
-    layout_group(c, "retained_ui_layout", true);
+    for retained in [false, true] {
+        let renderer = if retained { "retained" } else { "stock" };
+
+        let mut flat =
+            c.benchmark_group(format!("ui_layout/{renderer}/{}", TreeShape::Flat.name()));
+        for node_count in [100, 1_000, 10_000] {
+            bench_scene(
+                &mut flat,
+                node_count,
+                retained,
+                TreeShape::Flat,
+                true,
+                false,
+            );
+        }
+        flat.finish();
+
+        for (shape, node_count, reparent) in [
+            (TreeShape::Balanced, 10_000, false),
+            (TreeShape::Forest, 10_000, true),
+            (TreeShape::Deep, 256, false),
+        ] {
+            let mut group = c.benchmark_group(format!("ui_layout/{renderer}/{}", shape.name()));
+            bench_scene(&mut group, node_count, retained, shape, false, reparent);
+            group.finish();
+        }
+    }
 }
 
 criterion_group!(benches, layout);
