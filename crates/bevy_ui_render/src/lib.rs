@@ -198,10 +198,58 @@ pub struct UiRenderPlugin;
 
 impl Plugin for UiRenderPlugin {
     fn build(&self, app: &mut App) {
-        load_shader_library!(app, "ui.wgsl");
+        app.add_plugins(UiRenderInfrastructurePlugin);
 
         #[cfg(feature = "bevy_ui_debug")]
         app.init_resource::<GlobalUiDebugOptions>();
+
+        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
+
+        render_app
+            .add_systems(
+                ExtractSchedule,
+                (
+                    extract_uinode_background_colors.in_set(RenderUiSystems::ExtractBackgrounds),
+                    extract_uinode_images.in_set(RenderUiSystems::ExtractImages),
+                    extract_uinode_borders.in_set(RenderUiSystems::ExtractBorders),
+                    extract_viewport_nodes.in_set(RenderUiSystems::ExtractViewportNodes),
+                    extract_text_decorations.in_set(RenderUiSystems::ExtractTextBackgrounds),
+                    extract_text_shadows.in_set(RenderUiSystems::ExtractTextShadows),
+                    extract_text_sections.in_set(RenderUiSystems::ExtractText),
+                    extract_text_cursor.in_set(RenderUiSystems::ExtractCursor),
+                    extract_preedit_underlines.in_set(RenderUiSystems::ExtractCursor),
+                    #[cfg(feature = "bevy_ui_debug")]
+                    debug_overlay::extract_debug_overlay.in_set(RenderUiSystems::ExtractDebug),
+                ),
+            )
+            .add_systems(Render, queue_uinodes.in_set(RenderSystems::Queue))
+            .add_systems(
+                Core2d,
+                ui_pass.after(Core2dSystems::PostProcess).before(upscaling),
+            )
+            .add_systems(
+                Core3d,
+                ui_pass.after(Core3dSystems::PostProcess).before(upscaling),
+            );
+
+        app.add_plugins(UiTextureSlicerPlugin);
+        app.add_plugins(GradientPlugin);
+        app.add_plugins(BoxShadowPlugin);
+    }
+}
+
+/// GPU pipeline, camera extraction, queueing, and preparation shared by UI render policies.
+///
+/// Add this instead of [`UiRenderPlugin`] when another crate owns paint extraction and the UI
+/// render pass.
+#[derive(Default)]
+pub struct UiRenderInfrastructurePlugin;
+
+impl Plugin for UiRenderInfrastructurePlugin {
+    fn build(&self, app: &mut App) {
+        load_shader_library!(app, "ui.wgsl");
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -217,6 +265,7 @@ impl Plugin for UiRenderPlugin {
             .init_resource::<ViewSortedRenderPhases<TransparentUi>>()
             .allow_ambiguous_resource::<ViewSortedRenderPhases<TransparentUi>>()
             .add_render_command::<TransparentUi, DrawUi>()
+            .add_render_command::<TransparentUi, DrawUiItem>()
             .configure_sets(
                 ExtractSchedule,
                 (
@@ -237,43 +286,17 @@ impl Plugin for UiRenderPlugin {
             .add_systems(RenderStartup, init_ui_pipeline)
             .add_systems(
                 ExtractSchedule,
-                (
-                    extract_ui_camera_view
-                        .after(extract_cameras)
-                        .in_set(RenderUiSystems::ExtractCameraViews),
-                    extract_uinode_background_colors.in_set(RenderUiSystems::ExtractBackgrounds),
-                    extract_uinode_images.in_set(RenderUiSystems::ExtractImages),
-                    extract_uinode_borders.in_set(RenderUiSystems::ExtractBorders),
-                    extract_viewport_nodes.in_set(RenderUiSystems::ExtractViewportNodes),
-                    extract_text_decorations.in_set(RenderUiSystems::ExtractTextBackgrounds),
-                    extract_text_shadows.in_set(RenderUiSystems::ExtractTextShadows),
-                    extract_text_sections.in_set(RenderUiSystems::ExtractText),
-                    extract_text_cursor.in_set(RenderUiSystems::ExtractCursor),
-                    extract_preedit_underlines.in_set(RenderUiSystems::ExtractCursor),
-                    #[cfg(feature = "bevy_ui_debug")]
-                    debug_overlay::extract_debug_overlay.in_set(RenderUiSystems::ExtractDebug),
-                ),
+                extract_ui_camera_view
+                    .after(extract_cameras)
+                    .in_set(RenderUiSystems::ExtractCameraViews),
             )
             .add_systems(
                 Render,
                 (
-                    queue_uinodes.in_set(RenderSystems::Queue),
                     sort_phase_system::<TransparentUi>.in_set(RenderSystems::PhaseSort),
                     prepare_uinodes.in_set(RenderSystems::PrepareBindGroups),
                 ),
-            )
-            .add_systems(
-                Core2d,
-                ui_pass.after(Core2dSystems::PostProcess).before(upscaling),
-            )
-            .add_systems(
-                Core3d,
-                ui_pass.after(Core3dSystems::PostProcess).before(upscaling),
             );
-
-        app.add_plugins(UiTextureSlicerPlugin);
-        app.add_plugins(GradientPlugin);
-        app.add_plugins(BoxShadowPlugin);
     }
 }
 
@@ -1488,6 +1511,13 @@ pub struct UiBatch {
     pub image: AssetId<Image>,
 }
 
+/// Exact index range and texture for one extracted UI item.
+#[derive(Component)]
+pub struct UiItemBatch {
+    pub range: Range<u32>,
+    pub image: AssetId<Image>,
+}
+
 /// The values here should match the values for the constants in `ui.wgsl`
 pub mod shader_flags {
     /// Texture should be ignored
@@ -1585,6 +1615,7 @@ pub fn prepare_uinodes(
     gpu_images: Res<RenderAssets<GpuImage>>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     events: Res<SpriteAssetEvents>,
+    draw_functions: Res<DrawFunctions<TransparentUi>>,
     mut previous_len: Local<usize>,
 ) {
     // If an image has changed, the GpuImage has (probably) changed
@@ -1602,6 +1633,8 @@ pub fn prepare_uinodes(
 
     if let Some(view_binding) = view_uniforms.uniforms.binding() {
         let mut batches: Vec<(Entity, UiBatch)> = Vec::with_capacity(*previous_len);
+        let mut item_batches = Vec::new();
+        let item_draw_function = draw_functions.read().id::<DrawUiItem>();
 
         ui_meta.vertices.clear();
         ui_meta.indices.clear();
@@ -1618,9 +1651,10 @@ pub fn prepare_uinodes(
         for ui_phase in phases.values_mut() {
             let mut batch_item_index = 0;
             let mut batch_image_handle = None;
-
+            let mut prepared_individual_items = Vec::new();
             for item_index in 0..ui_phase.items.len() {
                 let item = &mut ui_phase.items[item_index];
+                let prepares_individual_item = item.draw_function == item_draw_function;
                 let Some(extracted_uinode) = extracted_uinodes
                     .uinodes
                     .get(item.index)
@@ -1695,6 +1729,7 @@ pub fn prepare_uinodes(
                         continue;
                     }
                 }
+                let item_range_start = vertices_index;
                 match &extracted_uinode.item {
                     ExtractedUiItem::Node {
                         atlas_scaling,
@@ -1964,8 +1999,23 @@ pub fn prepare_uinodes(
                         }
                     }
                 }
+                let prepared_individual_item =
+                    prepares_individual_item && item_range_start != vertices_index;
+                if prepared_individual_item {
+                    item_batches.push((
+                        item.entity(),
+                        UiItemBatch {
+                            range: item_range_start..vertices_index,
+                            image: extracted_uinode.image,
+                        },
+                    ));
+                    prepared_individual_items.push(item_index);
+                }
                 existing_batch.unwrap().1.range.end = vertices_index;
                 ui_phase.items[batch_item_index].batch_range_mut().end += 1;
+            }
+            for item_index in prepared_individual_items {
+                ui_phase.items[item_index].batch_range = 0..1;
             }
         }
 
@@ -1973,6 +2023,7 @@ pub fn prepare_uinodes(
         ui_meta.indices.write_buffer(&render_device, &render_queue);
         *previous_len = batches.len();
         commands.try_insert_batch(batches);
+        commands.try_insert_batch(item_batches);
     }
     extracted_uinodes.clear();
 }

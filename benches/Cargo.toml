@@ -23,11 +23,15 @@ bevy_reflect = { path = "../crates/bevy_reflect", features = ["functions"] }
 bevy_camera = { path = "../crates/bevy_camera" }
 bevy_mesh = { path = "../crates/bevy_mesh" }
 bevy_asset = { path = "../crates/bevy_asset" }
+bevy_image = { path = "../crates/bevy_image" }
 bevy_render = { path = "../crates/bevy_render" }
 bevy_scene = { path = "../crates/bevy_scene" }
 bevy_tasks = { path = "../crates/bevy_tasks" }
+bevy_text = { path = "../crates/bevy_text" }
+bevy_time = { path = "../crates/bevy_time" }
 bevy_transform = { path = "../crates/bevy_transform" }
 bevy_ui = { path = "../crates/bevy_ui" }
+bevy_ui_render_retained = { path = "../crates/bevy_ui_render_retained" }
 bevy_platform = { path = "../crates/bevy_platform", default-features = false, features = [
   "std",
 ] }
@@ -120,4 +124,9 @@ harness = false
 [[bench]]
 name = "transform"
 path = "benches/bevy_transform/main.rs"
+harness = false
+
+[[bench]]
+name = "ui"
+path = "benches/bevy_ui/main.rs"
 harness = false

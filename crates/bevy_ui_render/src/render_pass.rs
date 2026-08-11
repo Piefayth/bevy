@@ -1,6 +1,6 @@
 use core::ops::Range;
 
-use super::{ImageNodeBindGroups, UiBatch, UiMeta, UiViewTarget};
+use super::{ImageNodeBindGroups, UiBatch, UiItemBatch, UiMeta, UiViewTarget};
 
 use crate::UiCameraView;
 use bevy_ecs::{
@@ -161,6 +161,14 @@ pub type DrawUi = (
     DrawUiNode,
 );
 
+/// Draws exactly one extracted UI item without phase batching.
+pub type DrawUiItem = (
+    SetItemPipeline,
+    SetUiViewBindGroup<0>,
+    SetUiItemTextureBindGroup<1>,
+    DrawUiItemNode,
+);
+
 pub struct SetUiViewBindGroup<const I: usize>;
 impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiViewBindGroup<I> {
     type Param = SRes<UiMeta>;
@@ -238,6 +246,68 @@ impl<P: PhaseItem> RenderCommand<P> for DrawUiNode {
             bevy_render::render_resource::IndexFormat::Uint32,
         );
         // Draw the vertices
+        pass.draw_indexed(batch.range.clone(), 0, 0..1);
+        RenderCommandResult::Success
+    }
+}
+
+pub struct SetUiItemTextureBindGroup<const I: usize>;
+impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetUiItemTextureBindGroup<I> {
+    type Param = SRes<ImageNodeBindGroups>;
+    type ViewQuery = ();
+    type ItemQuery = Read<UiItemBatch>;
+
+    fn render<'w>(
+        _item: &P,
+        _view: (),
+        batch: Option<&'w UiItemBatch>,
+        image_bind_groups: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        let Some(batch) = batch else {
+            return RenderCommandResult::Failure("individual UI batch not available");
+        };
+        pass.set_bind_group(
+            I,
+            image_bind_groups
+                .into_inner()
+                .values
+                .get(&batch.image)
+                .unwrap(),
+            &[],
+        );
+        RenderCommandResult::Success
+    }
+}
+
+pub struct DrawUiItemNode;
+impl<P: PhaseItem> RenderCommand<P> for DrawUiItemNode {
+    type Param = SRes<UiMeta>;
+    type ViewQuery = ();
+    type ItemQuery = Read<UiItemBatch>;
+
+    fn render<'w>(
+        _item: &P,
+        _view: (),
+        batch: Option<&'w UiItemBatch>,
+        ui_meta: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        let Some(batch) = batch else {
+            return RenderCommandResult::Failure("individual UI batch not available");
+        };
+        let ui_meta = ui_meta.into_inner();
+        let Some(vertices) = ui_meta.vertices.buffer() else {
+            return RenderCommandResult::Failure("missing vertices to draw UI item");
+        };
+        let Some(indices) = ui_meta.indices.buffer() else {
+            return RenderCommandResult::Failure("missing indices to draw UI item");
+        };
+        pass.set_vertex_buffer(0, vertices.slice(..));
+        pass.set_index_buffer(
+            indices.slice(..),
+            bevy_render::render_resource::IndexFormat::Uint32,
+        );
         pass.draw_indexed(batch.range.clone(), 0, 0..1);
         RenderCommandResult::Success
     }
