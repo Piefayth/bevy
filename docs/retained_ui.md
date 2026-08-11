@@ -108,6 +108,17 @@ mutation journal or immutable render-affecting values replaced through an
 invalidating API. Manual dirty flags and periodic audits remain rejected
 because they permit permanent stale pixels.
 
+The first main-world quiescence increment replaces exactly three stock systems:
+`ui_layout_system`, `ui_stack_system`, and `update_clipping_system`. Each keeps
+its original public set membership and gains a complete changed/removed-input
+condition. Other application systems placed in `UiSystems::Layout`,
+`UiSystems::Stack`, or `UiSystems::PostLayout` remain ungated. Exact replacement
+requires naming the stock function; `ui_stack_system` was private, so the
+smallest `bevy_ui` patch publicly re-exports it and deletes its private cache
+wrapper in favor of the identical `Local<Vec<Vec<_>>>`. This is the first
+justified expansion beyond `bevy_ui_render`: gating the whole public set from a
+third-party crate would silently change unrelated systems' execution semantics.
+
 The core-pipeline probe found a public and simpler interposition point than
 changing `CameraOutputMode` after target preparation. Bevy schedules the final
 `upscaling` writer as an ordinary system in `Core2d`/`Core3d`, and the public
@@ -425,6 +436,17 @@ portable platform partial-present behavior cannot currently be promised.
 
 - [`wgpu::Surface`](https://docs.rs/wgpu/latest/wgpu/struct.Surface.html)
 
+A general subtree repaint boundary cannot be implemented by cutting a hole in
+one cached parent texture and compositing the subtree afterward. A later sibling
+may paint above the boundary; flattening all non-boundary paint into one texture
+loses the ordering point at which the boundary layer must be inserted. The exact
+representation is a compositor display list alternating cached paint chunks
+with boundary surfaces. Nested boundaries recurse, and each boundary defines an
+atomic stacking context. This is now a prerequisite for the boundary increment;
+a component that merely suppresses transform invalidation is rejected because
+it preserves stale pixels, while a topmost-only restriction is too narrow for
+the intended API.
+
 ## Handoff audit
 
 The supplied prior implementation report is evidence, not specification.
@@ -518,6 +540,20 @@ local comparison points, not portable claims. More importantly, the quiet
 100/1,000/10,000 results scale from roughly 0.08/0.17/1.18 ms, confirming the
 static stock path remains linear in tree size. The benchmark source is
 `benches/benches/bevy_ui/layout.rs`.
+
+The main-world quiescence benchmark runs the same quiet/localized/full trees
+through `RetainedUiMainWorldPlugin`. On this machine, a short 10,000-node quiet
+run fell from approximately 1.145 ms to 0.200 ms after layout, stack, and
+clipping were gated. A localized width change remained approximately 3.7 ms,
+as expected: it still requires Bevy's whole-root Taffy and geometry walk. These
+are local comparison points, not portable claims. The quiet remainder includes
+the exact `Changed<T>` scans and other ungated `PostUpdate` systems; it is not
+described as zero CPU work. Atomic counters separately prove zero layout walks,
+stack rebuilds, and clipping walks on static and paint-only frames. Tests also
+prove width and `UiTransform` changes wake layout plus clipping, `ZIndex` wakes
+only stack, `OverrideClip` wakes only clipping, hierarchy changes wake all three,
+removal cleans the stack, and custom systems in the public UI sets continue to
+run normally.
 
 The first retained-core benchmark on the same machine measured quiet repair
 planning at roughly 6 ns and one canonical record change plus exact damage at

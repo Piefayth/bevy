@@ -7,12 +7,13 @@ use bevy_math::UVec2;
 use bevy_text::TextPlugin;
 use bevy_time::TimePlugin;
 use bevy_ui::{Node, UiPlugin, Val};
+use bevy_ui_render_retained::RetainedUiMainWorldPlugin;
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use std::time::{Duration, Instant};
 
 const TARGET_SIZE: UVec2 = UVec2::new(1024, 1024);
 
-fn layout_app(node_count: usize) -> (App, Vec<Entity>) {
+fn layout_app(node_count: usize, retained: bool) -> (App, Vec<Entity>) {
     let mut app = App::new();
     app.add_plugins((
         TaskPoolPlugin::default(),
@@ -23,6 +24,9 @@ fn layout_app(node_count: usize) -> (App, Vec<Entity>) {
         UiPlugin,
     ))
     .init_asset::<bevy_image::TextureAtlasLayout>();
+    if retained {
+        app.add_plugins(RetainedUiMainWorldPlugin);
+    }
 
     app.world_mut().spawn((
         Camera2d,
@@ -86,13 +90,13 @@ fn measure_updates(
     elapsed
 }
 
-fn layout(c: &mut Criterion) {
-    let mut group = c.benchmark_group("ui_layout");
+fn layout_group(c: &mut Criterion, name: &str, retained: bool) {
+    let mut group = c.benchmark_group(name);
 
     for node_count in [100, 1_000, 10_000] {
         group.throughput(Throughput::Elements(node_count as u64));
 
-        let (mut quiet_app, _) = layout_app(node_count);
+        let (mut quiet_app, _) = layout_app(node_count, retained);
         group.bench_with_input(
             BenchmarkId::new("quiet", node_count),
             &node_count,
@@ -102,7 +106,7 @@ fn layout(c: &mut Criterion) {
             },
         );
 
-        let (mut localized_app, localized_nodes) = layout_app(node_count);
+        let (mut localized_app, localized_nodes) = layout_app(node_count, retained);
         let localized = *localized_nodes.last().unwrap();
         let mut localized_width = 8.0;
         group.bench_with_input(
@@ -118,7 +122,7 @@ fn layout(c: &mut Criterion) {
             },
         );
 
-        let (mut full_app, full_nodes) = layout_app(node_count);
+        let (mut full_app, full_nodes) = layout_app(node_count, retained);
         let mut full_width = 8.0;
         group.bench_with_input(
             BenchmarkId::new("full_change", node_count),
@@ -137,6 +141,11 @@ fn layout(c: &mut Criterion) {
     }
 
     group.finish();
+}
+
+fn layout(c: &mut Criterion) {
+    layout_group(c, "ui_layout", false);
+    layout_group(c, "retained_ui_layout", true);
 }
 
 criterion_group!(benches, layout);

@@ -31,28 +31,13 @@ pub struct UiStack {
     pub uinodes: Vec<Entity>,
 }
 
-#[derive(Default)]
-pub(crate) struct ChildBufferCache {
-    pub inner: Vec<Vec<(Entity, i32)>>,
-}
-
-impl ChildBufferCache {
-    fn pop(&mut self) -> Vec<(Entity, i32)> {
-        self.inner.pop().unwrap_or_default()
-    }
-
-    fn push(&mut self, vec: Vec<(Entity, i32)>) {
-        self.inner.push(vec);
-    }
-}
-
 /// Generates the render stack for UI nodes.
 ///
 /// Create a list of root nodes from parentless entities and entities with a `GlobalZIndex` component.
 /// Then build the `UiStack` from a walk of the existing layout trees starting from each root node,
 /// filtering branches by `Without<GlobalZIndex>`so that we don't revisit nodes.
 pub fn ui_stack_system(
-    mut cache: Local<ChildBufferCache>,
+    mut cache: Local<Vec<Vec<(Entity, i32)>>>,
     mut root_nodes: Local<Vec<(Entity, (i32, i32))>>,
     mut visited_root_nodes: Local<EntityHashSet>,
     mut ui_stack: ResMut<UiStack>,
@@ -118,7 +103,7 @@ pub fn ui_stack_system(
 }
 
 fn update_uistack_recursive(
-    cache: &mut ChildBufferCache,
+    cache: &mut Vec<Vec<(Entity, i32)>>,
     node_entity: Entity,
     ui_children: &UiChildren,
     zindex_query: &Query<Option<&ZIndex>, (With<ComputedStackIndex>, Without<GlobalZIndex>)>,
@@ -126,7 +111,7 @@ fn update_uistack_recursive(
 ) {
     ui_stack.push(node_entity);
 
-    let mut child_buffer = cache.pop();
+    let mut child_buffer = cache.pop().unwrap_or_default();
     child_buffer.extend(
         ui_children
             .iter_ui_children(node_entity)

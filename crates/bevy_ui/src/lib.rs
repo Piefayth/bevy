@@ -82,8 +82,7 @@ use bevy_ecs::prelude::*;
 use bevy_input::InputSystems;
 use bevy_transform::TransformSystems;
 use layout::ui_surface::UiSurface;
-use stack::ui_stack_system;
-pub use stack::{ComputedStackIndex, UiStack};
+pub use stack::{ui_stack_system, ComputedStackIndex, UiStack};
 use update::{propagate_ui_target_cameras, update_clipping_system};
 
 /// The basic plugin for Bevy UI

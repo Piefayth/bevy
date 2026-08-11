@@ -78,6 +78,11 @@ pub struct RetainedUiRenderPlugin;
 
 impl Plugin for RetainedUiRenderPlugin {
     fn build(&self, app: &mut App) {
+        if app.is_plugin_added::<bevy::ui::UiPlugin>()
+            && !app.is_plugin_added::<crate::RetainedUiMainWorldPlugin>()
+        {
+            app.add_plugins(crate::RetainedUiMainWorldPlugin);
+        }
         app.add_plugins(BoxShadowInfrastructurePlugin);
         app.add_plugins(GradientInfrastructurePlugin);
         app.add_plugins(UiTextureSlicerInfrastructurePlugin);

@@ -20,6 +20,7 @@ mod image;
 mod layer;
 mod material;
 mod paint;
+mod quiescence;
 mod sampled_image;
 mod scene;
 mod shadow;
@@ -34,6 +35,9 @@ pub use material::{
 };
 pub use paint::{
     FloatBits, PaintCoverage, PaintRecord, RetainedPaint, UpdateOutcome, WorkCounters,
+};
+pub use quiescence::{
+    RetainedUiMainWorldCounters, RetainedUiMainWorldPlugin, RetainedUiMainWorldWork,
 };
 pub use sampled_image::RetainedUiImageWrites;
 pub use scene::RetainedUiPaintCounters;
