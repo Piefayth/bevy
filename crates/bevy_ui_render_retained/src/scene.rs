@@ -1,4 +1,4 @@
-//! Retained UI paint records shared by every node family.
+//! Retained UI paint records shared by every paint family.
 
 use crate::{
     FloatBits, PaintCoverage, PaintRecord, PhysicalRect, RepairPlan, RetainedPaint, WorkCounters,
@@ -16,7 +16,7 @@ use bevy::{
     render::sync_world::MainEntity,
     sprite::BorderRect,
     ui::ResolvedBorderRadius,
-    ui_render::{ExtractedUiItem, ExtractedUiNode, ExtractedUiNodes, NodeType},
+    ui_render::{ExtractedGlyph, ExtractedUiItem, ExtractedUiNode, ExtractedUiNodes, NodeType},
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::{
@@ -29,6 +29,7 @@ pub(crate) enum PaintFamily {
     Background,
     Border,
     Image,
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -38,16 +39,33 @@ pub(crate) struct PaintId {
     pub(crate) ordinal: u32,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct RetainedNodeDraw {
+#[derive(Clone)]
+pub(crate) struct RetainedDraw {
     pub(crate) render_entity: Entity,
     pub(crate) camera: Entity,
     pub(crate) main_entity: MainEntity,
     pub(crate) z_order: f32,
     pub(crate) clip: Option<Rect>,
     pub(crate) image: AssetId<Image>,
-    pub(crate) resource_generation: u64,
     pub(crate) transform: Affine2,
+    pub(crate) item: RetainedDrawItem,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResourceFingerprint {
+    None,
+    Generation(u64),
+    Revisions(Box<[u64]>),
+}
+
+#[derive(Clone)]
+pub(crate) enum RetainedDrawItem {
+    Node(RetainedNodeItem),
+    Glyphs(Box<[RetainedGlyph]>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RetainedNodeItem {
     pub(crate) color: bevy::color::LinearRgba,
     pub(crate) rect: Rect,
     pub(crate) atlas_scaling: Option<Vec2>,
@@ -58,6 +76,43 @@ pub(crate) struct RetainedNodeDraw {
     pub(crate) node_type: NodeType,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetainedGlyph {
+    color: [FloatBits; 4],
+    translation: [FloatBits; 2],
+    rect: [FloatBits; 4],
+}
+
+impl RetainedGlyph {
+    pub(crate) fn new(color: bevy::color::LinearRgba, translation: Vec2, rect: Rect) -> Self {
+        Self {
+            color: color.to_f32_array().map(FloatBits::new),
+            translation: translation.to_array().map(FloatBits::new),
+            rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y].map(FloatBits::new),
+        }
+    }
+
+    fn color(self) -> bevy::color::LinearRgba {
+        bevy::color::LinearRgba::new(
+            self.color[0].get(),
+            self.color[1].get(),
+            self.color[2].get(),
+            self.color[3].get(),
+        )
+    }
+
+    pub(crate) fn translation(self) -> Vec2 {
+        Vec2::new(self.translation[0].get(), self.translation[1].get())
+    }
+
+    pub(crate) fn rect(self) -> Rect {
+        Rect::from_corners(
+            Vec2::new(self.rect[0].get(), self.rect[1].get()),
+            Vec2::new(self.rect[2].get(), self.rect[3].get()),
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum NodeTypeFingerprint {
     Rect,
@@ -66,13 +121,17 @@ enum NodeTypeFingerprint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RetainedNodeMergeFingerprint {
+struct RetainedCommonFingerprint {
     camera: Entity,
     z_order: FloatBits,
     clip: Option<[FloatBits; 4]>,
     image: AssetId<Image>,
-    resource_generation: u64,
+    resource: ResourceFingerprint,
     transform: [FloatBits; 6],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedNodeMergeFingerprint {
     color: [FloatBits; 4],
     rect: [FloatBits; 4],
     atlas_scaling: Option<[FloatBits; 2]>,
@@ -88,74 +147,109 @@ struct RetainedNodeFingerprint {
     node_type: NodeTypeFingerprint,
 }
 
-#[derive(Clone)]
-struct RetainedNodeRecord {
-    fingerprint: RetainedNodeFingerprint,
-    render_entity: Entity,
-    draw: RetainedNodeDraw,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetainedItemFingerprint {
+    Node(RetainedNodeFingerprint),
+    Glyphs,
 }
 
-impl PartialEq for RetainedNodeRecord {
+struct RetainedRecord {
+    common: RetainedCommonFingerprint,
+    item: RetainedItemFingerprint,
+    render_entity: Entity,
+    draw: RetainedDraw,
+}
+
+impl PartialEq for RetainedRecord {
     fn eq(&self, other: &Self) -> bool {
-        self.fingerprint == other.fingerprint
+        self.common == other.common
+            && self.item == other.item
+            && match (&self.draw.item, &other.draw.item) {
+                (RetainedDrawItem::Glyphs(left), RetainedDrawItem::Glyphs(right)) => left == right,
+                _ => true,
+            }
     }
 }
 
-impl RetainedNodeRecord {
-    fn new(draw: RetainedNodeDraw) -> Self {
+impl RetainedRecord {
+    fn new(draw: RetainedDraw, resource: ResourceFingerprint) -> Self {
         let clip = draw
             .clip
             .map(|clip| [clip.min.x, clip.min.y, clip.max.x, clip.max.y].map(FloatBits::new));
-        let rect = [
-            draw.rect.min.x,
-            draw.rect.min.y,
-            draw.rect.max.x,
-            draw.rect.max.y,
-        ]
-        .map(FloatBits::new);
-        let border = [
-            draw.border.min_inset.x,
-            draw.border.min_inset.y,
-            draw.border.max_inset.x,
-            draw.border.max_inset.y,
-        ]
-        .map(FloatBits::new);
-        let border_radius: [f32; 4] = draw.border_radius.into();
-        let node_type = match draw.node_type {
-            NodeType::Rect => NodeTypeFingerprint::Rect,
-            NodeType::Inverted => NodeTypeFingerprint::Inverted,
-            NodeType::Border(flags) => NodeTypeFingerprint::Border(flags),
+        let item = match &draw.item {
+            RetainedDrawItem::Node(item) => {
+                let rect = [
+                    item.rect.min.x,
+                    item.rect.min.y,
+                    item.rect.max.x,
+                    item.rect.max.y,
+                ]
+                .map(FloatBits::new);
+                let border = [
+                    item.border.min_inset.x,
+                    item.border.min_inset.y,
+                    item.border.max_inset.x,
+                    item.border.max_inset.y,
+                ]
+                .map(FloatBits::new);
+                let border_radius: [f32; 4] = item.border_radius.into();
+                let node_type = match item.node_type {
+                    NodeType::Rect => NodeTypeFingerprint::Rect,
+                    NodeType::Inverted => NodeTypeFingerprint::Inverted,
+                    NodeType::Border(flags) => NodeTypeFingerprint::Border(flags),
+                };
+                RetainedItemFingerprint::Node(RetainedNodeFingerprint {
+                    merge: RetainedNodeMergeFingerprint {
+                        color: item.color.to_f32_array().map(FloatBits::new),
+                        rect,
+                        atlas_scaling: item
+                            .atlas_scaling
+                            .map(|scaling| scaling.to_array().map(FloatBits::new)),
+                        flip_x: item.flip_x,
+                        flip_y: item.flip_y,
+                        border,
+                        border_radius: border_radius.map(FloatBits::new),
+                    },
+                    node_type,
+                })
+            }
+            RetainedDrawItem::Glyphs(_) => RetainedItemFingerprint::Glyphs,
         };
         Self {
-            fingerprint: RetainedNodeFingerprint {
-                merge: RetainedNodeMergeFingerprint {
-                    camera: draw.camera,
-                    z_order: FloatBits::new(draw.z_order),
-                    clip,
-                    image: draw.image,
-                    resource_generation: draw.resource_generation,
-                    transform: draw.transform.to_cols_array().map(FloatBits::new),
-                    color: draw.color.to_f32_array().map(FloatBits::new),
-                    rect,
-                    atlas_scaling: draw
-                        .atlas_scaling
-                        .map(|scaling| scaling.to_array().map(FloatBits::new)),
-                    flip_x: draw.flip_x,
-                    flip_y: draw.flip_y,
-                    border,
-                    border_radius: border_radius.map(FloatBits::new),
-                },
-                node_type,
+            common: RetainedCommonFingerprint {
+                camera: draw.camera,
+                z_order: FloatBits::new(draw.z_order),
+                clip,
+                image: draw.image,
+                resource,
+                transform: draw.transform.to_cols_array().map(FloatBits::new),
             },
+            item,
             render_entity: draw.render_entity,
             draw,
         }
+    }
+
+    fn border_parts(
+        &self,
+    ) -> Option<(
+        &RetainedCommonFingerprint,
+        &RetainedNodeMergeFingerprint,
+        u32,
+    )> {
+        let RetainedItemFingerprint::Node(node) = &self.item else {
+            return None;
+        };
+        let NodeTypeFingerprint::Border(flags) = node.node_type else {
+            return None;
+        };
+        Some((&self.common, &node.merge, flags))
     }
 }
 
 #[derive(Default)]
 pub(crate) struct RetainedUiSurfaces {
-    paint: HashMap<Entity, RetainedPaint<PaintId, RetainedNodeRecord>>,
+    paint: HashMap<Entity, RetainedPaint<PaintId, RetainedRecord>>,
     owners: HashMap<PaintId, Entity>,
 }
 
@@ -179,7 +273,8 @@ impl RetainedUiSurfaces {
         commands: &mut Commands,
         id: PaintId,
         camera: Entity,
-        mut draw: RetainedNodeDraw,
+        mut draw: RetainedDraw,
+        resource: ResourceFingerprint,
         coverage: PaintCoverage,
     ) {
         if coverage.is_empty() {
@@ -204,7 +299,7 @@ impl RetainedUiSurfaces {
             id,
             PaintRecord {
                 coverage,
-                value: RetainedNodeRecord::new(draw),
+                value: RetainedRecord::new(draw, resource),
             },
         );
     }
@@ -373,71 +468,104 @@ pub(crate) fn replay_retained_ui(
         if paint.repair_plan().is_none() {
             continue;
         }
-        let mut records: Vec<_> = paint
-            .iter()
-            .map(|(id, record)| {
-                (
-                    *id,
-                    record.value.draw,
-                    record.coverage.clone(),
-                    record.value.fingerprint.merge.clone(),
-                )
-            })
-            .collect();
-        records.sort_by(|(left_id, left, _, _), (right_id, right, _, _)| {
-            left.z_order
-                .total_cmp(&right.z_order)
+        let mut records: Vec<_> = paint.iter().collect();
+        records.sort_by(|(left_id, left), (right_id, right)| {
+            left.value
+                .draw
+                .z_order
+                .total_cmp(&right.value.draw.z_order)
                 .then_with(|| left_id.family.cmp(&right_id.family))
                 .then_with(|| left_id.entity.cmp(&right_id.entity))
                 .then_with(|| left_id.ordinal.cmp(&right_id.ordinal))
         });
-        let mut grouped: Vec<(
-            PaintId,
-            RetainedNodeDraw,
-            PaintCoverage,
-            RetainedNodeMergeFingerprint,
-        )> = Vec::new();
-        for (id, draw, coverage, merge) in records {
+        let mut index = 0;
+        while index < records.len() {
+            let (id, record) = records[index];
             if id.family == PaintFamily::Border
-                && let NodeType::Border(flags) = draw.node_type
-                && let Some((last_id, last_draw, last_coverage, last_merge)) = grouped.last_mut()
-                && last_id.entity == id.entity
-                && *last_merge == merge
-                && let NodeType::Border(last_flags) = &mut last_draw.node_type
+                && let Some((common, node, mut flags)) = record.value.border_parts()
             {
-                *last_flags |= flags;
-                last_coverage.extend(coverage.iter().copied());
+                let mut coverage = record.coverage.clone();
+                index += 1;
+                while let Some((next_id, next)) = records.get(index).copied()
+                    && next_id.family == PaintFamily::Border
+                    && next_id.entity == id.entity
+                    && let Some((next_common, next_node, next_flags)) = next.value.border_parts()
+                    && next_common == common
+                    && next_node == node
+                {
+                    flags |= next_flags;
+                    coverage.extend(next.coverage.iter().copied());
+                    index += 1;
+                }
+                push_replayed(
+                    &mut extracted,
+                    &mut items,
+                    &record.value.draw,
+                    coverage,
+                    Some(NodeType::Border(flags)),
+                );
                 continue;
             }
-            grouped.push((id, draw, coverage, merge));
-        }
-        for (_, draw, coverage, _) in grouped {
-            items.insert(
-                draw.render_entity,
-                RetainedItem {
-                    coverage,
-                    image: draw.image,
-                },
+
+            push_replayed(
+                &mut extracted,
+                &mut items,
+                &record.value.draw,
+                record.coverage.clone(),
+                None,
             );
-            extracted.uinodes.push(ExtractedUiNode {
-                render_entity: draw.render_entity,
-                z_order: draw.z_order,
-                clip: draw.clip,
-                image: draw.image,
-                extracted_camera_entity: draw.camera,
-                transform: draw.transform,
-                item: ExtractedUiItem::Node {
-                    color: draw.color,
-                    rect: draw.rect,
-                    atlas_scaling: draw.atlas_scaling,
-                    flip_x: draw.flip_x,
-                    flip_y: draw.flip_y,
-                    border: draw.border,
-                    border_radius: draw.border_radius,
-                    node_type: draw.node_type,
-                },
-                main_entity: draw.main_entity,
-            });
+            index += 1;
         }
     }
+}
+
+fn push_replayed(
+    extracted: &mut ExtractedUiNodes,
+    items: &mut HashMap<Entity, RetainedItem>,
+    draw: &RetainedDraw,
+    coverage: PaintCoverage,
+    node_type: Option<NodeType>,
+) {
+    let item = match &draw.item {
+        RetainedDrawItem::Node(item) => ExtractedUiItem::Node {
+            color: item.color,
+            rect: item.rect,
+            atlas_scaling: item.atlas_scaling,
+            flip_x: item.flip_x,
+            flip_y: item.flip_y,
+            border: item.border,
+            border_radius: item.border_radius,
+            node_type: node_type.unwrap_or(item.node_type),
+        },
+        RetainedDrawItem::Glyphs(glyphs) => {
+            let start = extracted.glyphs.len();
+            extracted
+                .glyphs
+                .extend(glyphs.iter().map(|glyph| ExtractedGlyph {
+                    color: glyph.color(),
+                    translation: glyph.translation(),
+                    rect: glyph.rect(),
+                }));
+            ExtractedUiItem::Glyphs {
+                range: start..extracted.glyphs.len(),
+            }
+        }
+    };
+    items.insert(
+        draw.render_entity,
+        RetainedItem {
+            coverage,
+            image: draw.image,
+        },
+    );
+    extracted.uinodes.push(ExtractedUiNode {
+        render_entity: draw.render_entity,
+        z_order: draw.z_order,
+        clip: draw.clip,
+        image: draw.image,
+        extracted_camera_entity: draw.camera,
+        transform: draw.transform,
+        item,
+        main_entity: draw.main_entity,
+    });
 }

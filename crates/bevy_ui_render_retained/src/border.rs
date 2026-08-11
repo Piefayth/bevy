@@ -1,7 +1,8 @@
 //! Change-driven retained extraction for solid borders and outlines.
 
 use crate::scene::{
-    coverage_rect, PaintFamily, PaintId, RetainedNodeDraw, RetainedUiScene, RetainedUiSurfaces,
+    coverage_rect, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
+    RetainedNodeItem, RetainedUiScene, RetainedUiSurfaces,
 };
 use bevy::{
     asset::AssetId,
@@ -228,24 +229,26 @@ fn upsert_edges(
             commands,
             border_id(entity, first_ordinal + edge as u32),
             camera,
-            RetainedNodeDraw {
+            RetainedDraw {
                 render_entity: Entity::PLACEHOLDER,
                 camera,
                 main_entity: entity.into(),
                 z_order,
                 clip,
                 image: AssetId::<Image>::default(),
-                resource_generation: 0,
                 transform,
-                color: colors[edge],
-                rect: Rect::from_corners(Vec2::ZERO, size),
-                atlas_scaling: None,
-                flip_x: false,
-                flip_y: false,
-                border,
-                border_radius,
-                node_type: NodeType::Border(EDGE_FLAGS[edge]),
+                item: RetainedDrawItem::Node(RetainedNodeItem {
+                    color: colors[edge],
+                    rect: Rect::from_corners(Vec2::ZERO, size),
+                    atlas_scaling: None,
+                    flip_x: false,
+                    flip_y: false,
+                    border,
+                    border_radius,
+                    node_type: NodeType::Border(EDGE_FLAGS[edge]),
+                }),
             },
+            ResourceFingerprint::None,
             painted
                 .then(|| coverage_rect(edge_rect(size, widths[edge], radii, edge), transform, clip))
                 .flatten()

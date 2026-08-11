@@ -7,6 +7,7 @@ use crate::scene::{
     cleanup_retained_ui, replay_retained_ui, RetainedItem, RetainedItems, RetainedUiPaintCounters,
     RetainedUiScene,
 };
+use crate::text::{extract_retained_text, resolve_ready_text_atlases, RetainedTextDependencies};
 use crate::{damage::exact_union, PhysicalRect, RepairPlan};
 use alloc::collections::VecDeque;
 use bevy::{
@@ -71,6 +72,7 @@ impl Plugin for RetainedUiRenderPlugin {
             .init_resource::<RetainedUiLayerCounters>()
             .init_resource::<RetainedUiScene>()
             .init_resource::<RetainedImageDependencies>()
+            .init_resource::<RetainedTextDependencies>()
             .init_resource::<RetainedItems>()
             .init_resource::<RetainedUiPaintCounters>()
             .add_systems(
@@ -87,6 +89,10 @@ impl Plugin for RetainedUiRenderPlugin {
             )
             .add_systems(
                 ExtractSchedule,
+                extract_retained_text.in_set(RenderUiSystems::ExtractText),
+            )
+            .add_systems(
+                ExtractSchedule,
                 replay_retained_ui.after(RenderUiSystems::ExtractDebug),
             )
             .add_systems(
@@ -97,7 +103,8 @@ impl Plugin for RetainedUiRenderPlugin {
             )
             .add_systems(
                 Render,
-                resolve_ready_images.in_set(RenderSystems::PrepareResources),
+                (resolve_ready_images, resolve_ready_text_atlases)
+                    .in_set(RenderSystems::PrepareResources),
             )
             .add_systems(Render, queue_retained_uinodes.in_set(RenderSystems::Queue))
             .add_systems(RenderStartup, init_composite_pipeline)
@@ -427,6 +434,7 @@ fn phase_is_ready(
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let dependencies = world.resource::<RetainedImageDependencies>();
+    let text_dependencies = world.resource::<RetainedTextDependencies>();
     let gpu_images = world.resource::<RenderAssets<GpuImage>>();
     for index in 0..phase.items.len() {
         let item = phase.items.get_index(index).unwrap().1;
@@ -437,7 +445,8 @@ fn phase_is_ready(
             let unavailable_image = metadata.image
                 != bevy::asset::AssetId::<bevy::image::Image>::default()
                 && gpu_images.get(metadata.image).is_none()
-                && !dependencies.is_pending(metadata.image);
+                && !dependencies.is_pending(metadata.image)
+                && !text_dependencies.is_pending(metadata.image);
             if unavailable_image {
                 continue;
             }

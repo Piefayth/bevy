@@ -1,6 +1,9 @@
 //! Change-driven retained extraction for ordinary UI images.
 
-use crate::scene::{coverage, PaintFamily, PaintId, RetainedNodeDraw, RetainedUiScene};
+use crate::scene::{
+    coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
+    RetainedNodeItem, RetainedUiScene,
+};
 use bevy::{
     asset::{AssetEvent, AssetId, Assets, RenderAssetUsages},
     camera::visibility::InheritedVisibility,
@@ -324,24 +327,26 @@ pub(crate) fn extract_retained_images(
             &mut commands,
             image_id(entity),
             camera,
-            RetainedNodeDraw {
+            RetainedDraw {
                 render_entity: Entity::PLACEHOLDER,
                 camera,
                 main_entity: MainEntity::from(entity),
                 z_order: stack.0 as f32 + stack_z_offsets::IMAGE,
                 clip,
                 image: image_asset,
-                resource_generation: image_generation,
                 transform,
-                color: image.color.into(),
-                rect,
-                atlas_scaling,
-                flip_x: image.flip_x,
-                flip_y: image.flip_y,
-                border: BorderRect::ZERO,
-                border_radius: node.border_radius,
-                node_type: NodeType::Rect,
+                item: RetainedDrawItem::Node(RetainedNodeItem {
+                    color: image.color.into(),
+                    rect,
+                    atlas_scaling,
+                    flip_x: image.flip_x,
+                    flip_y: image.flip_y,
+                    border: BorderRect::ZERO,
+                    border_radius: node.border_radius,
+                    node_type: NodeType::Rect,
+                }),
             },
+            ResourceFingerprint::Generation(image_generation),
             painted
                 .then(|| coverage(size, transform, clip))
                 .flatten()

@@ -19,6 +19,7 @@ mod image;
 mod layer;
 mod paint;
 mod scene;
+mod text;
 
 pub use damage::{DamageJournal, PhysicalRect, RepairPlan};
 pub use layer::{RetainedUiLayerCounters, RetainedUiLayerWork, RetainedUiRenderPlugin};

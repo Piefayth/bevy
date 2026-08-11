@@ -1,6 +1,9 @@
 //! Change-driven retained extraction for UI backgrounds.
 
-use crate::scene::{coverage, PaintFamily, PaintId, RetainedNodeDraw, RetainedUiScene};
+use crate::scene::{
+    coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
+    RetainedNodeItem, RetainedUiScene,
+};
 use bevy::{
     camera::visibility::InheritedVisibility,
     color::Alpha,
@@ -123,15 +126,7 @@ pub(crate) fn extract_retained_backgrounds(
         let clip = clip.map(|clip| clip.clip);
         let visible = visibility.get() && !node.is_empty();
         let z_order = stack.0 as f32 + stack_z_offsets::BACKGROUND_COLOR;
-        let base = RetainedNodeDraw {
-            render_entity: Entity::PLACEHOLDER,
-            camera,
-            main_entity: entity.into(),
-            z_order,
-            clip,
-            image: bevy::asset::AssetId::<Image>::default(),
-            resource_generation: 0,
-            transform,
+        let base_item = RetainedNodeItem {
             color: background.0.into(),
             rect: Rect {
                 min: Vec2::ZERO,
@@ -144,12 +139,23 @@ pub(crate) fn extract_retained_backgrounds(
             border_radius: node.border_radius(),
             node_type: NodeType::Rect,
         };
+        let base = RetainedDraw {
+            render_entity: Entity::PLACEHOLDER,
+            camera,
+            main_entity: entity.into(),
+            z_order,
+            clip,
+            image: bevy::asset::AssetId::<Image>::default(),
+            transform,
+            item: RetainedDrawItem::Node(base_item),
+        };
         let fill_painted = visible && !background.is_fully_transparent();
         surfaces.upsert(
             &mut commands,
             fill_id,
             camera,
-            base,
+            base.clone(),
+            ResourceFingerprint::None,
             fill_painted
                 .then(|| coverage(node.size, transform, clip))
                 .flatten()
@@ -163,12 +169,16 @@ pub(crate) fn extract_retained_backgrounds(
                 &mut commands,
                 outer_id,
                 camera,
-                RetainedNodeDraw {
-                    color: outer.0.into(),
-                    border: BorderRect::ZERO,
-                    node_type: NodeType::Inverted,
+                RetainedDraw {
+                    item: RetainedDrawItem::Node(RetainedNodeItem {
+                        color: outer.0.into(),
+                        border: BorderRect::ZERO,
+                        node_type: NodeType::Inverted,
+                        ..base_item
+                    }),
                     ..base
                 },
+                ResourceFingerprint::None,
                 outer_painted
                     .then(|| coverage(node.size, transform, clip))
                     .flatten()

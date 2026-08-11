@@ -498,14 +498,15 @@ file lock. Its stock and retained apps run in one process. A directly
 constructed stock final scene is byte-identical to the retained scene reached
 through movement, recoloring, and removal, including translucent overlap.
 
-The first integrated retained families are backgrounds (`BackgroundColor` and
-`OuterColor`) and ordinary, unsliced `ImageNode`s. They share one scene, one
-stable `(entity, family, ordinal)` identity space, and one damage journal per
-camera. Family extractors only update canonical records; a single later replay
-stage sorts every visible family together. This is required for correctness:
-repairing a translucent image must first replay the background beneath it.
-The named GPU proof changes a 10-by-10 image, repairs exactly 100 pixels, and
-replays exactly those two intersecting records bottom-up.
+The integrated retained families are backgrounds (`BackgroundColor` and
+`OuterColor`), ordinary unsliced `ImageNode`s, solid borders and outlines, and
+ordinary text glyph runs. They share one scene, one stable
+`(entity, family, ordinal)` identity space, and one damage journal per camera.
+Family extractors only update canonical records; a single later replay stage
+sorts every visible family together. This is required for correctness:
+repairing a translucent image or glyph must first replay the background
+beneath it. The named GPU image proof changes a 10-by-10 image, repairs exactly
+100 pixels, and replays exactly those two intersecting records bottom-up.
 
 Records use `Changed<T>` candidate nomination, bit-exact canonical values,
 stable render entities, and old-union-new damage. Each exact, non-overlapping
@@ -571,6 +572,37 @@ group therefore damages only that edge's 140-pixel rounded-corner reach, while
 the other three edges still replay as one command under the damage scissor.
 Equal-color borders, distinct-color regrouping, outlines, and component
 removal are byte-identical to stock in named GPU tests.
+
+Ordinary text retains consecutive glyphs that use the same font-atlas texture
+as one draw record. The canonical value contains the bit-exact glyph colors,
+local translations, atlas rectangles, node transform, clip, order, and target;
+coverage composes each glyph-local translation with the node transform rather
+than incorrectly measuring glyphs around the origin. A content change damages
+the exact old and new glyph unions, so shortening a string wipes the vacated
+glyphs without repainting its full layout box. Root colors and child
+`TextSpan` colors have separate nomination paths: a reverse section-to-root
+index makes a child-only color mutation rebuild the owning glyph run.
+
+Font-atlas invalidation is region-exact. Each retained run records the atlas
+cells it can sample, including the one-texel bilinear reach around each glyph,
+and stores exact pixel snapshots for those cells. An `Image` asset event first
+compares only these snapshots. Appending an unrelated glyph or changing any
+other unsampled atlas pixel therefore produces zero text candidates, canonical
+changes, or repair work; changing a sampled pixel advances only its readers.
+Texture and sampler metadata that can alter sampling is compared separately,
+with debug labels and creation-only flags normalized away. Dependency updates
+are transactional so temporarily detaching a root during re-extraction cannot
+discard a just-observed atlas revision. GPU tests cover sampled and unsampled
+mutations, span-only color changes, vacated glyphs, and delayed font-atlas
+uploads. A delayed upload keeps the old text visible and damage owed until the
+new `GpuImage` is actually ready.
+
+This milestone intentionally covers ordinary glyphs only. Text shadows,
+selection and run backgrounds, underline/strikethrough decoration geometry,
+the editable-text cursor, and IME preedit underlines are not yet extracted by
+the retained plugin. They must become first-class retained paint families;
+routing them through an unretained compatibility pass would defeat the static
+frame contract.
 
 Transparent or empty paint is represented by no retained record. This matters
 because `Node` requires transparent background and border components: keeping

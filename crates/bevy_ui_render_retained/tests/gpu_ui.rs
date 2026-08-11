@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use bevy::ui_render::RenderUiSystems;
 use bevy::ui_render::{UiRenderInfrastructurePlugin, UiRenderPlugin};
 use bevy::{
-    asset::RenderAssetUsages,
+    asset::{AssetId, RenderAssetUsages},
     camera::{ClearColorConfig, RenderTarget, Viewport},
     log::LogPlugin,
     prelude::*,
@@ -17,6 +17,7 @@ use bevy::{
         renderer::RenderDevice,
         ExtractSchedule, RenderApp, RenderPlugin,
     },
+    text::TextLayoutInfo,
     window::{ExitCondition, WindowPlugin},
 };
 use bevy_ui_render_retained::{
@@ -204,6 +205,9 @@ fn render_scene<S>(
     app.finish();
     app.cleanup();
 
+    for _ in 0..20 {
+        step_and_wait(&mut app);
+    }
     capture_fresh(&mut app, &pixels);
     let before_mutation = layer_work(&app);
     let paint_before_mutation = paint_work(&app);
@@ -350,6 +354,134 @@ fn spawn_border_leaf(
     }
 }
 
+fn spawn_text_leaf(world: &mut World, camera: Entity, color: Color) -> Entity {
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(4),
+                top: px(18),
+                width: px(56),
+                height: px(24),
+                ..default()
+            },
+            Text::new("Retained"),
+            TextColor(color),
+            TextFont {
+                font_size: FontSize::Px(18.0),
+                ..default()
+            },
+            UiTargetCamera(camera),
+        ))
+        .id()
+}
+
+fn spawn_spanned_text(world: &mut World, camera: Entity, span_color: Color) -> Entity {
+    let root = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(4),
+                top: px(18),
+                width: px(56),
+                height: px(24),
+                ..default()
+            },
+            Text::new("A"),
+            TextColor(Color::srgb_u8(220, 90, 35)),
+            TextFont {
+                font_size: FontSize::Px(18.0),
+                ..default()
+            },
+            UiTargetCamera(camera),
+        ))
+        .id();
+
+    world
+        .spawn((
+            TextSpan::new("B"),
+            TextColor(span_color),
+            TextFont {
+                font_size: FontSize::Px(18.0),
+                ..default()
+            },
+            ChildOf(root),
+        ))
+        .id()
+}
+
+fn first_glyph_pixel(world: &World, text: Entity) -> (AssetId<Image>, UVec3) {
+    let glyph = world
+        .get::<TextLayoutInfo>(text)
+        .and_then(|layout| layout.glyphs.first())
+        .expect("the default font must have a rasterized glyph");
+    (
+        glyph.atlas_info.texture,
+        UVec3::new(
+            glyph.atlas_info.rect.min.x.floor().max(0.0) as u32,
+            glyph.atlas_info.rect.min.y.floor().max(0.0) as u32,
+            0,
+        ),
+    )
+}
+
+fn unused_font_atlas_pixel(world: &World, text: Entity) -> (AssetId<Image>, UVec3) {
+    let layout = world
+        .get::<TextLayoutInfo>(text)
+        .expect("text layout must exist");
+    let atlas = layout
+        .glyphs
+        .first()
+        .map(|glyph| glyph.atlas_info.texture)
+        .expect("the default font must have a rasterized glyph");
+    let size = world
+        .resource::<Assets<Image>>()
+        .get(atlas)
+        .expect("font atlas image must remain in main-world assets")
+        .texture_descriptor
+        .size;
+
+    for y in (0..size.height).rev() {
+        for x in (0..size.width).rev() {
+            let sampled = layout.glyphs.iter().any(|glyph| {
+                glyph.atlas_info.texture == atlas
+                    && (x as f32) >= glyph.atlas_info.rect.min.x - 1.0
+                    && (x as f32) < glyph.atlas_info.rect.max.x + 1.0
+                    && (y as f32) >= glyph.atlas_info.rect.min.y - 1.0
+                    && (y as f32) < glyph.atlas_info.rect.max.y + 1.0
+            });
+            if !sampled {
+                return (atlas, UVec3::new(x, y, 0));
+            }
+        }
+    }
+    panic!("font atlas must contain a pixel outside the retained glyph samples");
+}
+
+fn erase_visible_glyph_pixel(world: &mut World, text: Entity) {
+    let (atlas, rect) = world
+        .get::<TextLayoutInfo>(text)
+        .and_then(|layout| layout.glyphs.first())
+        .map(|glyph| (glyph.atlas_info.texture, glyph.atlas_info.rect))
+        .expect("the default font must have a rasterized glyph");
+    let mut images = world.resource_mut::<Assets<Image>>();
+    let mut image = images
+        .get_mut(atlas)
+        .expect("font atlas image must remain in main-world assets");
+    for y in rect.min.y.floor().max(0.0) as u32..rect.max.y.ceil() as u32 {
+        for x in rect.min.x.floor().max(0.0) as u32..rect.max.x.ceil() as u32 {
+            let pixel = image
+                .pixel_bytes_mut(UVec3::new(x, y, 0))
+                .expect("font atlas pixels must be CPU-readable");
+            if pixel.get(3).is_some_and(|alpha| *alpha > 0) {
+                pixel[3] = 0;
+                return;
+            }
+        }
+    }
+    panic!("the first glyph must contain a visible atlas pixel");
+}
+
 #[test]
 fn reads_pixels_drawn_by_stock_bevy_ui() {
     with_gpu_lock(|| {
@@ -445,8 +577,16 @@ fn quiet_image_pixels_match_stock_without_another_repair() {
         );
 
         assert_pixels_eq(&retained.pixels, &stock.pixels);
+        assert!(
+            retained
+                .pixels
+                .chunks_exact(BYTES_PER_PIXEL)
+                .any(|pixel| pixel[..3] != [0, 0, 0]),
+            "the default font must produce glyph pixels"
+        );
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
+        assert_eq!(after.surfaces_created, 1);
         assert_eq!(after.repairs, before.repairs);
         assert_eq!(
             retained.paint_after_mutation,
@@ -486,6 +626,223 @@ fn quiet_equal_color_border_matches_stock_grouping() {
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn quiet_text_pixels_match_stock_without_another_repair() {
+    with_gpu_lock(|| {
+        let setup =
+            |world: &mut World, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35));
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn changed_text_color_repairs_only_glyph_coverage() {
+    with_gpu_lock(|| {
+        let final_color = Color::srgb_u8(40, 180, 220);
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, final_color),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35)),
+            move |world, text| {
+                world.entity_mut(text).get_mut::<TextColor>().unwrap().0 = final_color;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(
+            after.repairs,
+            before.repairs + 1,
+            "layer {before:?} -> {after:?}; paint {:?} -> {:?}",
+            retained.paint_before_mutation,
+            retained.paint_after_mutation
+        );
+        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+    });
+}
+
+#[test]
+fn changed_text_content_erases_vacated_glyphs() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35)),
+            |world, text| {
+                world.entity_mut(text).get_mut::<Text>().unwrap().0 = "UI".to_string();
+            },
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35)),
+            |world, text| {
+                world.entity_mut(text).get_mut::<Text>().unwrap().0 = "UI".to_string();
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+    });
+}
+
+#[test]
+fn changed_span_color_nominates_its_text_root() {
+    with_gpu_lock(|| {
+        let final_color = Color::srgb_u8(40, 180, 220);
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_spanned_text(world, camera, final_color),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_spanned_text(world, camera, Color::srgb_u8(180, 40, 210)),
+            move |world, span| {
+                world.entity_mut(span).get_mut::<TextColor>().unwrap().0 = final_color;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+    });
+}
+
+#[test]
+fn pending_font_atlas_upload_keeps_old_text_and_damage_owed() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35)),
+            |world, text| {
+                let (atlas, pixel) = first_glyph_pixel(world, text);
+                world.insert_resource(RenderAssetBytesPerFrame::new(0));
+                let mut images = world.resource_mut::<Assets<Image>>();
+                let mut image = images
+                    .get_mut(atlas)
+                    .expect("font atlas image must remain in main-world assets");
+                let first = image
+                    .pixel_bytes_mut(pixel)
+                    .ok()
+                    .and_then(|pixel| pixel.first_mut())
+                    .expect("font atlas must have CPU image data");
+                *first = first.wrapping_add(1);
+            },
+        );
+
+        assert!(
+            output
+                .pixels
+                .chunks_exact(BYTES_PER_PIXEL)
+                .any(|pixel| pixel[..3] != [0, 0, 0]),
+            "the previous text pixels must remain visible"
+        );
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        let paint_before = output.paint_before_mutation.unwrap();
+        let paint_after = output.paint_after_mutation.unwrap();
+        assert_eq!(
+            paint_after.records_changed,
+            paint_before.records_changed + 1
+        );
+    });
+}
+
+#[test]
+fn unsampled_font_atlas_change_does_not_repaint_text() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35)),
+            |world, text| {
+                let (atlas, pixel) = unused_font_atlas_pixel(world, text);
+                let mut images = world.resource_mut::<Assets<Image>>();
+                let mut image = images
+                    .get_mut(atlas)
+                    .expect("font atlas image must remain in main-world assets");
+                let first = image
+                    .pixel_bytes_mut(pixel)
+                    .ok()
+                    .and_then(|pixel| pixel.first_mut())
+                    .expect("font atlas must have CPU image data");
+                *first = first.wrapping_add(1);
+            },
+        );
+
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
+    });
+}
+
+#[test]
+fn changed_sampled_font_atlas_pixel_repairs_text() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35)),
+            erase_visible_glyph_pixel,
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35)),
+            erase_visible_glyph_pixel,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        let paint_before = retained.paint_before_mutation.unwrap();
+        let paint_after = retained.paint_after_mutation.unwrap();
+        assert_eq!(
+            paint_after.records_changed,
+            paint_before.records_changed + 1
         );
     });
 }
