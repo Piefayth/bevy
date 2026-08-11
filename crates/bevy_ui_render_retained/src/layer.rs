@@ -1,6 +1,7 @@
 //! Persistent UI layer and composition.
 
 use crate::background::extract_retained_backgrounds;
+use crate::border::extract_retained_borders;
 use crate::image::{extract_retained_images, resolve_ready_images, RetainedImageDependencies};
 use crate::scene::{
     cleanup_retained_ui, replay_retained_ui, RetainedItem, RetainedItems, RetainedUiPaintCounters,
@@ -79,6 +80,10 @@ impl Plugin for RetainedUiRenderPlugin {
             .add_systems(
                 ExtractSchedule,
                 extract_retained_images.in_set(RenderUiSystems::ExtractImages),
+            )
+            .add_systems(
+                ExtractSchedule,
+                extract_retained_borders.in_set(RenderUiSystems::ExtractBorders),
             )
             .add_systems(
                 ExtractSchedule,
@@ -529,9 +534,11 @@ fn replay_runs(
     for index in 0..phase.items.len() {
         let item = phase.items.get_index(index).unwrap().1;
         let intersects = world.get::<UiItemBatch>(item.entity()).is_some()
-            && items
-                .get(&item.entity())
-                .is_none_or(|item| item.bounds.intersection(region).is_some());
+            && items.get(&item.entity()).is_none_or(|item| {
+                item.coverage
+                    .iter()
+                    .any(|coverage| coverage.intersection(region).is_some())
+            });
         match (start, intersects) {
             (None, true) => start = Some(index),
             (Some(run_start), false) => {
@@ -566,9 +573,11 @@ fn exact_composite_regions(
         let Some(item) = items.get(&item.entity()) else {
             return vec![target];
         };
-        if let Some(clipped) = item.bounds.intersection(target) {
-            occupied.push(clipped);
-        }
+        occupied.extend(
+            item.coverage
+                .iter()
+                .filter_map(|coverage| coverage.intersection(target)),
+        );
     }
     exact_union(occupied)
 }

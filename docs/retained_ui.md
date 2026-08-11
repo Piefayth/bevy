@@ -484,6 +484,14 @@ A full 10,000-record change took roughly 1.73 ms. This benchmark covers only the
 canonical record map and exact damage journal; it does not yet include Bevy
 extraction, GPU upload, raster repair, or composition.
 
+After exact multi-region coverage was added, Criterion caught an avoidable
+full-change regression to roughly 1.97 ms: `upsert` cloned both coverage sets.
+Recording through disjoint borrows removed those copies. Replacing a four-rect
+inline array—which enlarged every hash-map record—with compact
+`Empty | One | Many` storage then measured roughly 2 ns quiet, 0.27
+microseconds for one localized change, and 1.63 ms for 10,000 full changes in a
+short Criterion run. The common zero/one-region cases allocate nothing.
+
 The GPU acceptance harness uses a 64-by-64 image target, synchronous pipeline
 compilation, explicit device polling, an in-process mutex, and a cross-process
 file lock. Its stock and retained apps run in one process. A directly
@@ -552,6 +560,30 @@ new generation; while a byte-upload budget deliberately holds it back, the
 old retained pixels stay visible and the damage remains owed. Per-item batch
 components are cleared before preparation so readiness can never be satisfied
 by stale metadata from a previous frame.
+
+Solid borders and outlines retain four fixed edge records per visible family.
+This deliberately separates damage identity from GPU draw grouping. A first
+attempt drew every edge independently; GPU comparison rejected it because
+equal-color corner ties then alpha-blended more than once. The accepted path
+keeps edge identity stable, but merges equal canonical commands at replay time
+by OR-ing their border flags. Changing the left edge out of an equal-color
+group therefore damages only that edge's 140-pixel rounded-corner reach, while
+the other three edges still replay as one command under the damage scissor.
+Equal-color borders, distinct-color regrouping, outlines, and component
+removal are byte-identical to stock in named GPU tests.
+
+Transparent or empty paint is represented by no retained record. This matters
+because `Node` requires transparent background and border components: keeping
+those as invisible records would still compare and rewrite canonical state
+whenever an unrelated transform moved. A GPU/counter proof moves an unpainted
+node and observes zero paint candidates, records, surfaces, or repairs.
+
+A paint record owns an exact set of physical coverage rectangles rather than
+one bounding box. Its compact `Empty | One | Many` representation allocates
+nothing for ordinary records; genuinely disjoint sampled-image mappings pay
+for storage only when they use it. Damage, item intersection, and cached
+composite coverage all consume the same region set. A unit proof keeps the gap
+between two regions absent from damage.
 
 The owned UI layer is double-buffered. A repair encodes into the inactive
 texture and replaces the visible texture only after every region succeeds.

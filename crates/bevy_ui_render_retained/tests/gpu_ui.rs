@@ -321,6 +321,35 @@ fn spawn_image_leaf(
         .id()
 }
 
+fn border_node() -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        left: px(8),
+        top: px(9),
+        width: px(20),
+        height: px(20),
+        border: UiRect::all(px(4)),
+        border_radius: BorderRadius::all(px(6)),
+        ..default()
+    }
+}
+
+fn spawn_border_leaf(
+    world: &mut World,
+    camera: Entity,
+    colors: BorderColor,
+    background: bool,
+) -> Entity {
+    if background {
+        let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+        world.spawn((border_node(), colors, ChildOf(root))).id()
+    } else {
+        world
+            .spawn((border_node(), colors, UiTargetCamera(camera)))
+            .id()
+    }
+}
+
 #[test]
 fn reads_pixels_drawn_by_stock_bevy_ui() {
     with_gpu_lock(|| {
@@ -361,6 +390,41 @@ fn a_camera_without_ui_allocates_no_retained_surface() {
 }
 
 #[test]
+fn moving_an_unpainted_node_does_no_paint_work() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                world
+                    .spawn((
+                        Node {
+                            width: px(10),
+                            height: px(10),
+                            ..default()
+                        },
+                        UiTargetCamera(camera),
+                    ))
+                    .id()
+            },
+            |world, node| {
+                world
+                    .entity_mut(node)
+                    .get_mut::<UiTransform>()
+                    .unwrap()
+                    .translation = Val2::px(20, 15);
+            },
+        );
+
+        assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.surfaces_created, 0);
+    });
+}
+
+#[test]
 fn quiet_image_pixels_match_stock_without_another_repair() {
     with_gpu_lock(|| {
         let setup = |world: &mut World, camera| {
@@ -388,6 +452,149 @@ fn quiet_image_pixels_match_stock_without_another_repair() {
             retained.paint_after_mutation,
             retained.paint_before_mutation
         );
+    });
+}
+
+#[test]
+fn quiet_equal_color_border_matches_stock_grouping() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_border_leaf(
+                world,
+                camera,
+                BorderColor::all(Color::srgba_u8(220, 45, 28, 190)),
+                false,
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn one_border_edge_change_repairs_only_its_antialiased_corner_reach() {
+    with_gpu_lock(|| {
+        let initial = BorderColor::all(Color::srgb_u8(220, 45, 28));
+        let final_left = Color::srgb_u8(180, 40, 210);
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                spawn_border_leaf(
+                    world,
+                    camera,
+                    BorderColor {
+                        left: final_left,
+                        ..initial
+                    },
+                    true,
+                )
+            },
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_border_leaf(world, camera, initial, true),
+            move |world, border| {
+                world
+                    .entity_mut(border)
+                    .get_mut::<BorderColor>()
+                    .unwrap()
+                    .left = final_left;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 140);
+        assert_eq!(after.items_replayed, before.items_replayed + 3);
+    });
+}
+
+#[test]
+fn retained_outline_matches_stock_pixels() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            world
+                .spawn((
+                    border_node(),
+                    Outline::new(px(3), px(2), Color::srgba_u8(220, 45, 28, 190)),
+                    UiTargetCamera(camera),
+                ))
+                .id()
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+    });
+}
+
+#[test]
+fn removing_border_color_repairs_all_vacated_edge_regions() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+                world.spawn((border_node(), ChildOf(root))).id()
+            },
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                spawn_border_leaf(
+                    world,
+                    camera,
+                    BorderColor::all(Color::srgba_u8(220, 45, 28, 190)),
+                    true,
+                )
+            },
+            |world, border| {
+                world.entity_mut(border).remove::<BorderColor>();
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 364);
     });
 }
 

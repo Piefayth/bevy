@@ -58,7 +58,7 @@ fn rect(min_x: i32, min_y: i32, max_x: i32, max_y: i32) -> PhysicalRect {
 
 fn record(coverage: PhysicalRect, order: i32, color: [u8; 4]) -> PaintRecord<Command> {
     PaintRecord {
-        coverage: Some(coverage),
+        coverage: coverage.into(),
         value: Command { order, color },
     }
 }
@@ -72,7 +72,7 @@ fn ordered_records(paint: &RetainedPaint<u32, Command>) -> Vec<(u32, &PaintRecor
 fn full_repaint(paint: &RetainedPaint<u32, Command>) -> Canvas {
     let mut canvas = Canvas::transparent();
     for (_, record) in ordered_records(paint) {
-        if let Some(coverage) = record.coverage {
+        for &coverage in record.coverage.iter() {
             canvas.draw(coverage, record.value.color);
         }
     }
@@ -84,10 +84,10 @@ fn repair(canvas: &mut Canvas, paint: &RetainedPaint<u32, Command>, plan: &Repai
     for &region in plan.regions() {
         canvas.clear(region);
         for (_, record) in &records {
-            if let Some(coverage) = record.coverage
-                && let Some(scissored_coverage) = coverage.intersection(region)
-            {
-                canvas.draw(scissored_coverage, record.value.color);
+            for &coverage in record.coverage.iter() {
+                if let Some(scissored_coverage) = coverage.intersection(region) {
+                    canvas.draw(scissored_coverage, record.value.color);
+                }
             }
         }
     }

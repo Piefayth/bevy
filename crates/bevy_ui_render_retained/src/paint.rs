@@ -4,6 +4,90 @@ use crate::{DamageJournal, PhysicalRect, RepairPlan};
 use core::hash::Hash;
 use std::collections::{hash_map::Entry, HashMap};
 
+/// Exact physical regions covered by one retained paint record.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaintCoverage(CoverageStorage);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum CoverageStorage {
+    #[default]
+    Empty,
+    One(PhysicalRect),
+    Many(Box<[PhysicalRect]>),
+}
+
+impl PaintCoverage {
+    /// No visible pixels.
+    pub fn empty() -> Self {
+        Self(CoverageStorage::Empty)
+    }
+
+    /// One visible rectangle without a heap allocation.
+    pub fn one(region: PhysicalRect) -> Self {
+        Self(CoverageStorage::One(region))
+    }
+
+    /// Builds coverage without allocating for zero or one rectangle.
+    pub fn from_regions(regions: impl IntoIterator<Item = PhysicalRect>) -> Self {
+        let mut regions = regions.into_iter();
+        let Some(first) = regions.next() else {
+            return Self::empty();
+        };
+        let Some(second) = regions.next() else {
+            return Self::one(first);
+        };
+        let mut many = Vec::with_capacity(regions.size_hint().0.saturating_add(2));
+        many.extend([first, second]);
+        many.extend(regions);
+        Self(CoverageStorage::Many(many.into_boxed_slice()))
+    }
+
+    /// Returns whether the record covers no pixels.
+    pub fn is_empty(&self) -> bool {
+        matches!(self.0, CoverageStorage::Empty)
+    }
+
+    /// Iterates over exact coverage rectangles.
+    pub fn iter(&self) -> impl Iterator<Item = &PhysicalRect> {
+        self.as_slice().iter()
+    }
+
+    /// Appends exact coverage rectangles.
+    pub fn extend(&mut self, regions: impl IntoIterator<Item = PhysicalRect>) {
+        let previous = core::mem::take(self);
+        *self = Self::from_regions(previous.iter().copied().chain(regions));
+    }
+
+    fn as_slice(&self) -> &[PhysicalRect] {
+        match &self.0 {
+            CoverageStorage::Empty => &[],
+            CoverageStorage::One(region) => core::slice::from_ref(region),
+            CoverageStorage::Many(regions) => regions,
+        }
+    }
+}
+
+impl From<PhysicalRect> for PaintCoverage {
+    fn from(region: PhysicalRect) -> Self {
+        Self::one(region)
+    }
+}
+
+impl FromIterator<PhysicalRect> for PaintCoverage {
+    fn from_iter<T: IntoIterator<Item = PhysicalRect>>(iter: T) -> Self {
+        Self::from_regions(iter)
+    }
+}
+
+impl<'a> IntoIterator for &'a PaintCoverage {
+    type Item = &'a PhysicalRect;
+    type IntoIter = core::slice::Iter<'a, PhysicalRect>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 /// The exact bit representation of a paint-input `f32`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FloatBits(u32);
@@ -23,8 +107,8 @@ impl FloatBits {
 /// Everything required to prove whether one paint family produces the same pixels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaintRecord<T> {
-    /// Conservative physical-pixel coverage, or `None` when nothing is visible.
-    pub coverage: Option<PhysicalRect>,
+    /// Conservative physical-pixel regions; empty when nothing is visible.
+    pub coverage: PaintCoverage,
     /// Canonical commands, ordering, clips, effects, and resource generations.
     pub value: T,
 }
@@ -76,29 +160,31 @@ impl<K, V> Default for RetainedPaint<K, V> {
 impl<K: Eq + Hash, V: PartialEq> RetainedPaint<K, V> {
     /// Inserts or replaces one candidate after comparing its canonical record.
     pub fn upsert(&mut self, id: K, record: PaintRecord<V>) -> UpdateOutcome {
-        self.counters.candidates += 1;
-        let (outcome, old_coverage, new_coverage) = match self.records.entry(id) {
+        let Self {
+            records,
+            damage,
+            counters,
+        } = self;
+        counters.candidates += 1;
+        match records.entry(id) {
             Entry::Occupied(mut entry) => {
-                self.counters.records_compared += 1;
+                counters.records_compared += 1;
                 if entry.get() == &record {
                     return UpdateOutcome::Unchanged;
                 }
-                let old_coverage = entry.get().coverage;
-                let new_coverage = record.coverage;
+                record_damage(damage, counters, entry.get().coverage.as_slice());
+                record_damage(damage, counters, record.coverage.as_slice());
                 entry.insert(record);
-                (UpdateOutcome::Changed, old_coverage, new_coverage)
+                counters.records_changed += 1;
+                UpdateOutcome::Changed
             }
             Entry::Vacant(entry) => {
-                let new_coverage = record.coverage;
+                record_damage(damage, counters, record.coverage.as_slice());
                 entry.insert(record);
-                (UpdateOutcome::Inserted, None, new_coverage)
+                counters.records_changed += 1;
+                UpdateOutcome::Inserted
             }
-        };
-
-        self.record_coverage(old_coverage);
-        self.record_coverage(new_coverage);
-        self.counters.records_changed += 1;
-        outcome
+        }
     }
 
     /// Removes one paint record and damages the pixels it occupied.
@@ -106,7 +192,11 @@ impl<K: Eq + Hash, V: PartialEq> RetainedPaint<K, V> {
         let Some(record) = self.records.remove(id) else {
             return false;
         };
-        self.record_coverage(record.coverage);
+        record_damage(
+            &mut self.damage,
+            &mut self.counters,
+            record.coverage.as_slice(),
+        );
         self.counters.records_removed += 1;
         true
     }
@@ -133,19 +223,23 @@ impl<K: Eq + Hash, V: PartialEq> RetainedPaint<K, V> {
 
     /// Invalidates pixels because the surface holding otherwise unchanged records was lost.
     pub fn invalidate(&mut self, coverage: PhysicalRect) {
-        self.record_coverage(Some(coverage));
+        record_damage(&mut self.damage, &mut self.counters, &[coverage]);
     }
 
     /// Takes and resets deterministic work counters.
     pub fn take_counters(&mut self) -> WorkCounters {
         core::mem::take(&mut self.counters)
     }
+}
 
-    fn record_coverage(&mut self, coverage: Option<PhysicalRect>) {
-        if let Some(rect) = coverage {
-            self.damage.record(rect);
-            self.counters.damage_events += 1;
-        }
+fn record_damage(
+    damage: &mut DamageJournal,
+    counters: &mut WorkCounters,
+    coverage: &[PhysicalRect],
+) {
+    for &rect in coverage {
+        damage.record(rect);
+        counters.damage_events += 1;
     }
 }
 
@@ -159,7 +253,7 @@ mod tests {
 
     fn record(coverage: PhysicalRect, value: u32) -> PaintRecord<u32> {
         PaintRecord {
-            coverage: Some(coverage),
+            coverage: coverage.into(),
             value,
         }
     }
@@ -225,6 +319,25 @@ mod tests {
         let repair = paint.repair_plan().unwrap();
         assert_eq!(repair.regions(), &[rect(-2, 4, 3, 6)]);
         assert_eq!(repair.damaged_pixels(), 10);
+    }
+
+    #[test]
+    fn disjoint_record_coverage_does_not_damage_its_gap() {
+        let mut paint = RetainedPaint::default();
+        paint.upsert(
+            1,
+            PaintRecord {
+                coverage: PaintCoverage::from_regions([rect(0, 0, 2, 2), rect(6, 0, 8, 2)]),
+                value: 7,
+            },
+        );
+        let initial = paint.repair_plan().unwrap();
+        assert_eq!(initial.damaged_pixels(), 8);
+        assert_eq!(initial.regions().len(), 2);
+        assert!(initial
+            .regions()
+            .iter()
+            .all(|region| region.intersection(rect(2, 0, 6, 2)).is_none()));
     }
 
     #[test]

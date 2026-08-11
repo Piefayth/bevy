@@ -152,8 +152,9 @@ pub(crate) fn extract_retained_backgrounds(
             base,
             fill_painted
                 .then(|| coverage(node.size, transform, clip))
-                .flatten(),
-            fill_painted,
+                .flatten()
+                .into_iter()
+                .collect(),
         );
 
         if let Some(outer) = outer {
@@ -170,8 +171,9 @@ pub(crate) fn extract_retained_backgrounds(
                 },
                 outer_painted
                     .then(|| coverage(node.size, transform, clip))
-                    .flatten(),
-                outer_painted,
+                    .flatten()
+                    .into_iter()
+                    .collect(),
             );
         } else {
             surfaces.remove(&mut commands, outer_id);

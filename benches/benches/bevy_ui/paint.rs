@@ -14,7 +14,7 @@ fn retained_paint(record_count: u32) -> RetainedPaint<u32, u32> {
         paint.upsert(
             id,
             PaintRecord {
-                coverage: Some(coverage(id)),
+                coverage: coverage(id).into(),
                 value: 0,
             },
         );
@@ -48,7 +48,7 @@ fn paint(c: &mut Criterion) {
                     localized.upsert(
                         localized_id,
                         PaintRecord {
-                            coverage: Some(coverage(localized_id)),
+                            coverage: coverage(localized_id).into(),
                             value: localized_value,
                         },
                     );
@@ -71,7 +71,7 @@ fn paint(c: &mut Criterion) {
                         full.upsert(
                             id,
                             PaintRecord {
-                                coverage: Some(coverage(id)),
+                                coverage: coverage(id).into(),
                                 value: full_value,
                             },
                         );

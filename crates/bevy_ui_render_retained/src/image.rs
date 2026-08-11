@@ -342,8 +342,11 @@ pub(crate) fn extract_retained_images(
                 border_radius: node.border_radius,
                 node_type: NodeType::Rect,
             },
-            painted.then(|| coverage(size, transform, clip)).flatten(),
-            painted,
+            painted
+                .then(|| coverage(size, transform, clip))
+                .flatten()
+                .into_iter()
+                .collect(),
         );
     }
 }
