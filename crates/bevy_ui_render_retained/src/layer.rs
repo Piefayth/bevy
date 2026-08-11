@@ -1,8 +1,10 @@
 //! Persistent UI layer and composition.
 
-use crate::background::{
-    cleanup_retained_backgrounds, extract_retained_backgrounds, RetainedBackgrounds,
-    RetainedItemBounds, RetainedUiPaintCounters,
+use crate::background::extract_retained_backgrounds;
+use crate::image::{extract_retained_images, resolve_ready_images, RetainedImageDependencies};
+use crate::scene::{
+    cleanup_retained_ui, replay_retained_ui, RetainedItem, RetainedItems, RetainedUiPaintCounters,
+    RetainedUiScene,
 };
 use crate::{damage::exact_union, PhysicalRect, RepairPlan};
 use alloc::collections::VecDeque;
@@ -21,6 +23,7 @@ use bevy::{
     prelude::{App, Plugin, Resource, World},
     render::{
         camera::ExtractedCamera,
+        render_asset::RenderAssets,
         render_phase::{DrawFunctions, PhaseItem, PhaseItemExtraIndex, ViewSortedRenderPhases},
         render_resource::{
             binding_types::texture_2d, BindGroup, BindGroupEntries, BindGroupLayoutDescriptor,
@@ -32,12 +35,13 @@ use bevy::{
             TextureView, TextureViewDescriptor,
         },
         renderer::{RenderContext, RenderDevice, ViewQuery},
+        texture::GpuImage,
         view::{ExtractedView, RetainedViewEntity, ViewTarget},
         ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
     },
     ui_render::{
         DrawUiItem, ExtractedUiNodes, RenderUiSystems, TransparentUi, UiAntiAlias, UiCameraView,
-        UiPipeline, UiPipelineKey, UiViewTarget,
+        UiItemBatch, UiPipeline, UiPipelineKey, UiViewTarget,
     },
 };
 use core::{
@@ -64,18 +68,31 @@ impl Plugin for RetainedUiRenderPlugin {
         render_app
             .init_resource::<LayerSurfaces>()
             .init_resource::<RetainedUiLayerCounters>()
-            .init_resource::<RetainedBackgrounds>()
-            .init_resource::<RetainedItemBounds>()
+            .init_resource::<RetainedUiScene>()
+            .init_resource::<RetainedImageDependencies>()
+            .init_resource::<RetainedItems>()
             .init_resource::<RetainedUiPaintCounters>()
             .add_systems(
                 ExtractSchedule,
                 extract_retained_backgrounds.in_set(RenderUiSystems::ExtractBackgrounds),
             )
             .add_systems(
+                ExtractSchedule,
+                extract_retained_images.in_set(RenderUiSystems::ExtractImages),
+            )
+            .add_systems(
+                ExtractSchedule,
+                replay_retained_ui.after(RenderUiSystems::ExtractDebug),
+            )
+            .add_systems(
                 Render,
-                (cleanup_retained_backgrounds, cleanup_layer_surfaces)
+                (cleanup_retained_ui, cleanup_layer_surfaces)
                     .chain()
                     .in_set(RenderSystems::PrepareResources),
+            )
+            .add_systems(
+                Render,
+                resolve_ready_images.in_set(RenderSystems::PrepareResources),
             )
             .add_systems(Render, queue_retained_uinodes.in_set(RenderSystems::Queue))
             .add_systems(RenderStartup, init_composite_pipeline)
@@ -394,23 +411,38 @@ fn cleanup_layer_surfaces(views: Query<&ExtractedView>, surfaces: Res<LayerSurfa
 fn phase_is_ready(
     phase: &bevy::render::render_phase::SortedRenderPhase<TransparentUi>,
     pipeline_cache: &PipelineCache,
+    world: &World,
 ) -> bool {
-    let mut index = 0;
-    let mut found_draw = false;
-    while index < phase.items.len() {
+    if phase.items.is_empty() {
+        return false;
+    }
+    let items = world
+        .resource::<RetainedItems>()
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let dependencies = world.resource::<RetainedImageDependencies>();
+    let gpu_images = world.resource::<RenderAssets<GpuImage>>();
+    for index in 0..phase.items.len() {
         let item = phase.items.get_index(index).unwrap().1;
-        let batch_range = item.batch_range();
-        if batch_range.is_empty() {
-            index += 1;
-            continue;
+        let Some(metadata) = items.get(&item.entity()) else {
+            return false;
+        };
+        if world.get::<UiItemBatch>(item.entity()).is_none() {
+            let unavailable_image = metadata.image
+                != bevy::asset::AssetId::<bevy::image::Image>::default()
+                && gpu_images.get(metadata.image).is_none()
+                && !dependencies.is_pending(metadata.image);
+            if unavailable_image {
+                continue;
+            }
+            return false;
         }
         if pipeline_cache.get_render_pipeline(item.pipeline).is_none() {
             return false;
         }
-        found_draw = true;
-        index += batch_range.len();
     }
-    found_draw
+    true
 }
 
 fn target_rect(size: UVec2) -> PhysicalRect {
@@ -488,16 +520,18 @@ fn synchronize_pending_layer(surface: &LayerSurface, pending: usize, ctx: &mut R
 
 fn replay_runs(
     phase: &bevy::render::render_phase::SortedRenderPhase<TransparentUi>,
-    bounds: &HashMap<bevy::ecs::entity::Entity, PhysicalRect>,
+    items: &HashMap<bevy::ecs::entity::Entity, RetainedItem>,
     region: PhysicalRect,
+    world: &World,
 ) -> Vec<Range<usize>> {
     let mut runs = Vec::new();
     let mut start = None;
     for index in 0..phase.items.len() {
         let item = phase.items.get_index(index).unwrap().1;
-        let intersects = bounds
-            .get(&item.entity())
-            .is_none_or(|bounds| bounds.intersection(region).is_some());
+        let intersects = world.get::<UiItemBatch>(item.entity()).is_some()
+            && items
+                .get(&item.entity())
+                .is_none_or(|item| item.bounds.intersection(region).is_some());
         match (start, intersects) {
             (None, true) => start = Some(index),
             (Some(run_start), false) => {
@@ -515,8 +549,9 @@ fn replay_runs(
 
 fn exact_composite_regions(
     phase: Option<&bevy::render::render_phase::SortedRenderPhase<TransparentUi>>,
-    bounds: &HashMap<bevy::ecs::entity::Entity, PhysicalRect>,
+    items: &HashMap<bevy::ecs::entity::Entity, RetainedItem>,
     size: UVec2,
+    world: &World,
 ) -> Vec<PhysicalRect> {
     let Some(phase) = phase else {
         return Vec::new();
@@ -525,10 +560,13 @@ fn exact_composite_regions(
     let mut occupied = Vec::with_capacity(phase.items.len());
     for index in 0..phase.items.len() {
         let item = phase.items.get_index(index).unwrap().1;
-        let Some(item_bounds) = bounds.get(&item.entity()) else {
+        if world.get::<UiItemBatch>(item.entity()).is_none() {
+            continue;
+        }
+        let Some(item) = items.get(&item.entity()) else {
             return vec![target];
         };
-        if let Some(clipped) = item_bounds.intersection(target) {
+        if let Some(clipped) = item.bounds.intersection(target) {
             occupied.push(clipped);
         }
     }
@@ -567,20 +605,19 @@ fn retained_ui_pass(
 
     let phase = transparent_render_phases.get(&extracted_view.retained_view_entity);
     let phase_has_items = phase.is_some_and(|phase| !phase.items.is_empty());
-    let backgrounds = world.resource::<RetainedBackgrounds>();
-    let background_plan = backgrounds.repair_plan(ui_view_target.0);
-    let damage_regions = clipped_damage(background_plan.as_ref(), size);
-    if let Some(plan) = background_plan.as_ref()
+    let scene = world.resource::<RetainedUiScene>();
+    let repair_plan = scene.repair_plan(ui_view_target.0);
+    let damage_regions = clipped_damage(repair_plan.as_ref(), size);
+    if let Some(plan) = repair_plan.as_ref()
         && damage_regions.is_empty()
     {
-        backgrounds.acknowledge(ui_view_target.0, plan);
+        scene.acknowledge(ui_view_target.0, plan);
     }
-    let repair_requested =
-        phase_has_items || (background_plan.is_some() && !damage_regions.is_empty());
+    let repair_requested = phase_has_items || (repair_plan.is_some() && !damage_regions.is_empty());
     let repair_ready = if phase_has_items {
-        phase.is_some_and(|phase| phase_is_ready(phase, &pipeline_cache))
+        phase.is_some_and(|phase| phase_is_ready(phase, &pipeline_cache, world))
     } else {
-        background_plan.is_some()
+        repair_plan.is_some()
     };
 
     let mut surfaces = surfaces.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -590,8 +627,8 @@ fn retained_ui_pass(
     if !existing_matches && !repair_requested {
         drop(surfaces);
         let target = target_rect(size);
-        if backgrounds.has_visible_records(ui_view_target.0, target) {
-            backgrounds.invalidate(ui_view_target.0, target);
+        if scene.has_visible_records(ui_view_target.0, target) {
+            scene.invalidate(ui_view_target.0, target);
         }
         return;
     }
@@ -624,14 +661,14 @@ fn retained_ui_pass(
     if let Some(wipe_pipeline) = wipe_pipeline {
         let pending = 1 - surface.active;
         synchronize_pending_layer(surface, pending, &mut ctx);
-        let bounds = world
-            .resource::<RetainedItemBounds>()
+        let items = world
+            .resource::<RetainedItems>()
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let mut result = Ok(());
         let mut replayed = 0;
-        let composite_regions = exact_composite_regions(phase, &bounds, size);
+        let composite_regions = exact_composite_regions(phase, &items, size, world);
         for region in &damage_regions {
             let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
                 label: Some("retained_ui_repair"),
@@ -659,7 +696,7 @@ fn retained_ui_pass(
             pass.draw(0..3, 0..1);
 
             if let Some(phase) = phase.filter(|phase| !phase.items.is_empty()) {
-                for run in replay_runs(phase, &bounds, *region) {
+                for run in replay_runs(phase, &items, *region, world) {
                     replayed += run.len() as u64;
                     if let Err(err) = phase.render_range(&mut pass, world, ui_view_entity, run) {
                         result = Err(err);
@@ -671,7 +708,7 @@ fn retained_ui_pass(
                 break;
             }
         }
-        drop(bounds);
+        drop(items);
 
         match result {
             Ok(()) => {
@@ -684,9 +721,9 @@ fn retained_ui_pass(
                 counters
                     .items_replayed
                     .fetch_add(replayed, Ordering::Relaxed);
-                if let Some(plan) = background_plan.as_ref() {
+                if let Some(plan) = repair_plan.as_ref() {
                     world
-                        .resource::<RetainedBackgrounds>()
+                        .resource::<RetainedUiScene>()
                         .acknowledge(ui_view_target.0, plan);
                 }
             }

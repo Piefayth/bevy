@@ -490,13 +490,21 @@ file lock. Its stock and retained apps run in one process. A directly
 constructed stock final scene is byte-identical to the retained scene reached
 through movement, recoloring, and removal, including translucent overlap.
 
-The first integrated retained family is `BackgroundColor` plus `OuterColor`.
-It uses `Changed<T>` candidate nomination, bit-exact canonical records, stable
-render entities, and old-union-new damage. Each exact, non-overlapping damage
-rectangle is wiped to transparent and rebuilt bottom-up from only the sorted
-phase items whose physical bounds intersect it. A localized GPU proof moves a
-10-by-10 leaf across a larger background: exactly 200 pixels are repaired and
-only the three necessary item-region intersections are replayed.
+The first integrated retained families are backgrounds (`BackgroundColor` and
+`OuterColor`) and ordinary, unsliced `ImageNode`s. They share one scene, one
+stable `(entity, family, ordinal)` identity space, and one damage journal per
+camera. Family extractors only update canonical records; a single later replay
+stage sorts every visible family together. This is required for correctness:
+repairing a translucent image must first replay the background beneath it.
+The named GPU proof changes a 10-by-10 image, repairs exactly 100 pixels, and
+replays exactly those two intersecting records bottom-up.
+
+Records use `Changed<T>` candidate nomination, bit-exact canonical values,
+stable render entities, and old-union-new damage. Each exact, non-overlapping
+damage rectangle is wiped to transparent and rebuilt from only the sorted
+phase items whose physical bounds intersect it. A localized background proof
+moves a 10-by-10 leaf across a larger background: exactly 200 pixels are
+repaired and only the three necessary item-region intersections are replayed.
 
 The mutation audit found that `ComputedNode` alone is not a complete
 nomination source: Bevy intentionally writes resolved borders and corner radii
@@ -525,6 +533,25 @@ The current background dependency matrix is executable in `tests/gpu_ui.rs`:
 
 All canonical draw fields remain in the fingerprint, so these sources only
 nominate comparison. They do not decide damage.
+
+Image resource dependencies are exact and reverse-indexed. `Image` asset
+changes nominate only `ImageNode`s that sample that asset and add a content
+generation to their canonical record. `TextureAtlasLayout` changes nominate
+only nodes using that layout, then recompute the selected rectangle; changing
+an unselected atlas entry is therefore compared but causes zero damage. The
+GPU suite proves quiet images match stock output, image tint changes rebuild
+underlying backgrounds, pixel-only asset modifications repaint exact readers,
+selected atlas changes repaint, and irrelevant atlas edits do not.
+
+Availability follows Bevy's render-asset lifecycle rather than main-world
+`Assets<Image>` membership. Removing a main-world asset does not unload its GPU
+copy while a strong handle remains, so it correctly causes no repaint. A
+never-available image is safely omitted and its old coverage erased. An added
+or modified image remains pending until `RenderAssets<GpuImage>` contains the
+new generation; while a byte-upload budget deliberately holds it back, the
+old retained pixels stay visible and the damage remains owed. Per-item batch
+components are cleared before preparation so readiness can never be satisfied
+by stale metadata from a previous frame.
 
 The owned UI layer is double-buffered. A repair encodes into the inactive
 texture and replaces the visible texture only after every region succeeds.

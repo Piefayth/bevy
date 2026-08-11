@@ -1631,10 +1631,19 @@ pub fn prepare_uinodes(
         };
     }
 
+    let item_draw_function = draw_functions.read().id::<DrawUiItem>();
+    for phase in phases.values() {
+        for index in 0..phase.items.len() {
+            let item = phase.items.get_index(index).unwrap().1;
+            if item.draw_function == item_draw_function {
+                commands.entity(item.entity()).remove::<UiItemBatch>();
+            }
+        }
+    }
+
     if let Some(view_binding) = view_uniforms.uniforms.binding() {
         let mut batches: Vec<(Entity, UiBatch)> = Vec::with_capacity(*previous_len);
         let mut item_batches = Vec::new();
-        let item_draw_function = draw_functions.read().id::<DrawUiItem>();
 
         ui_meta.vertices.clear();
         ui_meta.indices.clear();

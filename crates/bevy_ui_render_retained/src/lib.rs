@@ -14,10 +14,12 @@ extern crate alloc;
 
 mod background;
 mod damage;
+mod image;
 mod layer;
 mod paint;
+mod scene;
 
-pub use background::RetainedUiPaintCounters;
 pub use damage::{DamageJournal, PhysicalRect, RepairPlan};
 pub use layer::{RetainedUiLayerCounters, RetainedUiLayerWork, RetainedUiRenderPlugin};
 pub use paint::{FloatBits, PaintRecord, RetainedPaint, UpdateOutcome, WorkCounters};
+pub use scene::RetainedUiPaintCounters;
