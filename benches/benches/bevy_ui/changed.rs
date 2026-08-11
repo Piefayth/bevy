@@ -1,5 +1,5 @@
 use bevy_ecs::{prelude::*, schedule::Schedule, system::ScheduleSystem};
-use criterion::{BenchmarkId, Criterion, criterion_group};
+use criterion::{criterion_group, BenchmarkId, Criterion};
 use std::hint::black_box;
 
 #[derive(Component)]

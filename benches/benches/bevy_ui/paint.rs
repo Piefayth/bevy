@@ -1,5 +1,5 @@
 use bevy_ui_render_retained::{PaintRecord, PhysicalRect, RetainedPaint};
-use criterion::{BenchmarkId, Criterion, criterion_group};
+use criterion::{criterion_group, BenchmarkId, Criterion};
 use std::hint::black_box;
 
 fn coverage(index: u32) -> PhysicalRect {

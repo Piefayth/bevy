@@ -7,7 +7,7 @@ use bevy_math::UVec2;
 use bevy_text::TextPlugin;
 use bevy_time::TimePlugin;
 use bevy_ui::{Node, UiPlugin, Val};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
+use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use std::time::{Duration, Instant};
 
 const TARGET_SIZE: UVec2 = UVec2::new(1024, 1024);
@@ -97,9 +97,8 @@ fn layout(c: &mut Criterion) {
             BenchmarkId::new("quiet", node_count),
             &node_count,
             |bencher, _| {
-                bencher.iter_custom(|iterations| {
-                    measure_updates(&mut quiet_app, iterations, |_| {})
-                });
+                bencher
+                    .iter_custom(|iterations| measure_updates(&mut quiet_app, iterations, |_| {}));
             },
         );
 
