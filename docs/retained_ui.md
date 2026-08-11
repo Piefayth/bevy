@@ -136,10 +136,17 @@ therefore remove that one system and install its own final writer after
 writer and exactly one replacement.
 
 This preserves Bevy's `ViewTarget`, output attachment, and later presentation
-bookkeeping without vendoring `bevy_core_pipeline`. The scheduling proof does
-not establish that the replacement blit has correct pixels or that every
-window backend presents it; image-target readback will establish the former,
-while the latter still requires a window integration test on each supported
+bookkeeping without vendoring `bevy_core_pipeline`. The retained plugin now
+uses that interposition: it removes exactly one stock writer from each of
+`Core2d` and `Core3d`, mirrors Bevy's public pipeline key and blocking behavior,
+and installs one final blit with plain and fused shader entries. Bevy's private
+stock preparation system remains installed and prepares an unused stock
+pipeline component; removing that small per-camera scan is the only known
+reason this mechanism would need a `bevy_core_pipeline` patch. GPU differentials
+prove the no-UI path, premultiplied UI, nonzero viewports, default multi-camera
+alpha composition, and
+`CameraOutputMode::Skip` byte-identical to stock on an image target. Actual
+window presentation still requires one integration test on each supported
 backend.
 
 Replacing individual stock extraction systems exposed one smaller
@@ -425,18 +432,30 @@ If the world below the UI changes, cached UI must be composited again. This is
 irreducible unless the operating-system compositor owns the UI as a separate
 surface, which portable `wgpu` does not expose.
 
-Composition need not sample a fullscreen transparent layer. The renderer can
-retain occupied coverage tiles or regions and issue a static instanced draw for
-only nonempty UI coverage in the same render pass as Bevy's final world blit:
+The first proposed co-draw was:
 
 ```text
 draw world/upscaled image
 draw cached occupied UI regions
 ```
 
-This avoids an additional attachment load/store and makes sampling cost
-proportional to visible UI coverage. A fullscreen translucent UI remains
-fullscreen work by definition.
+That is not generally equivalent to Bevy's output semantics. A later camera can
+blend its complete world-plus-UI source into an existing target with an
+arbitrary `CameraOutputMode` blend state. Drawing world and UI separately would
+apply that output blend twice and can double-multiply alpha. Restricting the
+optimization to the first or replace-mode camera was rejected as a parallel
+correctness path.
+
+The exact public-API implementation instead samples the premultiplied retained
+layer in Bevy's existing fullscreen final blit, combines it with the world, then
+applies color-space conversion and the camera output blend once. This deletes
+the standalone UI composite pass and its attachment load/store without
+vendoring `bevy_core_pipeline`. The price is one additional UI texture read for
+every output pixel while UI is visible, even outside occupied UI bounds. That
+trade is expected to favor tile GPUs but is not called free and must be included
+in the physical-device sweep. A camera with no visible UI selects a plain shader
+entry that never reads the bound transparent fallback, performs the same single
+world-texture draw as stock, and allocates no retained surface.
 
 The public `wgpu::Surface` presentation API has no damage-region parameter, so
 portable platform partial-present behavior cannot currently be promised.
@@ -511,8 +530,8 @@ allows it:
 - a deterministic adversarial scene rendered once with retention and once with
   full redraw, followed by an exact pixel comparison;
 - counters asserted by tests: entities extracted, paint records changed, items
-  and prepared quads replayed, damaged pixels, surfaces repaired, and composite
-  coverage.
+  and prepared quads replayed, damaged pixels, surfaces repaired, fused
+  composites, and physical UI texture samples.
 
 Every regression test must first fail with the named defect reintroduced.
 
@@ -534,9 +553,10 @@ Wall-clock samples catch constant-factor regressions. Deterministic counters
 catch complexity regressions even when timing noise is high. Benchmarked work
 counts include roots and entities visited, entities extracted, paint records
 compared/changed, bytes uploaded, records and prepared quads replayed, damaged
-physical pixels, surface repairs, composite instances, and composite pixel
-coverage. The quiet case is required to report zero for every counter except
-unavoidable composition when another renderer produces a fresh target frame.
+physical pixels, surface repairs, fused composites, and physical pixels sampling
+the retained UI texture. The quiet case is required to report zero for every
+counter except unavoidable fused composition when another renderer produces a
+fresh target frame.
 
 - [Bevy benchmark instructions](../benches/README.md)
 
@@ -818,9 +838,9 @@ node and observes zero paint candidates, records, surfaces, or repairs.
 A paint record owns an exact set of physical coverage rectangles rather than
 one bounding box. Its compact `Empty | One | Many` representation allocates
 nothing for ordinary records; genuinely disjoint sampled-image mappings pay
-for storage only when they use it. Damage, item intersection, and cached
-composite coverage all consume the same region set. A unit proof keeps the gap
-between two regions absent from damage.
+for storage only when they use it. Damage and item intersection consume the
+same region set. A unit proof keeps the gap between two regions absent from
+damage; composition no longer needs a second coverage representation.
 
 The owned UI layer is double-buffered. A repair encodes into the inactive
 texture and replaces the visible texture only after every region succeeds.
@@ -839,19 +859,17 @@ nonzero-origin viewport is byte-identical to stock, and moving an unchanged
 viewport is proven to cause zero paint candidates and zero repair work. This
 is placement-only motion of a retained surface.
 
-Composition caches the exact union of possibly nontransparent item bounds when
-a repair commits. Quiet frames reuse those regions and issue one scissored
-texture draw per non-overlapping region; they do not rebuild the union. A lone
-10-by-10 UI composites 100 pixels rather than the 4,096-pixel test viewport.
-Two disjoint translucent 10-by-10 regions remain byte-identical to stock,
-preserve the untouched gap, and composite exactly 200 pixels in two draws. An
-empty committed layer stops compositing entirely, and a camera with no visible
-UI allocates no layer textures. If a layer is lost or no longer matches its
-viewport size or target format while its records remain unchanged, the whole
-viewport is added to owed damage and those records replay on the following
-extraction. Replacing the scissored draws with one static instanced region draw
-remains a constant-factor optimization; it does not change pixel coverage or
-invalidation semantics.
+Composition is folded into Bevy's existing final blit. A quiet visible layer
+therefore causes no extra pass, attachment load/store, or draw, but it does add
+one retained-layer texture read across the physical viewport. A 10-by-10 UI in
+the 64-by-64 harness truthfully reports 4,096 sampled UI pixels, not 100 logical
+content pixels. Two disjoint translucent regions remain byte-identical to stock
+and preserve the untouched gap without retaining or rebuilding a coverage union
+that the fused shader cannot use. An empty committed layer uses the transparent
+fallback, and a camera with no visible UI allocates no layer textures. If a
+layer is lost or no longer matches its viewport size or target format while its
+records remain unchanged, the whole viewport is added to owed damage and those
+records replay on the following extraction.
 
 Some behavior cannot be established by portable automated tests:
 

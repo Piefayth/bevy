@@ -16,39 +16,44 @@ use crate::scene::{
 use crate::shadow::{extract_retained_shadows, RetainedShadowDependencies};
 use crate::text::{extract_retained_text, RetainedTextDependencies};
 use crate::viewport::{extract_retained_viewports, RetainedViewportDependencies};
-use crate::{damage::exact_union, PhysicalRect, RepairPlan};
+use crate::{PhysicalRect, RepairPlan};
 use alloc::collections::VecDeque;
 use bevy::{
     asset::{embedded_asset, load_embedded_asset, AssetServer},
+    camera::{CameraOutputMode, ClearColor, ClearColorConfig, CompositingSpace},
     core_pipeline::{
-        upscaling::upscaling, Core2d, Core2dSystems, Core3d, Core3dSystems, FullscreenShader,
+        blit::{BlitPipeline, BlitPipelineKey},
+        upscaling::upscaling,
+        Core2d, Core2dSystems, Core3d, Core3dSystems, FullscreenShader,
     },
     ecs::{
         entity::Entity,
         query::With,
-        schedule::IntoScheduleConfigs,
-        system::{Commands, Query, Res, ResMut},
+        schedule::{IntoScheduleConfigs, ScheduleCleanupPolicy},
+        system::{Commands, Local, Query, Res, ResMut},
     },
     log::error,
     math::{FloatOrd, UVec2},
     prelude::{App, Plugin, Resource, World},
     render::{
         camera::ExtractedCamera,
+        diagnostic::RecordDiagnostics,
         render_asset::RenderAssets,
         render_phase::{
             DrawFunctionId, DrawFunctions, PhaseItem, PhaseItemExtraIndex, ViewSortedRenderPhases,
         },
         render_resource::{
-            binding_types::texture_2d, BindGroup, BindGroupEntries, BindGroupLayoutDescriptor,
-            BindGroupLayoutEntries, CachedRenderPipelineId, ColorTargetState, ColorWrites,
-            Extent3d, FragmentState, LoadOp, Operations, Origin3d, PipelineCache,
-            RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor,
-            ShaderStages, SpecializedRenderPipeline, SpecializedRenderPipelines, StoreOp, Texture,
-            TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-            TextureView, TextureViewDescriptor,
+            binding_types::{sampler, texture_2d},
+            BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
+            BlendState, CachedRenderPipelineId, ColorTargetState, ColorWrites, Extent3d,
+            FragmentState, LoadOp, Operations, Origin3d, PipelineCache, RenderPassColorAttachment,
+            RenderPassDescriptor, RenderPipelineDescriptor, SamplerBindingType, ShaderStages,
+            SpecializedRenderPipelines, StoreOp, Texture, TextureDescriptor, TextureDimension,
+            TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
+            TextureViewId,
         },
         renderer::{RenderContext, RenderDevice, ViewQuery},
-        texture::GpuImage,
+        texture::{FallbackImageZero, GpuImage},
         view::{ExtractedView, RetainedViewEntity, ViewTarget},
         ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
     },
@@ -72,7 +77,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-/// Adds a persistent UI layer while reusing Bevy's public UI phase and draw commands.
+/// Adds a persistent UI layer and folds it into Bevy's final blit.
 #[derive(Default)]
 pub struct RetainedUiRenderPlugin;
 
@@ -164,19 +169,29 @@ impl Plugin for RetainedUiRenderPlugin {
             )
             .add_systems(Render, queue_retained_uinodes.in_set(RenderSystems::Queue))
             .add_systems(Render, queue_ui_slice_items.in_set(RenderSystems::Queue))
-            .add_systems(RenderStartup, init_composite_pipeline)
             .add_systems(
-                Core2d,
-                retained_ui_pass
-                    .after(Core2dSystems::PostProcess)
-                    .before(upscaling),
+                RenderStartup,
+                (clear_final_pipelines, init_retained_ui_pipelines).chain(),
             )
             .add_systems(
-                Core3d,
-                retained_ui_pass
-                    .after(Core3dSystems::PostProcess)
-                    .before(upscaling),
+                Render,
+                prepare_final_pipelines
+                    .in_set(RenderSystems::Prepare)
+                    .ambiguous_with_all(),
             );
+
+        let removed_2d = render_app
+            .remove_systems_in_set(Core2d, upscaling, ScheduleCleanupPolicy::RemoveSystemsOnly)
+            .expect("Core2dPlugin must be added before RetainedUiRenderPlugin");
+        assert_eq!(removed_2d, 1, "Core2d must contain one final writer");
+        let removed_3d = render_app
+            .remove_systems_in_set(Core3d, upscaling, ScheduleCleanupPolicy::RemoveSystemsOnly)
+            .expect("Core3dPlugin must be added before RetainedUiRenderPlugin");
+        assert_eq!(removed_3d, 1, "Core3d must contain one final writer");
+
+        render_app
+            .add_systems(Core2d, retained_ui_pass.after(Core2dSystems::PostProcess))
+            .add_systems(Core3d, retained_ui_pass.after(Core3dSystems::PostProcess));
     }
 }
 
@@ -237,12 +252,10 @@ pub struct RetainedUiLayerWork {
     pub items_replayed: u64,
     /// Prepared quads submitted across all replayed paint items.
     pub quads_replayed: u64,
-    /// Layer composites encoded over world output.
+    /// Final blits that sampled and composited a retained UI layer.
     pub composites: u64,
-    /// Scissored texture draws issued by layer composites.
-    pub composite_draws: u64,
-    /// Physical pixels covered by exact layer-content bounds.
-    pub composite_pixels: u64,
+    /// Physical output pixels that sampled the retained UI layer.
+    pub ui_sample_pixels: u64,
 }
 
 /// Atomic render-world counters for retained-layer acceptance tests and diagnostics.
@@ -254,8 +267,7 @@ pub struct RetainedUiLayerCounters {
     items_replayed: AtomicU64,
     quads_replayed: AtomicU64,
     composites: AtomicU64,
-    composite_draws: AtomicU64,
-    composite_pixels: AtomicU64,
+    ui_sample_pixels: AtomicU64,
 }
 
 impl RetainedUiLayerCounters {
@@ -268,47 +280,58 @@ impl RetainedUiLayerCounters {
             items_replayed: self.items_replayed.load(Ordering::Relaxed),
             quads_replayed: self.quads_replayed.load(Ordering::Relaxed),
             composites: self.composites.load(Ordering::Relaxed),
-            composite_draws: self.composite_draws.load(Ordering::Relaxed),
-            composite_pixels: self.composite_pixels.load(Ordering::Relaxed),
+            ui_sample_pixels: self.ui_sample_pixels.load(Ordering::Relaxed),
         }
     }
 }
 
 #[derive(Resource)]
-struct CompositePipeline {
-    layout: BindGroupLayoutDescriptor,
+struct RetainedUiPipelines {
+    final_layout: BindGroupLayoutDescriptor,
     shader: bevy::asset::Handle<bevy::shader::Shader>,
     vertex: bevy::render::render_resource::VertexState,
-    pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
+    final_pipelines: Mutex<HashMap<(BlitPipelineKey, bool), CachedRenderPipelineId>>,
     wipe_pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
 }
 
-impl SpecializedRenderPipeline for CompositePipeline {
-    type Key = TextureFormat;
-
-    fn specialize(&self, format: Self::Key) -> RenderPipelineDescriptor {
-        RenderPipelineDescriptor {
-            label: Some("retained_ui_composite_pipeline".into()),
-            layout: vec![self.layout.clone()],
-            vertex: self.vertex.clone(),
-            fragment: Some(FragmentState {
-                shader: self.shader.clone(),
-                entry_point: Some("fragment".into()),
-                targets: vec![Some(ColorTargetState {
-                    format,
-                    blend: Some(
-                        bevy::render::render_resource::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-                    ),
-                    write_mask: ColorWrites::ALL,
-                })],
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
+impl RetainedUiPipelines {
+    fn final_pipeline(
+        &self,
+        key: BlitPipelineKey,
+        fused: bool,
+        pipeline_cache: &PipelineCache,
+    ) -> CachedRenderPipelineId {
+        *self
+            .final_pipelines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((key, fused))
+            .or_insert_with(|| {
+                let mut shader_defs = Vec::new();
+                match key.source_space {
+                    Some(CompositingSpace::Srgb) => shader_defs.push("SRGB_TO_LINEAR".into()),
+                    Some(CompositingSpace::Oklab) => shader_defs.push("OKLAB_TO_LINEAR".into()),
+                    Some(CompositingSpace::Linear) | None => {}
+                }
+                pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+                    label: Some("retained_ui_final_blit_pipeline".into()),
+                    layout: vec![self.final_layout.clone()],
+                    vertex: self.vertex.clone(),
+                    fragment: Some(FragmentState {
+                        shader: self.shader.clone(),
+                        shader_defs,
+                        entry_point: Some(if fused { "final_blit" } else { "plain_blit" }.into()),
+                        targets: vec![Some(ColorTargetState {
+                            format: key.target_format,
+                            blend: key.blend_state,
+                            write_mask: ColorWrites::ALL,
+                        })],
+                    }),
+                    ..Default::default()
+                })
+            })
     }
-}
 
-impl CompositePipeline {
     fn wipe_pipeline(
         &self,
         format: TextureFormat,
@@ -340,30 +363,89 @@ impl CompositePipeline {
     }
 }
 
-fn init_composite_pipeline(
+fn init_retained_ui_pipelines(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     fullscreen_shader: Res<FullscreenShader>,
 ) {
-    commands.insert_resource(CompositePipeline {
-        layout: BindGroupLayoutDescriptor::new(
-            "retained_ui_composite_layout",
-            &BindGroupLayoutEntries::single(
+    commands.insert_resource(RetainedUiPipelines {
+        final_layout: BindGroupLayoutDescriptor::new(
+            "retained_ui_final_blit_layout",
+            &BindGroupLayoutEntries::sequential(
                 ShaderStages::FRAGMENT,
-                texture_2d(TextureSampleType::Float { filterable: false }),
+                (
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                    sampler(SamplerBindingType::NonFiltering),
+                ),
             ),
         ),
         shader: load_embedded_asset!(asset_server.as_ref(), "composite.wgsl"),
         vertex: fullscreen_shader.to_vertex_state(),
-        pipelines: Mutex::new(HashMap::new()),
+        final_pipelines: Mutex::new(HashMap::new()),
         wipe_pipelines: Mutex::new(HashMap::new()),
     });
+}
+
+#[derive(bevy::prelude::Component)]
+struct RetainedFinalPipeline {
+    plain: CachedRenderPipelineId,
+    fused: CachedRenderPipelineId,
+    key: BlitPipelineKey,
+}
+
+fn clear_final_pipelines(
+    mut commands: Commands,
+    views: Query<Entity, With<RetainedFinalPipeline>>,
+) {
+    for entity in &views {
+        commands.entity(entity).remove::<RetainedFinalPipeline>();
+    }
+}
+
+fn prepare_final_pipelines(
+    mut commands: Commands,
+    mut pipeline_cache: ResMut<PipelineCache>,
+    pipeline: Res<RetainedUiPipelines>,
+    views: Query<(
+        Entity,
+        &ViewTarget,
+        Option<&ExtractedCamera>,
+        Option<&RetainedFinalPipeline>,
+    )>,
+) {
+    for (entity, view_target, camera, prepared) in &views {
+        let blend_state = camera.and_then(|camera| match camera.output_mode {
+            CameraOutputMode::Skip => None,
+            CameraOutputMode::Write { blend_state, .. } => blend_state.or_else(|| {
+                (camera.sorted_camera_index_for_target > 0).then_some(BlendState::ALPHA_BLENDING)
+            }),
+        });
+        let Some(target_format) = view_target.out_texture_view_format() else {
+            continue;
+        };
+        let key = BlitPipelineKey {
+            target_format,
+            blend_state,
+            samples: 1,
+            source_space: view_target.compositing_space,
+        };
+        if prepared.is_some_and(|prepared| prepared.key == key) {
+            continue;
+        }
+        let plain = pipeline.final_pipeline(key, false, &pipeline_cache);
+        let fused = pipeline.final_pipeline(key, true, &pipeline_cache);
+        pipeline_cache.block_on_render_pipeline(plain);
+        pipeline_cache.block_on_render_pipeline(fused);
+        commands
+            .entity(entity)
+            .insert(RetainedFinalPipeline { plain, fused, key });
+    }
 }
 
 struct LayerSlot {
     texture: Texture,
     view: TextureView,
-    bind_group: BindGroup,
     initialized: bool,
     generation: u64,
 }
@@ -379,20 +461,12 @@ struct LayerSurface {
     slots: [LayerSlot; 2],
     active: usize,
     has_content: bool,
-    composite_regions: Vec<PhysicalRect>,
     generation: u64,
     history: VecDeque<CommittedDamage>,
 }
 
 impl LayerSurface {
-    fn new(
-        render_device: &RenderDevice,
-        pipeline_cache: &PipelineCache,
-        pipeline: &CompositePipeline,
-        size: UVec2,
-        format: TextureFormat,
-    ) -> Self {
-        let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
+    fn new(render_device: &RenderDevice, size: UVec2, format: TextureFormat) -> Self {
         let create_slot = || {
             let texture = render_device.create_texture(&TextureDescriptor {
                 label: Some("retained_ui_layer"),
@@ -412,15 +486,9 @@ impl LayerSurface {
                 view_formats: &[],
             });
             let view = texture.create_view(&TextureViewDescriptor::default());
-            let bind_group = render_device.create_bind_group(
-                "retained_ui_composite_bind_group",
-                &layout,
-                &BindGroupEntries::single(&view),
-            );
             LayerSlot {
                 texture,
                 view,
-                bind_group,
                 initialized: false,
                 generation: 0,
             }
@@ -432,7 +500,6 @@ impl LayerSurface {
             slots: [create_slot(), create_slot()],
             active: 0,
             has_content: false,
-            composite_regions: Vec::new(),
             generation: 0,
             history: VecDeque::new(),
         }
@@ -442,16 +509,10 @@ impl LayerSurface {
         self.size == size && self.format == format
     }
 
-    fn commit(
-        &mut self,
-        active: usize,
-        regions: Vec<PhysicalRect>,
-        composite_regions: Vec<PhysicalRect>,
-    ) {
+    fn commit(&mut self, active: usize, regions: Vec<PhysicalRect>, has_content: bool) {
         self.generation += 1;
         self.active = active;
-        self.has_content = !composite_regions.is_empty();
-        self.composite_regions = composite_regions;
+        self.has_content = has_content;
         self.slots[active].initialized = true;
         self.slots[active].generation = self.generation;
         self.history.push_back(CommittedDamage {
@@ -686,33 +747,109 @@ fn replay_runs(
     runs
 }
 
-fn exact_composite_regions(
+fn phase_has_drawable_items(
     phase: Option<&bevy::render::render_phase::SortedRenderPhase<TransparentUi>>,
-    items: &HashMap<Entity, RetainedItem>,
-    size: UVec2,
     world: &World,
     draw_functions: RetainedDrawFunctionIds,
-) -> Vec<PhysicalRect> {
+) -> bool {
     let Some(phase) = phase else {
-        return Vec::new();
+        return false;
     };
-    let target = target_rect(size);
-    let mut occupied = Vec::with_capacity(phase.items.len());
-    for index in 0..phase.items.len() {
+    (0..phase.items.len()).any(|index| {
         let item = phase.items.get_index(index).unwrap().1;
-        if item_batch_range(world, item, draw_functions).is_none() {
-            continue;
+        item_batch_range(world, item, draw_functions).is_some_and(|range| !range.is_empty())
+    })
+}
+
+#[derive(Default)]
+struct FinalBindGroupCache {
+    cached: Option<(TextureViewId, TextureViewId, BindGroup)>,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the final writer preserves Bevy's independent camera output inputs"
+)]
+fn final_blit(
+    target: &ViewTarget,
+    camera: &ExtractedCamera,
+    prepared: &RetainedFinalPipeline,
+    ui_view: &TextureView,
+    has_ui: bool,
+    pipeline: &RetainedUiPipelines,
+    pipeline_cache: &PipelineCache,
+    blit_pipeline: &BlitPipeline,
+    global_clear_color: &ClearColor,
+    cache: &mut FinalBindGroupCache,
+    ctx: &mut RenderContext,
+) -> bool {
+    let clear_config = match camera.output_mode {
+        CameraOutputMode::Write { clear_color, .. } => clear_color,
+        CameraOutputMode::Skip => return false,
+    };
+    let clear_color = match clear_config {
+        ClearColorConfig::Default => Some(global_clear_color.0),
+        ClearColorConfig::Custom(color) => Some(color),
+        ClearColorConfig::None => None,
+    };
+    let main_view = target.main_texture_view();
+    let bind_group = match &mut cache.cached {
+        Some((main_id, ui_id, bind_group))
+            if *main_id == main_view.id() && *ui_id == ui_view.id() =>
+        {
+            bind_group
         }
-        let Some(item) = items.get(&item.entity()) else {
-            return vec![target];
-        };
-        occupied.extend(
-            item.coverage
-                .iter()
-                .filter_map(|coverage| coverage.intersection(target)),
-        );
+        cached => {
+            let bind_group = ctx.render_device().create_bind_group(
+                "retained_ui_final_blit_bind_group",
+                &pipeline_cache.get_bind_group_layout(&pipeline.final_layout),
+                &BindGroupEntries::sequential((ui_view, main_view, &blit_pipeline.sampler)),
+            );
+            let (_, _, bind_group) = cached.insert((main_view.id(), ui_view.id(), bind_group));
+            bind_group
+        }
+    };
+    let Some(attachment) = target.out_texture_color_attachment(clear_color.map(Into::into)) else {
+        return false;
+    };
+    let pass_descriptor = RenderPassDescriptor {
+        label: Some("retained_ui_final_blit"),
+        color_attachments: &[Some(attachment)],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    };
+    let pipeline_id = if has_ui {
+        prepared.fused
+    } else {
+        prepared.plain
+    };
+    let Some(render_pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
+        #[cfg(target_os = "macos")]
+        ctx.command_encoder().begin_render_pass(&pass_descriptor);
+        return false;
+    };
+
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+    let time_span = diagnostics.time_span(ctx.command_encoder(), "retained_ui_final_blit");
+    {
+        let mut pass = ctx.command_encoder().begin_render_pass(&pass_descriptor);
+        if let Some(viewport) = &camera.viewport {
+            pass.set_scissor_rect(
+                viewport.physical_position.x,
+                viewport.physical_position.y,
+                viewport.physical_size.x,
+                viewport.physical_size.y,
+            );
+        }
+        pass.set_pipeline(render_pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
-    exact_union(occupied)
+    time_span.end(ctx.command_encoder());
+    true
 }
 
 #[expect(
@@ -721,27 +858,56 @@ fn exact_composite_regions(
 )]
 fn retained_ui_pass(
     world: &World,
-    view: ViewQuery<&UiCameraView>,
+    view: ViewQuery<(
+        &UiCameraView,
+        &ViewTarget,
+        &ExtractedCamera,
+        &RetainedFinalPipeline,
+    )>,
     ui_view_query: Query<(&ExtractedView, &UiViewTarget)>,
-    ui_view_target_query: Query<(&ViewTarget, &ExtractedCamera)>,
     transparent_render_phases: Res<ViewSortedRenderPhases<TransparentUi>>,
-    composite_pipeline: Option<Res<CompositePipeline>>,
+    pipelines: Res<RetainedUiPipelines>,
     pipeline_cache: Res<PipelineCache>,
+    blit_pipeline: Res<BlitPipeline>,
+    fallback: Res<FallbackImageZero>,
+    clear_color: Res<ClearColor>,
     surfaces: Res<LayerSurfaces>,
     counters: Res<RetainedUiLayerCounters>,
+    mut final_cache: Local<FinalBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let Some(composite_pipeline) = composite_pipeline else {
-        return;
-    };
-    let ui_view_entity = view.into_inner().0;
+    let (ui_camera_view, target, camera, final_pipeline) = view.into_inner();
+    let ui_view_entity = ui_camera_view.0;
     let Ok((extracted_view, ui_view_target)) = ui_view_query.get(ui_view_entity) else {
-        return;
-    };
-    let Ok((target, camera)) = ui_view_target_query.get(ui_view_target.0) else {
+        let _ = final_blit(
+            target,
+            camera,
+            final_pipeline,
+            &fallback.texture_view,
+            false,
+            &pipelines,
+            &pipeline_cache,
+            &blit_pipeline,
+            &clear_color,
+            &mut final_cache,
+            &mut ctx,
+        );
         return;
     };
     let Some(size) = camera.physical_viewport_size else {
+        let _ = final_blit(
+            target,
+            camera,
+            final_pipeline,
+            &fallback.texture_view,
+            false,
+            &pipelines,
+            &pipeline_cache,
+            &blit_pipeline,
+            &clear_color,
+            &mut final_cache,
+            &mut ctx,
+        );
         return;
     };
 
@@ -773,37 +939,38 @@ fn retained_ui_pass(
         .is_some_and(|surface| surface.matches(size, extracted_view.target_format));
     if !existing_matches && !repair_requested {
         drop(surfaces);
-        let target = target_rect(size);
-        if scene.has_visible_records(ui_view_target.0, target) {
-            scene.invalidate(ui_view_target.0, target);
+        let viewport = target_rect(size);
+        if scene.has_visible_records(ui_view_target.0, viewport) {
+            scene.invalidate(ui_view_target.0, viewport);
         }
+        let _ = final_blit(
+            target,
+            camera,
+            final_pipeline,
+            &fallback.texture_view,
+            false,
+            &pipelines,
+            &pipeline_cache,
+            &blit_pipeline,
+            &clear_color,
+            &mut final_cache,
+            &mut ctx,
+        );
         return;
     }
     let surface = surfaces
         .entry(extracted_view.retained_view_entity)
         .or_insert_with(|| {
             counters.surfaces_created.fetch_add(1, Ordering::Relaxed);
-            LayerSurface::new(
-                ctx.render_device(),
-                &pipeline_cache,
-                &composite_pipeline,
-                size,
-                extracted_view.target_format,
-            )
+            LayerSurface::new(ctx.render_device(), size, extracted_view.target_format)
         });
     if !surface.matches(size, extracted_view.target_format) {
-        *surface = LayerSurface::new(
-            ctx.render_device(),
-            &pipeline_cache,
-            &composite_pipeline,
-            size,
-            extracted_view.target_format,
-        );
+        *surface = LayerSurface::new(ctx.render_device(), size, extracted_view.target_format);
         counters.surfaces_created.fetch_add(1, Ordering::Relaxed);
     }
 
     let wipe_pipeline = (repair_requested && repair_ready)
-        .then(|| composite_pipeline.wipe_pipeline(extracted_view.target_format, &pipeline_cache))
+        .then(|| pipelines.wipe_pipeline(extracted_view.target_format, &pipeline_cache))
         .and_then(|id| pipeline_cache.get_render_pipeline(id));
     if let Some(wipe_pipeline) = wipe_pipeline {
         let pending = 1 - surface.active;
@@ -816,7 +983,7 @@ fn retained_ui_pass(
         let mut result = Ok(());
         let mut replayed = 0;
         let mut replayed_quads = 0;
-        let composite_regions = exact_composite_regions(phase, &items, size, world, draw_functions);
+        let has_content = phase_has_drawable_items(phase, world, draw_functions);
         for region in &damage_regions {
             let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
                 label: Some("retained_ui_repair"),
@@ -865,7 +1032,7 @@ fn retained_ui_pass(
         match result {
             Ok(()) => {
                 let repaired_pixels = damage_regions.iter().map(PhysicalRect::area).sum::<u64>();
-                surface.commit(pending, damage_regions, composite_regions);
+                surface.commit(pending, damage_regions, has_content);
                 counters.repairs.fetch_add(1, Ordering::Relaxed);
                 counters
                     .repair_pixels
@@ -890,61 +1057,29 @@ fn retained_ui_pass(
         }
     }
 
-    if !surface.has_content {
-        return;
-    }
-
-    let pipeline_id = *composite_pipeline
-        .pipelines
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(extracted_view.target_format)
-        .or_insert_with(|| {
-            pipeline_cache
-                .queue_render_pipeline(composite_pipeline.specialize(extracted_view.target_format))
-        });
-    let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
-        return;
+    let has_content = surface.has_content;
+    let ui_view = if has_content {
+        &surface.slots[surface.active].view
+    } else {
+        &fallback.texture_view
     };
-
-    let attachment = target.get_unsampled_color_attachment();
-    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
-        label: Some("retained_ui_composite"),
-        color_attachments: &[Some(attachment)],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
-    pass.set_render_pipeline(pipeline);
-    pass.set_bind_group(0, &surface.slots[surface.active].bind_group, &[]);
-    if let Some(viewport) = camera.viewport.as_ref() {
-        pass.set_camera_viewport(viewport);
-    }
-    let viewport_origin = camera
-        .viewport
-        .as_ref()
-        .map(|viewport| viewport.physical_position)
-        .unwrap_or_default();
-    for region in &surface.composite_regions {
-        pass.set_scissor_rect(
-            viewport_origin.x + region.min_x() as u32,
-            viewport_origin.y + region.min_y() as u32,
-            (region.max_x() - region.min_x()) as u32,
-            (region.max_y() - region.min_y()) as u32,
-        );
-        pass.draw(0..3, 0..1);
-    }
-    counters.composites.fetch_add(1, Ordering::Relaxed);
-    counters
-        .composite_draws
-        .fetch_add(surface.composite_regions.len() as u64, Ordering::Relaxed);
-    counters.composite_pixels.fetch_add(
-        surface
-            .composite_regions
-            .iter()
-            .map(PhysicalRect::area)
-            .sum(),
-        Ordering::Relaxed,
+    let final_blit_encoded = final_blit(
+        target,
+        camera,
+        final_pipeline,
+        ui_view,
+        has_content,
+        &pipelines,
+        &pipeline_cache,
+        &blit_pipeline,
+        &clear_color,
+        &mut final_cache,
+        &mut ctx,
     );
+    if has_content && final_blit_encoded {
+        counters.composites.fetch_add(1, Ordering::Relaxed);
+        counters
+            .ui_sample_pixels
+            .fetch_add(u64::from(size.x) * u64::from(size.y), Ordering::Relaxed);
+    }
 }

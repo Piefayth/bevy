@@ -834,19 +834,89 @@ fn reads_pixels_drawn_by_stock_bevy_ui() {
 }
 
 #[test]
-fn a_camera_without_ui_allocates_no_retained_surface() {
+fn a_camera_without_ui_uses_the_stock_final_blit_without_a_retained_surface() {
     with_gpu_lock(|| {
-        let output = render_scene(
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |_, _| {},
+            |_, _| {},
+        );
+        let retained = render_scene(
             UiRenderer::Retained,
             PaintSchedule::EveryFrame,
             |_, _| {},
             |_, _| {},
         );
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
 
-        let work = output.after_mutation.unwrap();
+        let work = retained.after_mutation.unwrap();
         assert_eq!(work.surfaces_created, 0);
         assert_eq!(work.repairs, 0);
         assert_eq!(work.composites, 0);
+    });
+}
+
+fn spawn_stacked_camera_ui(world: &mut World, first_camera: Entity) {
+    let target = world
+        .get::<RenderTarget>(first_camera)
+        .expect("the harness camera has an image target")
+        .clone();
+    spawn_full_background(world, first_camera, Color::srgb_u8(20, 80, 210));
+    let second_camera = world
+        .spawn((
+            Camera2d,
+            Camera {
+                order: 1,
+                clear_color: ClearColorConfig::None,
+                ..default()
+            },
+            target,
+        ))
+        .id();
+    spawn_full_background(world, second_camera, Color::srgba_u8(220, 40, 20, 128));
+}
+
+#[test]
+fn fused_final_blit_matches_stock_multi_camera_alpha_composition() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            spawn_stacked_camera_ui,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            spawn_stacked_camera_ui,
+            |_, _| {},
+        );
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+    });
+}
+
+#[test]
+fn fused_final_writer_preserves_camera_output_skip() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera: Entity| {
+            world.get_mut::<Camera>(camera).unwrap().output_mode = CameraOutputMode::Skip;
+            spawn_full_background(world, camera, Color::srgb_u8(220, 40, 20))
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        assert_eq!(retained.after_mutation.unwrap().composites, 0);
     });
 }
 
@@ -3215,7 +3285,7 @@ fn quiet_backgrounds_retain_pixels_without_another_repair() {
 }
 
 #[test]
-fn quiet_composition_touches_only_possible_content_pixels() {
+fn quiet_composition_rides_the_existing_full_view_final_blit() {
     with_gpu_lock(|| {
         let output = render_scene(
             UiRenderer::Retained,
@@ -3241,8 +3311,8 @@ fn quiet_composition_touches_only_possible_content_pixels() {
         let composites = after.composites - before.composites;
         assert!(composites > 0);
         assert_eq!(
-            after.composite_pixels - before.composite_pixels,
-            composites * 100
+            after.ui_sample_pixels - before.ui_sample_pixels,
+            composites * u64::from(WIDTH) * u64::from(HEIGHT)
         );
     });
 }
@@ -3278,7 +3348,7 @@ fn spawn_disjoint_backgrounds(world: &mut World, camera: Entity) {
 }
 
 #[test]
-fn disjoint_composite_regions_preserve_pixels_and_the_gap_between_them() {
+fn fused_composite_preserves_disjoint_pixels_and_the_gap_between_them() {
     with_gpu_lock(|| {
         let stock = render_scene(
             UiRenderer::Stock,
@@ -3306,13 +3376,8 @@ fn disjoint_composite_regions_preserve_pixels_and_the_gap_between_them() {
         let composites = after.composites - before.composites;
         assert!(composites > 0);
         assert_eq!(
-            after.composite_draws - before.composite_draws,
-            composites * 2,
-            "{before:?} -> {after:?}"
-        );
-        assert_eq!(
-            after.composite_pixels - before.composite_pixels,
-            composites * 200
+            after.ui_sample_pixels - before.ui_sample_pixels,
+            composites * u64::from(WIDTH) * u64::from(HEIGHT)
         );
     });
 }
