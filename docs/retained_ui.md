@@ -500,7 +500,7 @@ through movement, recoloring, and removal, including translucent overlap.
 
 The integrated retained families are backgrounds (`BackgroundColor` and
 `OuterColor`), ordinary unsliced `ImageNode`s, solid borders and outlines, and
-ordinary text glyph runs. They share one scene, one stable
+all stock UI text paint. They share one scene, one stable
 `(entity, family, ordinal)` identity space, and one damage journal per camera.
 Family extractors only update canonical records; a single later replay stage
 sorts every visible family together. This is required for correctness:
@@ -573,9 +573,13 @@ the other three edges still replay as one command under the damage scissor.
 Equal-color borders, distinct-color regrouping, outlines, and component
 removal are byte-identical to stock in named GPU tests.
 
-Ordinary text retains consecutive glyphs that use the same font-atlas texture
-as one draw record. The canonical value contains the bit-exact glyph colors,
-local translations, atlas rectangles, node transform, clip, order, and target;
+Text retains consecutive glyphs in the same section that use the same
+font-atlas texture as one draw record. Identity uses the stable section entity
+and a section-local atlas-run ordinal; paint order is separate canonical data.
+A child-span color change therefore changes exactly that span's glyph record
+instead of churning every later run, while overlapping spans still paint in
+layout order. The canonical value contains the bit-exact glyph colors, local
+translations, atlas rectangles, node transform, clip, order, and target;
 coverage composes each glyph-local translation with the node transform rather
 than incorrectly measuring glyphs around the origin. A content change damages
 the exact old and new glyph unions, so shortening a string wipes the vacated
@@ -597,12 +601,18 @@ mutations, span-only color changes, vacated glyphs, and delayed font-atlas
 uploads. A delayed upload keeps the old text visible and damage owed until the
 new `GpuImage` is actually ready.
 
-This milestone intentionally covers ordinary glyphs only. Text shadows,
-selection and run backgrounds, underline/strikethrough decoration geometry,
-the editable-text cursor, and IME preedit underlines are not yet extracted by
-the retained plugin. They must become first-class retained paint families;
-routing them through an unretained compatibility pass would defeat the static
-frame contract.
+All stock text paint families are now first-class retained records: run
+backgrounds, glyph and decoration shadows, underline and strikethrough,
+selection backgrounds, selected glyph color, cursor, and IME preedit
+underlines. `EditableText` is a peer root rather than a `Text` subtype, so the
+root query explicitly accepts either component. Section decoration components
+use the same reverse section-to-root dependency index as span colors. Input
+focus is retained as explicit state: a focus transition nominates only the old
+and new focused entities, and canonical comparison limits damage to selection
+pixels whose focused/unfocused color actually differs. GPU differentials cover
+quiet and mutated shadows, all run decorations, decoration removal, selected
+editable text, focus-only selection recoloring, and nonempty IME underline
+geometry.
 
 Transparent or empty paint is represented by no retained record. This matters
 because `Node` requires transparent background and border components: keeping

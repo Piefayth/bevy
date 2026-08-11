@@ -8,6 +8,7 @@ use bevy::ui_render::{UiRenderInfrastructurePlugin, UiRenderPlugin};
 use bevy::{
     asset::{AssetId, RenderAssetUsages},
     camera::{ClearColorConfig, RenderTarget, Viewport},
+    input_focus::InputFocus,
     log::LogPlugin,
     prelude::*,
     render::{
@@ -17,7 +18,7 @@ use bevy::{
         renderer::RenderDevice,
         ExtractSchedule, RenderApp, RenderPlugin,
     },
-    text::TextLayoutInfo,
+    text::{EditableText, TextCursorStyle, TextEdit, TextLayoutInfo},
     window::{ExitCondition, WindowPlugin},
 };
 use bevy_ui_render_retained::{
@@ -376,6 +377,99 @@ fn spawn_text_leaf(world: &mut World, camera: Entity, color: Color) -> Entity {
         .id()
 }
 
+fn spawn_shadowed_text(
+    world: &mut World,
+    camera: Entity,
+    text_color: Color,
+    shadow: TextShadow,
+) -> Entity {
+    let text = spawn_text_leaf(world, camera, text_color);
+    world.entity_mut(text).insert(shadow);
+    text
+}
+
+fn spawn_decorated_text(world: &mut World, camera: Entity, underline: Color) -> Entity {
+    let text = spawn_shadowed_text(
+        world,
+        camera,
+        Color::srgb_u8(235, 210, 80),
+        TextShadow {
+            offset: Vec2::new(2.0, 2.0),
+            color: Color::srgb_u8(35, 145, 185),
+        },
+    );
+    world.entity_mut(text).insert((
+        TextBackgroundColor(Color::srgba_u8(95, 35, 130, 180)),
+        Strikethrough,
+        StrikethroughColor(Color::srgb_u8(225, 55, 65)),
+        Underline,
+        UnderlineColor(underline),
+    ));
+    text
+}
+
+fn spawn_selected_editable_text(world: &mut World, camera: Entity) -> Entity {
+    let mut editable = EditableText::new("Retained");
+    editable.queue_edit(TextEdit::SelectAll);
+    let text = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(4),
+                top: px(18),
+                width: px(56),
+                height: px(24),
+                ..default()
+            },
+            editable,
+            TextColor(Color::srgb_u8(235, 210, 80)),
+            TextFont {
+                font_size: FontSize::Px(18.0),
+                ..default()
+            },
+            TextCursorStyle {
+                color: Color::srgb_u8(240, 60, 80),
+                selection_color: Color::srgb_u8(40, 180, 220),
+                unfocused_selection_color: Color::srgb_u8(95, 35, 130),
+                selected_text_color: Some(Color::srgb_u8(25, 30, 35)),
+            },
+            UiTargetCamera(camera),
+        ))
+        .id();
+    world.insert_resource(InputFocus::from_entity(text));
+    text
+}
+
+fn spawn_preedit_text(world: &mut World, camera: Entity) -> Entity {
+    let mut editable = EditableText::new("Retained");
+    editable.queue_edit(TextEdit::ImeSetCompose {
+        value: "IME".into(),
+        cursor: None,
+    });
+    let text = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(4),
+                top: px(18),
+                width: px(56),
+                height: px(24),
+                ..default()
+            },
+            editable,
+            TextColor(Color::srgb_u8(235, 210, 80)),
+            TextFont {
+                font_size: FontSize::Px(18.0),
+                ..default()
+            },
+            TextCursorStyle::default(),
+            UiTargetCamera(camera),
+        ))
+        .id();
+    world.insert_resource(InputFocus::from_entity(text));
+    text
+}
+
 fn spawn_spanned_text(world: &mut World, camera: Entity, span_color: Color) -> Entity {
     let root = world
         .spawn((
@@ -660,6 +754,259 @@ fn quiet_text_pixels_match_stock_without_another_repair() {
 }
 
 #[test]
+fn quiet_text_shadow_matches_stock_without_main_glyph_paint() {
+    with_gpu_lock(|| {
+        let shadow = TextShadow {
+            offset: Vec2::new(3.0, 2.0),
+            color: Color::srgb_u8(40, 180, 220),
+        };
+        let setup = move |world: &mut World, camera| {
+            spawn_shadowed_text(world, camera, Color::NONE, shadow)
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        assert!(
+            retained
+                .pixels
+                .chunks_exact(BYTES_PER_PIXEL)
+                .any(|pixel| pixel[..3] != [0, 0, 0]),
+            "the text shadow must produce pixels without main glyph paint"
+        );
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+    });
+}
+
+#[test]
+fn changed_text_shadow_offset_repairs_old_and_new_glyph_coverage() {
+    with_gpu_lock(|| {
+        let initial = TextShadow {
+            offset: Vec2::new(2.0, 1.0),
+            color: Color::srgb_u8(40, 180, 220),
+        };
+        let final_shadow = TextShadow {
+            offset: Vec2::new(-3.0, 2.0),
+            ..initial
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            move |world, camera| {
+                spawn_shadowed_text(world, camera, Color::srgb_u8(220, 90, 35), final_shadow)
+            },
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            move |world, camera| {
+                spawn_shadowed_text(world, camera, Color::srgb_u8(220, 90, 35), initial)
+            },
+            move |world, text| {
+                world
+                    .entity_mut(text)
+                    .get_mut::<TextShadow>()
+                    .unwrap()
+                    .offset = final_shadow.offset;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+    });
+}
+
+#[test]
+fn quiet_text_decorations_and_their_shadows_match_stock() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_decorated_text(world, camera, Color::srgb_u8(65, 225, 105))
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+    });
+}
+
+#[test]
+fn changed_underline_color_repairs_its_text_root() {
+    with_gpu_lock(|| {
+        let final_color = Color::srgb_u8(55, 125, 235);
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            move |world, camera| spawn_decorated_text(world, camera, final_color),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_decorated_text(world, camera, Color::srgb_u8(65, 225, 105)),
+            move |world, text| {
+                world
+                    .entity_mut(text)
+                    .get_mut::<UnderlineColor>()
+                    .unwrap()
+                    .0 = final_color;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+    });
+}
+
+#[test]
+fn removing_text_background_repairs_its_vacated_run_bounds() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_decorated_text(world, camera, Color::srgb_u8(65, 225, 105))
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |world, text| {
+                world.entity_mut(text).remove::<TextBackgroundColor>();
+            },
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |world, text| {
+                world.entity_mut(text).remove::<TextBackgroundColor>();
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+    });
+}
+
+#[test]
+fn selected_editable_text_and_cursor_match_stock() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            spawn_selected_editable_text,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            spawn_selected_editable_text,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        assert!(
+            retained
+                .pixels
+                .chunks_exact(BYTES_PER_PIXEL)
+                .any(|pixel| pixel[..3] != [0, 0, 0]),
+            "editable glyphs and selection must produce pixels"
+        );
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+    });
+}
+
+#[test]
+fn changing_editable_text_focus_repairs_selection_color() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            spawn_selected_editable_text,
+            |world, _| world.resource_mut::<InputFocus>().clear(),
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            spawn_selected_editable_text,
+            |world, _| world.resource_mut::<InputFocus>().clear(),
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert!(after.repair_pixels - before.repair_pixels < u64::from(WIDTH * HEIGHT));
+    });
+}
+
+#[test]
+fn editable_preedit_underline_matches_stock() {
+    with_gpu_lock(|| {
+        let assert_preedit = |world: &mut World, text| {
+            assert!(
+                !world
+                    .get::<TextLayoutInfo>(text)
+                    .unwrap()
+                    .preedit_underline_rects
+                    .is_empty(),
+                "the test must exercise preedit underline geometry"
+            );
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            spawn_preedit_text,
+            assert_preedit,
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            spawn_preedit_text,
+            assert_preedit,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+    });
+}
+
+#[test]
 fn changed_text_color_repairs_only_glyph_coverage() {
     with_gpu_lock(|| {
         let final_color = Color::srgb_u8(40, 180, 220);
@@ -744,6 +1091,13 @@ fn changed_span_color_nominates_its_text_root() {
         let after = retained.after_mutation.unwrap();
         assert_eq!(after.repairs, before.repairs + 1);
         assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+        let paint_before = retained.paint_before_mutation.unwrap();
+        let paint_after = retained.paint_after_mutation.unwrap();
+        assert_eq!(
+            paint_after.records_changed,
+            paint_before.records_changed + 1,
+            "a span-only color change must not rewrite sibling glyph records"
+        );
     });
 }
 

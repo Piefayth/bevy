@@ -234,6 +234,7 @@ fn upsert_edges(
                 camera,
                 main_entity: entity.into(),
                 z_order,
+                paint_order: 0,
                 clip,
                 image: AssetId::<Image>::default(),
                 transform,

@@ -144,6 +144,7 @@ pub(crate) fn extract_retained_backgrounds(
             camera,
             main_entity: entity.into(),
             z_order,
+            paint_order: 0,
             clip,
             image: bevy::asset::AssetId::<Image>::default(),
             transform,

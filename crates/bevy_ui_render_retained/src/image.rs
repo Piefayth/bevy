@@ -332,6 +332,7 @@ pub(crate) fn extract_retained_images(
                 camera,
                 main_entity: MainEntity::from(entity),
                 z_order: stack.0 as f32 + stack_z_offsets::IMAGE,
+                paint_order: 0,
                 clip,
                 image: image_asset,
                 transform,

@@ -29,7 +29,14 @@ pub(crate) enum PaintFamily {
     Background,
     Border,
     Image,
+    TextBackground,
+    TextShadow,
+    TextShadowDecoration,
+    TextSelection,
     Text,
+    TextDecoration,
+    TextPreedit,
+    TextCursor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -45,6 +52,7 @@ pub(crate) struct RetainedDraw {
     pub(crate) camera: Entity,
     pub(crate) main_entity: MainEntity,
     pub(crate) z_order: f32,
+    pub(crate) paint_order: u32,
     pub(crate) clip: Option<Rect>,
     pub(crate) image: AssetId<Image>,
     pub(crate) transform: Affine2,
@@ -124,6 +132,7 @@ enum NodeTypeFingerprint {
 struct RetainedCommonFingerprint {
     camera: Entity,
     z_order: FloatBits,
+    paint_order: u32,
     clip: Option<[FloatBits; 4]>,
     image: AssetId<Image>,
     resource: ResourceFingerprint,
@@ -219,6 +228,7 @@ impl RetainedRecord {
             common: RetainedCommonFingerprint {
                 camera: draw.camera,
                 z_order: FloatBits::new(draw.z_order),
+                paint_order: draw.paint_order,
                 clip,
                 image: draw.image,
                 resource,
@@ -475,6 +485,12 @@ pub(crate) fn replay_retained_ui(
                 .z_order
                 .total_cmp(&right.value.draw.z_order)
                 .then_with(|| left_id.family.cmp(&right_id.family))
+                .then_with(|| {
+                    left.value
+                        .draw
+                        .paint_order
+                        .cmp(&right.value.draw.paint_order)
+                })
                 .then_with(|| left_id.entity.cmp(&right_id.entity))
                 .then_with(|| left_id.ordinal.cmp(&right_id.ordinal))
         });
