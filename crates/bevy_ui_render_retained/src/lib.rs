@@ -18,6 +18,7 @@ mod damage;
 mod image;
 mod layer;
 mod paint;
+mod sampled_image;
 mod scene;
 mod text;
 

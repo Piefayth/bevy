@@ -287,7 +287,7 @@ The implementation uses these conceptual domains:
 | Placement | `UiTransform`, scroll offset | update spatial properties and affected descendant coverage |
 | Paint | colors, glyphs, borders, image selection | rebuild only affected paint records and repair their pixels |
 | Composite | retained-island transform or opacity | update compositor properties, no island repaint |
-| Resource | image/atlas/material/sampled-surface generation | repaint exact readers and their filter reach |
+| Resource | image/atlas/material/sampled-surface revision | repaint exact readers and their filter reach |
 
 For existing Bevy components, the intended semantics are:
 
@@ -309,7 +309,7 @@ input the renderer consumes:
 - transform, clip, and effect property references;
 - exact conservative physical-pixel coverage;
 - GPU allocation/batch ownership;
-- sampled resource IDs, generations, and read regions.
+- sampled resource IDs, exact content revisions, and read regions.
 
 Change notification only queues possible work. When a queued entity is
 extracted, its canonical new paint records are compared with the retained old
@@ -543,24 +543,38 @@ The current background dependency matrix is executable in `tests/gpu_ui.rs`:
 All canonical draw fields remain in the fingerprint, so these sources only
 nominate comparison. They do not decide damage.
 
-Image resource dependencies are exact and reverse-indexed. `Image` asset
-changes nominate only `ImageNode`s that sample that asset and add a content
-generation to their canonical record. `TextureAtlasLayout` changes nominate
-only nodes using that layout, then recompute the selected rectangle; changing
-an unselected atlas entry is therefore compared but causes zero damage. The
+Image and font-atlas resource dependencies use one exact reverse index. Each
+visible reader declares the image texels it can sample. An asset event compares
+those CPU-side bytes before nominating the reader, so equal writes or changes
+outside a selected `ImageNode` rectangle cause zero extraction, canonical
+comparison, or repair. Full-image readers keep one exact byte snapshot per
+shared sample rather than one copy per node. Transparent, invisible, empty,
+and built-in-transparent nodes do not subscribe; their own component changes
+re-establish dependencies if they become paintable.
+
+Rectangle precision has a proof boundary. Single-mip, two-dimensional,
+single-layer images with clamp-to-edge, non-comparison, non-anisotropic
+sampling track the selected rectangle plus one texel of nearest/linear filter
+reach. Clamped rectangles wholly outside the image still track the edge texel
+they actually sample. Repeating or mirrored addressing, mipmaps, array layers,
+anisotropy, and unsupported CPU pixel layouts conservatively track the whole
+image. This is a correctness fallback, not an admission heuristic.
+`TextureAtlasLayout` changes separately nominate only nodes using that layout,
+then canonical comparison decides whether the selected rectangle changed. The
 GPU suite proves quiet images match stock output, image tint changes rebuild
-underlying backgrounds, pixel-only asset modifications repaint exact readers,
-selected atlas changes repaint, and irrelevant atlas edits do not.
+underlying backgrounds, sampled pixel modifications repaint exact readers,
+unsampled and equal-byte modifications do no retained work, selected atlas
+changes repaint, and irrelevant atlas edits do not.
 
 Availability follows Bevy's render-asset lifecycle rather than main-world
 `Assets<Image>` membership. Removing a main-world asset does not unload its GPU
 copy while a strong handle remains, so it correctly causes no repaint. A
 never-available image is safely omitted and its old coverage erased. An added
-or modified image remains pending until `RenderAssets<GpuImage>` contains the
-new generation; while a byte-upload budget deliberately holds it back, the
-old retained pixels stay visible and the damage remains owed. Per-item batch
-components are cleared before preparation so readiness can never be satisfied
-by stale metadata from a previous frame.
+or relevantly modified image remains pending until `RenderAssets<GpuImage>`
+contains the new revision; while a byte-upload budget deliberately holds it
+back, the old retained pixels stay visible and the damage remains owed.
+Per-item batch components are cleared before preparation so readiness can never
+be satisfied by stale metadata from a previous frame.
 
 Solid borders and outlines retain four fixed edge records per visible family.
 This deliberately separates damage identity from GPU draw grouping. A first
@@ -587,16 +601,15 @@ glyphs without repainting its full layout box. Root colors and child
 `TextSpan` colors have separate nomination paths: a reverse section-to-root
 index makes a child-only color mutation rebuild the owning glyph run.
 
-Font-atlas invalidation is region-exact. Each retained run records the atlas
-cells it can sample, including the one-texel bilinear reach around each glyph,
-and stores exact pixel snapshots for those cells. An `Image` asset event first
-compares only these snapshots. Appending an unrelated glyph or changing any
-other unsampled atlas pixel therefore produces zero text candidates, canonical
+Font-atlas invalidation uses that same sampled-image index. Each retained run
+records the atlas cells it can sample, including the one-texel bilinear reach
+around each glyph. Appending an unrelated glyph or changing any other
+unsampled atlas pixel therefore produces zero text candidates, canonical
 changes, or repair work; changing a sampled pixel advances only its readers.
 Texture and sampler metadata that can alter sampling is compared separately,
 with debug labels and creation-only flags normalized away. Dependency updates
 are transactional so temporarily detaching a root during re-extraction cannot
-discard a just-observed atlas revision. GPU tests cover sampled and unsampled
+discard a just-observed revision. GPU tests cover sampled and unsampled
 mutations, span-only color changes, vacated glyphs, and delayed font-atlas
 uploads. A delayed upload keeps the old text visible and damage owed until the
 new `GpuImage` is actually ready.
@@ -683,7 +696,8 @@ readback even when the performance mechanism is opaque.
    culling.
 6. Add transform/clip/effect/scroll property separation and declared retained
    boundaries.
-7. Add exact sampled-surface/resource dependency generations.
+7. Propagate committed damage from retained offscreen surfaces to their exact
+   image readers.
 8. Gate or replace main-world layout, stack, and clipping work by dirty domain.
 9. Perform runtime-selectable on-device architecture sweeps and retain only
    mechanisms justified by measurements.

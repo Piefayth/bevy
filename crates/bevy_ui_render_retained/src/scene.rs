@@ -62,7 +62,6 @@ pub(crate) struct RetainedDraw {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResourceFingerprint {
     None,
-    Generation(u64),
     Revisions(Box<[u64]>),
 }
 

@@ -1,27 +1,24 @@
 //! Change-driven retained extraction for ordinary UI text glyphs.
 
+use crate::sampled_image::{ImageReader, ImageSample, RetainedSampledImages};
 use crate::scene::{
     coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
     RetainedGlyph, RetainedUiScene, RetainedUiSurfaces,
 };
 use bevy::{
-    asset::{AssetEvent, AssetId, Assets, RenderAssetUsages},
+    asset::{AssetId, Assets},
     camera::visibility::InheritedVisibility,
     color::{Alpha, LinearRgba},
     ecs::{
         entity::Entity,
         lifecycle::RemovedComponents,
-        message::MessageReader,
         query::{Changed, Has, Or, With},
         system::{Commands, Query, Res, ResMut, SystemParam},
     },
-    image::{Image, ImageSampler},
+    image::Image,
     input_focus::InputFocus,
-    math::{Affine2, Rect, UVec3, Vec2},
-    render::{
-        render_asset::RenderAssets, render_resource::TextureUsages, sync_world::MainEntity,
-        texture::GpuImage, Extract,
-    },
+    math::{Affine2, Rect, Vec2},
+    render::{render_resource::DefaultImageSamplerDescriptor, sync_world::MainEntity, Extract},
     sprite::BorderRect,
     text::{
         ComputedTextBlock, EditableText, PositionedGlyph, Strikethrough, StrikethroughColor,
@@ -39,43 +36,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Default)]
 struct TextRootDependencies {
     sections: HashSet<Entity>,
-    images: HashSet<AssetId<Image>>,
-    samples: HashSet<AtlasSample>,
     paints: HashSet<PaintId>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct AtlasSample {
-    image: AssetId<Image>,
-    min: [i64; 2],
-    max: [i64; 2],
-}
-
-impl AtlasSample {
-    fn new(image: AssetId<Image>, rect: Rect) -> Self {
-        Self {
-            image,
-            min: [
-                (rect.min.x.floor() as i64).saturating_sub(1),
-                (rect.min.y.floor() as i64).saturating_sub(1),
-            ],
-            max: [
-                (rect.max.x.ceil() as i64).saturating_add(1),
-                (rect.max.y.ceil() as i64).saturating_add(1),
-            ],
-        }
-    }
-}
-
-struct AtlasSampleState {
-    pixels: Option<Box<[u8]>>,
-    revision: u64,
-    readers: HashSet<Entity>,
-}
-
-struct AtlasMetadataState {
-    value: Option<Image>,
-    revision: u64,
 }
 
 struct GlyphRun {
@@ -84,7 +45,7 @@ struct GlyphRun {
     paint_order: u32,
     image: AssetId<Image>,
     glyphs: Vec<RetainedGlyph>,
-    samples: HashSet<AtlasSample>,
+    samples: HashSet<ImageSample>,
 }
 
 struct TextNodePaint {
@@ -103,7 +64,7 @@ fn push_glyph_run(
     paint_order: u32,
     image: AssetId<Image>,
     glyph: RetainedGlyph,
-    sample: AtlasSample,
+    sample: ImageSample,
 ) {
     if let Some(run) = runs.last_mut()
         && run.image == image
@@ -127,19 +88,12 @@ fn push_glyph_run(
 pub(crate) struct RetainedTextDependencies {
     roots: HashMap<Entity, TextRootDependencies>,
     section_roots: HashMap<Entity, HashSet<Entity>>,
-    image_readers: HashMap<AssetId<Image>, HashSet<Entity>>,
-    image_metadata: HashMap<AssetId<Image>, AtlasMetadataState>,
-    samples: HashMap<AtlasSample, AtlasSampleState>,
-    pending_images: HashSet<AssetId<Image>>,
-    next_revision: u64,
     focused: Option<Entity>,
 }
 
 impl RetainedTextDependencies {
     fn remove_root(&mut self, root: Entity) -> HashSet<PaintId> {
-        let paints = self.detach_root(root);
-        self.prune_unused();
-        paints
+        self.detach_root(root)
     }
 
     fn detach_root(&mut self, root: Entity) -> HashSet<PaintId> {
@@ -149,33 +103,14 @@ impl RetainedTextDependencies {
         for section in old.sections {
             remove_reader(&mut self.section_roots, section, root);
         }
-        for image in old.images {
-            remove_reader(&mut self.image_readers, image, root);
-        }
-        for sample in old.samples {
-            if let Some(state) = self.samples.get_mut(&sample) {
-                state.readers.remove(&root);
-            }
-        }
         old.paints
-    }
-
-    fn prune_unused(&mut self) {
-        self.image_metadata
-            .retain(|image, _| self.image_readers.contains_key(image));
-        self.pending_images
-            .retain(|image| self.image_readers.contains_key(image));
-        self.samples.retain(|_, state| !state.readers.is_empty());
     }
 
     fn set_root(
         &mut self,
         root: Entity,
         sections: impl IntoIterator<Item = Entity>,
-        images: impl IntoIterator<Item = AssetId<Image>>,
-        samples: impl IntoIterator<Item = AtlasSample>,
         paints: HashSet<PaintId>,
-        assets: &Assets<Image>,
     ) -> HashSet<PaintId> {
         let old_paints = self.detach_root(root);
         let mut dependencies = TextRootDependencies {
@@ -187,189 +122,9 @@ impl RetainedTextDependencies {
                 self.section_roots.entry(section).or_default().insert(root);
             }
         }
-        for image in images {
-            if dependencies.images.insert(image) {
-                self.image_readers.entry(image).or_default().insert(root);
-                self.image_metadata
-                    .entry(image)
-                    .or_insert_with(|| AtlasMetadataState {
-                        value: assets.get(image).map(image_metadata),
-                        revision: 0,
-                    });
-            }
-        }
-        for sample in samples {
-            if dependencies.samples.insert(sample) {
-                self.samples
-                    .entry(sample)
-                    .or_insert_with(|| AtlasSampleState {
-                        pixels: assets
-                            .get(sample.image)
-                            .and_then(|image| sample_pixels(image, sample)),
-                        revision: 0,
-                        readers: HashSet::default(),
-                    })
-                    .readers
-                    .insert(root);
-            }
-        }
         self.roots.insert(root, dependencies);
-        self.prune_unused();
         old_paints
     }
-
-    fn image_changed(
-        &mut self,
-        image: AssetId<Image>,
-        asset: Option<&Image>,
-        pending: bool,
-        candidates: &mut HashSet<Entity>,
-    ) {
-        let Some(readers) = self.image_readers.get(&image).cloned() else {
-            return;
-        };
-        let mut relevant_change = false;
-        let metadata = asset.map(image_metadata);
-        let metadata_changed = self
-            .image_metadata
-            .get(&image)
-            .is_none_or(|old| metadata.is_none() || old.value != metadata);
-        if metadata_changed {
-            relevant_change = true;
-            let revision = self.new_revision();
-            self.image_metadata.insert(
-                image,
-                AtlasMetadataState {
-                    value: metadata,
-                    revision,
-                },
-            );
-            candidates.extend(&readers);
-        }
-
-        let samples: Vec<_> = self
-            .samples
-            .keys()
-            .filter(|sample| sample.image == image)
-            .copied()
-            .collect();
-        for sample in samples {
-            let changed = self
-                .samples
-                .get(&sample)
-                .is_some_and(|old| match (&old.pixels, asset) {
-                    (Some(old), Some(image)) => {
-                        !sample_matches(image, sample, old).unwrap_or(false)
-                    }
-                    _ => true,
-                });
-            if changed {
-                let pixels = asset.and_then(|image| sample_pixels(image, sample));
-                relevant_change = true;
-                let revision = self.new_revision();
-                let state = self.samples.get_mut(&sample).unwrap();
-                state.pixels = pixels;
-                state.revision = revision;
-                candidates.extend(&state.readers);
-            }
-        }
-        if pending && relevant_change {
-            self.pending_images.insert(image);
-        } else if !pending {
-            self.pending_images.remove(&image);
-        }
-    }
-
-    fn revisions(
-        &self,
-        image: AssetId<Image>,
-        samples: impl IntoIterator<Item = AtlasSample>,
-    ) -> Box<[u64]> {
-        let mut samples: Vec<_> = samples.into_iter().collect();
-        samples.sort_unstable();
-        core::iter::once(
-            self.image_metadata
-                .get(&image)
-                .map_or(0, |state| state.revision),
-        )
-        .chain(
-            samples
-                .into_iter()
-                .map(|sample| self.samples.get(&sample).map_or(0, |state| state.revision)),
-        )
-        .collect()
-    }
-
-    fn new_revision(&mut self) -> u64 {
-        self.next_revision = self
-            .next_revision
-            .checked_add(1)
-            .expect("retained text atlas revision exhausted");
-        self.next_revision
-    }
-
-    pub(crate) fn is_pending(&self, image: AssetId<Image>) -> bool {
-        self.pending_images.contains(&image)
-    }
-}
-
-fn image_metadata(image: &Image) -> Image {
-    let mut metadata = Image {
-        data: None,
-        data_order: image.data_order,
-        texture_descriptor: image.texture_descriptor.clone(),
-        sampler: image.sampler.clone(),
-        texture_view_descriptor: image.texture_view_descriptor.clone(),
-        asset_usage: image.asset_usage & RenderAssetUsages::RENDER_WORLD,
-        copy_on_resize: false,
-    };
-    metadata.texture_descriptor.label = None;
-    metadata.texture_descriptor.usage = TextureUsages::empty();
-    if let ImageSampler::Descriptor(sampler) = &mut metadata.sampler {
-        sampler.label = None;
-    }
-    if let Some(view) = &mut metadata.texture_view_descriptor {
-        view.label = None;
-        view.usage = None;
-    }
-    metadata
-}
-
-fn sample_pixels(image: &Image, sample: AtlasSample) -> Option<Box<[u8]>> {
-    let [min_x, min_y, max_x, max_y] = sample_bounds(image, sample);
-    let mut pixels = Vec::new();
-    for y in min_y..max_y {
-        for x in min_x..max_x {
-            pixels.extend_from_slice(image.pixel_bytes(UVec3::new(x, y, 0)).ok()?);
-        }
-    }
-    Some(pixels.into_boxed_slice())
-}
-
-fn sample_matches(image: &Image, sample: AtlasSample, old: &[u8]) -> Option<bool> {
-    let [min_x, min_y, max_x, max_y] = sample_bounds(image, sample);
-    let mut offset = 0;
-    for y in min_y..max_y {
-        for x in min_x..max_x {
-            let pixel = image.pixel_bytes(UVec3::new(x, y, 0)).ok()?;
-            let end = offset + pixel.len();
-            if old.get(offset..end) != Some(pixel) {
-                return Some(false);
-            }
-            offset = end;
-        }
-    }
-    Some(offset == old.len())
-}
-
-fn sample_bounds(image: &Image, sample: AtlasSample) -> [u32; 4] {
-    let size = image.texture_descriptor.size;
-    [
-        sample.min[0].clamp(0, i64::from(size.width)) as u32,
-        sample.min[1].clamp(0, i64::from(size.height)) as u32,
-        sample.max[0].clamp(0, i64::from(size.width)) as u32,
-        sample.max[1].clamp(0, i64::from(size.height)) as u32,
-    ]
 }
 
 fn remove_reader<K: Eq + core::hash::Hash + Copy>(
@@ -436,8 +191,9 @@ pub(crate) fn extract_retained_text(
     mut commands: Commands,
     state: Res<RetainedUiScene>,
     mut dependencies: ResMut<RetainedTextDependencies>,
+    mut sampled_images: ResMut<RetainedSampledImages>,
+    default_sampler: Res<DefaultImageSamplerDescriptor>,
     images: Extract<Res<Assets<Image>>>,
-    mut image_events: Extract<MessageReader<AssetEvent<Image>>>,
     changed: Extract<
         Query<
             TextQueryItem<'static>,
@@ -492,6 +248,7 @@ pub(crate) fn extract_retained_text(
     mut removed: Extract<RemovedTextInputs>,
 ) {
     let mut candidates: HashSet<_> = changed.iter().map(|item| item.0).collect();
+    candidates.extend(sampled_images.take_text());
     let focused = input_focus.as_ref().and_then(|focus| focus.get());
     if dependencies.focused != focused {
         candidates.extend(dependencies.focused);
@@ -503,18 +260,6 @@ pub(crate) fn extract_retained_text(
             candidates.extend(roots);
         }
     }
-    for event in image_events.read() {
-        match *event {
-            AssetEvent::Added { id } | AssetEvent::Modified { id } => {
-                dependencies.image_changed(id, images.get(id), true, &mut candidates);
-            }
-            AssetEvent::Unused { id } => {
-                dependencies.image_changed(id, images.get(id), false, &mut candidates);
-            }
-            AssetEvent::Removed { .. } | AssetEvent::LoadedWithDependencies { .. } => {}
-        }
-    }
-
     let RemovedTextInputs {
         text,
         editable,
@@ -563,7 +308,13 @@ pub(crate) fn extract_retained_text(
         .chain(visibility.read())
         .chain(camera.read())
     {
-        remove_text_root(&mut dependencies, &mut surfaces, &mut commands, root);
+        remove_text_root(
+            &mut dependencies,
+            &mut sampled_images,
+            &mut surfaces,
+            &mut commands,
+            root,
+        );
     }
     candidates.extend(clip.read());
     candidates.extend(scroll.read());
@@ -590,7 +341,13 @@ pub(crate) fn extract_retained_text(
             editable,
         )) = all.get(root)
         else {
-            remove_text_root(&mut dependencies, &mut surfaces, &mut commands, root);
+            remove_text_root(
+                &mut dependencies,
+                &mut sampled_images,
+                &mut surfaces,
+                &mut commands,
+                root,
+            );
             continue;
         };
 
@@ -678,7 +435,7 @@ pub(crate) fn extract_retained_text(
                 ordinal
             };
             let paint_order = u32::try_from(glyph_index).expect("text glyph count exceeds u32");
-            let sample = AtlasSample::new(atlas_info.texture, atlas_info.rect);
+            let sample = ImageSample::rect(atlas_info.texture, atlas_info.rect);
             if !glyph_color.is_fully_transparent() {
                 push_glyph_run(
                     &mut runs,
@@ -898,18 +655,16 @@ pub(crate) fn extract_retained_text(
                 .entities()
                 .iter()
                 .map(|section| section.entity),
-            image_ids.iter().copied(),
-            atlas_samples,
             paint_ids.clone(),
+        );
+        sampled_images.replace_reader(
+            ImageReader::Text(root),
+            atlas_samples,
             &images,
+            &default_sampler,
         );
         for &image in &image_ids {
-            if images
-                .get(image)
-                .is_some_and(|asset| asset.asset_usage.contains(RenderAssetUsages::RENDER_WORLD))
-            {
-                dependencies.pending_images.insert(image);
-            }
+            sampled_images.mark_pending(image, images.get(image));
         }
 
         for id in old_paints {
@@ -928,7 +683,7 @@ pub(crate) fn extract_retained_text(
             upsert_glyph_runs(
                 &mut surfaces,
                 &mut commands,
-                &dependencies,
+                &sampled_images,
                 root,
                 camera,
                 stack.0 as f32 + stack_z_offsets::TEXT,
@@ -941,7 +696,7 @@ pub(crate) fn extract_retained_text(
         upsert_glyph_runs(
             &mut surfaces,
             &mut commands,
-            &dependencies,
+            &sampled_images,
             root,
             camera,
             stack.0 as f32 + stack_z_offsets::TEXT,
@@ -1012,7 +767,7 @@ fn decoration_ordinal(run: u32, kind: u32) -> u32 {
 fn upsert_glyph_runs(
     surfaces: &mut RetainedUiSurfaces,
     commands: &mut Commands,
-    dependencies: &RetainedTextDependencies,
+    sampled_images: &RetainedSampledImages,
     root: Entity,
     camera: Entity,
     z_order: f32,
@@ -1034,7 +789,7 @@ fn upsert_glyph_runs(
                 )
             })
             .collect();
-        let revisions = dependencies.revisions(run.image, run.samples);
+        let revisions = sampled_images.revisions(run.image, run.samples);
         surfaces.upsert(
             commands,
             id,
@@ -1058,10 +813,12 @@ fn upsert_glyph_runs(
 
 fn remove_text_root(
     dependencies: &mut RetainedTextDependencies,
+    sampled_images: &mut RetainedSampledImages,
     surfaces: &mut RetainedUiSurfaces,
     commands: &mut Commands,
     root: Entity,
 ) {
+    sampled_images.remove_reader(ImageReader::Text(root));
     for id in dependencies.remove_root(root) {
         surfaces.remove(commands, id);
     }
@@ -1073,15 +830,4 @@ fn glyph_run_id(run: &GlyphRun, family: PaintFamily) -> PaintId {
         family,
         ordinal: run.section_ordinal,
     }
-}
-
-pub(crate) fn resolve_ready_text_atlases(
-    mut dependencies: ResMut<RetainedTextDependencies>,
-    gpu_images: Res<RenderAssets<GpuImage>>,
-) {
-    let mut pending = core::mem::take(&mut dependencies.pending_images);
-    pending.retain(|image| {
-        dependencies.image_readers.contains_key(image) && gpu_images.get(*image).is_none()
-    });
-    dependencies.pending_images = pending;
 }

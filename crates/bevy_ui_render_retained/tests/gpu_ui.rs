@@ -302,6 +302,42 @@ fn add_solid_image(world: &mut World, color: [u8; 4]) -> Handle<Image> {
     ))
 }
 
+fn add_color_strip(world: &mut World) -> Handle<Image> {
+    world.resource_mut::<Assets<Image>>().add(Image::new_fill(
+        Extent3d {
+            width: 8,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[
+            220, 45, 28, 255, 20, 190, 80, 255, 30, 70, 210, 255, 190, 150, 20, 255, 80, 30, 160,
+            255, 15, 175, 210, 255, 210, 60, 150, 255, 100, 120, 140, 255,
+        ],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    ))
+}
+
+fn spawn_sampled_strip(world: &mut World, camera: Entity) -> Handle<Image> {
+    let image = add_color_strip(world);
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(8),
+            top: px(9),
+            width: px(20),
+            height: px(10),
+            ..default()
+        },
+        ImageNode::new(image.clone())
+            .with_rect(Rect::from_corners(Vec2::new(1.0, 0.0), Vec2::new(3.0, 1.0)))
+            .with_mode(NodeImageMode::Stretch),
+        UiTargetCamera(camera),
+    ));
+    image
+}
+
 fn spawn_image_leaf(
     world: &mut World,
     camera: Entity,
@@ -1393,6 +1429,130 @@ fn modified_image_asset_repairs_only_its_readers() {
             &output.pixels[center..center + BYTES_PER_PIXEL],
             &[20, 80, 210, 255]
         );
+    });
+}
+
+#[test]
+fn unsampled_image_pixel_change_does_no_retained_work() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            spawn_sampled_strip,
+            |world, image| {
+                world
+                    .resource_mut::<Assets<Image>>()
+                    .get_mut(&image)
+                    .unwrap()
+                    .pixel_bytes_mut(UVec3::new(7, 0, 0))
+                    .unwrap()[0] ^= 0xff;
+            },
+        );
+
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.repair_pixels, before.repair_pixels);
+        assert_eq!(after.items_replayed, before.items_replayed);
+        assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
+    });
+}
+
+#[test]
+fn sampled_image_pixel_change_repairs_its_node() {
+    with_gpu_lock(|| {
+        let mutate = |world: &mut World, image: Handle<Image>| {
+            world
+                .resource_mut::<Assets<Image>>()
+                .get_mut(&image)
+                .unwrap()
+                .pixel_bytes_mut(UVec3::new(2, 0, 0))
+                .unwrap()
+                .copy_from_slice(&[245, 210, 35, 255]);
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            spawn_sampled_strip,
+            mutate,
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            spawn_sampled_strip,
+            mutate,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 200);
+        let paint_before = retained.paint_before_mutation.unwrap();
+        let paint_after = retained.paint_after_mutation.unwrap();
+        assert_eq!(
+            paint_after.records_changed,
+            paint_before.records_changed + 1
+        );
+    });
+}
+
+#[test]
+fn equal_image_asset_write_does_not_repaint() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let image = add_solid_image(world, [180, 25, 70, 255]);
+                spawn_image_leaf(world, camera, image.clone(), Color::WHITE);
+                image
+            },
+            |world, image| {
+                let mut images = world.resource_mut::<Assets<Image>>();
+                let data = images.get(&image).unwrap().data.clone();
+                images.get_mut(&image).unwrap().data = data;
+            },
+        );
+
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.repair_pixels, before.repair_pixels);
+        assert_eq!(after.items_replayed, before.items_replayed);
+        assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
+    });
+}
+
+#[test]
+fn transparent_image_does_not_subscribe_to_asset_changes() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let image = add_solid_image(world, [180, 25, 70, 255]);
+                spawn_image_leaf(world, camera, image.clone(), Color::NONE);
+                image
+            },
+            |world, image| {
+                world
+                    .resource_mut::<Assets<Image>>()
+                    .get_mut(&image)
+                    .unwrap()
+                    .data
+                    .as_mut()
+                    .unwrap()
+                    .copy_from_slice(&[20, 80, 210, 255]);
+            },
+        );
+
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.repair_pixels, before.repair_pixels);
+        assert_eq!(after.items_replayed, before.items_replayed);
+        assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
     });
 }
 

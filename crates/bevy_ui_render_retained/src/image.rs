@@ -1,11 +1,12 @@
 //! Change-driven retained extraction for ordinary UI images.
 
+use crate::sampled_image::{ImageReader, ImageSample, RetainedSampledImages};
 use crate::scene::{
     coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
     RetainedNodeItem, RetainedUiScene,
 };
 use bevy::{
-    asset::{AssetEvent, AssetId, Assets, RenderAssetUsages},
+    asset::{AssetEvent, AssetId, Assets},
     camera::visibility::InheritedVisibility,
     color::Alpha,
     ecs::{
@@ -17,7 +18,7 @@ use bevy::{
     },
     image::{Image, TextureAtlasLayout, TRANSPARENT_IMAGE_HANDLE},
     math::{Affine2, Rect, Vec2},
-    render::{render_asset::RenderAssets, sync_world::MainEntity, texture::GpuImage, Extract},
+    render::{render_resource::DefaultImageSamplerDescriptor, sync_world::MainEntity, Extract},
     sprite::BorderRect,
     ui::{
         widget::{ImageNode, ImageNodeSize, NodeImageMode},
@@ -30,18 +31,13 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy)]
 struct ImageDependencies {
-    image: AssetId<Image>,
     atlas: Option<AssetId<TextureAtlasLayout>>,
 }
 
 #[derive(bevy::prelude::Resource, Default)]
 pub(crate) struct RetainedImageDependencies {
     entities: HashMap<Entity, ImageDependencies>,
-    image_readers: HashMap<AssetId<Image>, HashSet<Entity>>,
     atlas_readers: HashMap<AssetId<TextureAtlasLayout>, HashSet<Entity>>,
-    image_generations: HashMap<AssetId<Image>, u64>,
-    pending_images: HashSet<AssetId<Image>>,
-    next_generation: u64,
 }
 
 impl RetainedImageDependencies {
@@ -49,7 +45,6 @@ impl RetainedImageDependencies {
         let Some(old) = self.entities.remove(&entity) else {
             return;
         };
-        remove_reader(&mut self.image_readers, old.image, entity);
         if let Some(atlas) = old.atlas {
             remove_reader(&mut self.atlas_readers, atlas, entity);
         }
@@ -58,39 +53,9 @@ impl RetainedImageDependencies {
     fn set_entity(&mut self, entity: Entity, dependencies: ImageDependencies) {
         self.remove_entity(entity);
         self.entities.insert(entity, dependencies);
-        self.image_readers
-            .entry(dependencies.image)
-            .or_default()
-            .insert(entity);
         if let Some(atlas) = dependencies.atlas {
             self.atlas_readers.entry(atlas).or_default().insert(entity);
         }
-    }
-
-    fn image_changed(
-        &mut self,
-        id: AssetId<Image>,
-        pending: bool,
-        candidates: &mut HashSet<Entity>,
-    ) {
-        let Some(readers) = self.image_readers.get(&id) else {
-            return;
-        };
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .expect("retained image generation exhausted");
-        self.image_generations.insert(id, self.next_generation);
-        if pending {
-            self.pending_images.insert(id);
-        } else {
-            self.pending_images.remove(&id);
-        }
-        candidates.extend(readers);
-    }
-
-    pub(crate) fn is_pending(&self, id: AssetId<Image>) -> bool {
-        self.pending_images.contains(&id)
     }
 
     fn atlas_changed(&self, id: AssetId<TextureAtlasLayout>, candidates: &mut HashSet<Entity>) {
@@ -147,9 +112,10 @@ pub(crate) fn extract_retained_images(
     mut commands: Commands,
     state: Res<RetainedUiScene>,
     mut dependencies: ResMut<RetainedImageDependencies>,
+    mut sampled_images: ResMut<RetainedSampledImages>,
+    default_sampler: Res<DefaultImageSamplerDescriptor>,
     images: Extract<Res<Assets<Image>>>,
     texture_atlases: Extract<Res<Assets<TextureAtlasLayout>>>,
-    mut image_events: Extract<MessageReader<AssetEvent<Image>>>,
     mut atlas_events: Extract<MessageReader<AssetEvent<TextureAtlasLayout>>>,
     changed: Extract<
         Query<
@@ -176,17 +142,7 @@ pub(crate) fn extract_retained_images(
     mut removed: Extract<RemovedImageInputs>,
 ) {
     let mut candidates: HashSet<_> = changed.iter().map(|item| item.0).collect();
-    for event in image_events.read() {
-        match *event {
-            AssetEvent::Added { id } | AssetEvent::Modified { id } => {
-                dependencies.image_changed(id, true, &mut candidates);
-            }
-            AssetEvent::Unused { id } => {
-                dependencies.image_changed(id, false, &mut candidates);
-            }
-            AssetEvent::Removed { .. } | AssetEvent::LoadedWithDependencies { .. } => {}
-        }
-    }
+    candidates.extend(sampled_images.take_nodes());
     for event in atlas_events.read() {
         let id = match *event {
             AssetEvent::Added { id } | AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
@@ -220,6 +176,7 @@ pub(crate) fn extract_retained_images(
         .chain(camera.read())
     {
         dependencies.remove_entity(entity);
+        sampled_images.remove_reader(ImageReader::Node(entity));
         surfaces.remove(&mut commands, image_id(entity));
     }
     candidates.extend(clip.read());
@@ -239,34 +196,23 @@ pub(crate) fn extract_retained_images(
         )) = all.get(entity)
         else {
             dependencies.remove_entity(entity);
+            sampled_images.remove_reader(ImageReader::Node(entity));
             surfaces.remove(&mut commands, image_id(entity));
             continue;
         };
 
         if image.image_mode.uses_slices() {
             dependencies.remove_entity(entity);
+            sampled_images.remove_reader(ImageReader::Node(entity));
             surfaces.remove(&mut commands, image_id(entity));
             continue;
         }
 
         let image_asset = image.image.id();
         let atlas_asset = image.texture_atlas.as_ref().map(|atlas| atlas.layout.id());
-        dependencies.set_entity(
-            entity,
-            ImageDependencies {
-                image: image_asset,
-                atlas: atlas_asset,
-            },
-        );
-        if let Some(asset) = images.get(image_asset) {
-            if asset.asset_usage.contains(RenderAssetUsages::RENDER_WORLD) {
-                dependencies.pending_images.insert(image_asset);
-            } else {
-                dependencies.pending_images.remove(&image_asset);
-            }
-        }
-
         let Some(camera) = camera_mapper.map(target_camera) else {
+            dependencies.remove_entity(entity);
+            sampled_images.remove_reader(ImageReader::Node(entity));
             surfaces.remove(&mut commands, image_id(entity));
             continue;
         };
@@ -290,20 +236,21 @@ pub(crate) fn extract_retained_images(
             .as_ref()
             .and_then(|atlas| atlas.texture_rect(&texture_atlases))
             .map(|rect| rect.as_rect());
-        let mut rect = match (atlas_rect, image.rect) {
-            (None, None) => Rect {
-                min: Vec2::ZERO,
-                max: size,
-            },
-            (None, Some(image_rect)) => image_rect,
-            (Some(atlas_rect), None) => atlas_rect,
+        let source_rect = match (atlas_rect, image.rect) {
+            (None, None) => None,
+            (None, Some(image_rect)) => Some(image_rect),
+            (Some(atlas_rect), None) => Some(atlas_rect),
             (Some(atlas_rect), Some(mut image_rect)) => {
                 image_rect.min += atlas_rect.min;
                 image_rect.max += atlas_rect.min;
-                image_rect
+                Some(image_rect)
             }
         };
-        let atlas_scaling = if atlas_rect.is_some() || image.rect.is_some() {
+        let mut rect = source_rect.unwrap_or(Rect {
+            min: Vec2::ZERO,
+            max: size,
+        });
+        let atlas_scaling = if source_rect.is_some() {
             let scaling = size / rect.size();
             rect.min *= scaling;
             rect.max *= scaling;
@@ -311,6 +258,10 @@ pub(crate) fn extract_retained_images(
         } else {
             None
         };
+        let sample = source_rect.map_or_else(
+            || ImageSample::all(image_asset),
+            |rect| ImageSample::rect(image_asset, rect),
+        );
         let transform = transform.affine() * Affine2::from_translation(visual_box.center());
         let clip = clip.map(|clip| clip.clip);
         let painted = visibility.get()
@@ -318,11 +269,21 @@ pub(crate) fn extract_retained_images(
             && image_asset != TRANSPARENT_IMAGE_HANDLE.id()
             && !node.is_empty()
             && !visual_box.size().cmple(Vec2::ZERO).any();
-        let image_generation = dependencies
-            .image_generations
-            .get(&image_asset)
-            .copied()
-            .unwrap_or_default();
+        let resources = if painted {
+            dependencies.set_entity(entity, ImageDependencies { atlas: atlas_asset });
+            sampled_images.replace_reader(
+                ImageReader::Node(entity),
+                [sample],
+                &images,
+                &default_sampler,
+            );
+            sampled_images.mark_pending(image_asset, images.get(image_asset));
+            ResourceFingerprint::Revisions(sampled_images.revisions(image_asset, [sample]))
+        } else {
+            dependencies.remove_entity(entity);
+            sampled_images.remove_reader(ImageReader::Node(entity));
+            ResourceFingerprint::None
+        };
         surfaces.upsert(
             &mut commands,
             image_id(entity),
@@ -347,7 +308,7 @@ pub(crate) fn extract_retained_images(
                     node_type: NodeType::Rect,
                 }),
             },
-            ResourceFingerprint::Generation(image_generation),
+            resources,
             painted
                 .then(|| coverage(size, transform, clip))
                 .flatten()
@@ -363,15 +324,4 @@ fn image_id(entity: Entity) -> PaintId {
         family: PaintFamily::Image,
         ordinal: 0,
     }
-}
-
-pub(crate) fn resolve_ready_images(
-    mut dependencies: ResMut<RetainedImageDependencies>,
-    gpu_images: Res<RenderAssets<GpuImage>>,
-) {
-    let mut pending = core::mem::take(&mut dependencies.pending_images);
-    pending.retain(|image| {
-        dependencies.image_readers.contains_key(image) && gpu_images.get(*image).is_none()
-    });
-    dependencies.pending_images = pending;
 }
