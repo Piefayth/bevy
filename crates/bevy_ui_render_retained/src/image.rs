@@ -3,7 +3,7 @@
 use crate::sampled_image::{ImageReader, ImageSample, RetainedSampledImages};
 use crate::scene::{
     coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
-    RetainedNodeItem, RetainedUiScene,
+    RetainedNodeItem, RetainedTextureSliceItem, RetainedUiScene,
 };
 use bevy::{
     asset::{AssetEvent, AssetId, Assets},
@@ -19,7 +19,7 @@ use bevy::{
     image::{Image, TextureAtlasLayout, TRANSPARENT_IMAGE_HANDLE},
     math::{Affine2, Rect, Vec2},
     render::{render_resource::DefaultImageSamplerDescriptor, sync_world::MainEntity, Extract},
-    sprite::BorderRect,
+    sprite::{BorderRect, SpriteImageMode},
     ui::{
         widget::{ImageNode, ImageNodeSize, NodeImageMode},
         CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
@@ -201,13 +201,6 @@ pub(crate) fn extract_retained_images(
             continue;
         };
 
-        if image.image_mode.uses_slices() {
-            dependencies.remove_entity(entity);
-            sampled_images.remove_reader(ImageReader::Node(entity));
-            surfaces.remove(&mut commands, image_id(entity));
-            continue;
-        }
-
         let image_asset = image.image.id();
         let atlas_asset = image.texture_atlas.as_ref().map(|atlas| atlas.layout.id());
         let Some(camera) = camera_mapper.map(target_camera) else {
@@ -246,17 +239,67 @@ pub(crate) fn extract_retained_images(
                 Some(image_rect)
             }
         };
-        let mut rect = source_rect.unwrap_or(Rect {
-            min: Vec2::ZERO,
-            max: size,
-        });
-        let atlas_scaling = if source_rect.is_some() {
-            let scaling = size / rect.size();
-            rect.min *= scaling;
-            rect.max *= scaling;
-            Some(scaling)
-        } else {
-            None
+        let item = match &image.image_mode {
+            NodeImageMode::Sliced(slicer) => {
+                RetainedDrawItem::TextureSlice(RetainedTextureSliceItem {
+                    stack_index: stack.0,
+                    rect: Rect {
+                        min: Vec2::ZERO,
+                        max: size,
+                    },
+                    atlas_rect: source_rect,
+                    color: image.color.into(),
+                    image_scale_mode: SpriteImageMode::Sliced(slicer.clone()),
+                    flip_x: image.flip_x,
+                    flip_y: image.flip_y,
+                    inverse_scale_factor: node.inverse_scale_factor,
+                })
+            }
+            NodeImageMode::Tiled {
+                tile_x,
+                tile_y,
+                stretch_value,
+            } => RetainedDrawItem::TextureSlice(RetainedTextureSliceItem {
+                stack_index: stack.0,
+                rect: Rect {
+                    min: Vec2::ZERO,
+                    max: size,
+                },
+                atlas_rect: source_rect,
+                color: image.color.into(),
+                image_scale_mode: SpriteImageMode::Tiled {
+                    tile_x: *tile_x,
+                    tile_y: *tile_y,
+                    stretch_value: *stretch_value,
+                },
+                flip_x: image.flip_x,
+                flip_y: image.flip_y,
+                inverse_scale_factor: node.inverse_scale_factor,
+            }),
+            NodeImageMode::Auto | NodeImageMode::Stretch => {
+                let mut rect = source_rect.unwrap_or(Rect {
+                    min: Vec2::ZERO,
+                    max: size,
+                });
+                let atlas_scaling = if source_rect.is_some() {
+                    let scaling = size / rect.size();
+                    rect.min *= scaling;
+                    rect.max *= scaling;
+                    Some(scaling)
+                } else {
+                    None
+                };
+                RetainedDrawItem::Node(RetainedNodeItem {
+                    color: image.color.into(),
+                    rect,
+                    atlas_scaling,
+                    flip_x: image.flip_x,
+                    flip_y: image.flip_y,
+                    border: BorderRect::ZERO,
+                    border_radius: node.border_radius,
+                    node_type: NodeType::Rect,
+                })
+            }
         };
         let sample = source_rect.map_or_else(
             || ImageSample::all(image_asset),
@@ -297,16 +340,7 @@ pub(crate) fn extract_retained_images(
                 clip,
                 image: image_asset,
                 transform,
-                item: RetainedDrawItem::Node(RetainedNodeItem {
-                    color: image.color.into(),
-                    rect,
-                    atlas_scaling,
-                    flip_x: image.flip_x,
-                    flip_y: image.flip_y,
-                    border: BorderRect::ZERO,
-                    border_radius: node.border_radius,
-                    node_type: NodeType::Rect,
-                }),
+                item,
             },
             resources,
             painted

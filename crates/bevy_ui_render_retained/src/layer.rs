@@ -19,6 +19,7 @@ use bevy::{
         upscaling::upscaling, Core2d, Core2dSystems, Core3d, Core3dSystems, FullscreenShader,
     },
     ecs::{
+        entity::Entity,
         query::With,
         schedule::IntoScheduleConfigs,
         system::{Commands, Query, Res, ResMut},
@@ -29,7 +30,9 @@ use bevy::{
     render::{
         camera::ExtractedCamera,
         render_asset::RenderAssets,
-        render_phase::{DrawFunctions, PhaseItem, PhaseItemExtraIndex, ViewSortedRenderPhases},
+        render_phase::{
+            DrawFunctionId, DrawFunctions, PhaseItem, PhaseItemExtraIndex, ViewSortedRenderPhases,
+        },
         render_resource::{
             binding_types::texture_2d, BindGroup, BindGroupEntries, BindGroupLayoutDescriptor,
             BindGroupLayoutEntries, CachedRenderPipelineId, ColorTargetState, ColorWrites,
@@ -45,6 +48,10 @@ use bevy::{
         ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
     },
     ui_render::{
+        ui_texture_slice_pipeline::{
+            queue_ui_slice_items, DrawUiTextureSliceItem, UiTextureSlicerBatch,
+            UiTextureSlicerInfrastructurePlugin,
+        },
         DrawUiItem, ExtractedUiNodes, RenderUiSystems, TransparentUi, UiAntiAlias, UiCameraView,
         UiItemBatch, UiPipeline, UiPipelineKey, UiViewTarget,
     },
@@ -64,6 +71,7 @@ pub struct RetainedUiRenderPlugin;
 
 impl Plugin for RetainedUiRenderPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(UiTextureSlicerInfrastructurePlugin);
         embedded_asset!(app, "composite.wgsl");
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -116,6 +124,7 @@ impl Plugin for RetainedUiRenderPlugin {
                 resolve_ready_sampled_images.in_set(RenderSystems::PrepareResources),
             )
             .add_systems(Render, queue_retained_uinodes.in_set(RenderSystems::Queue))
+            .add_systems(Render, queue_ui_slice_items.in_set(RenderSystems::Queue))
             .add_systems(RenderStartup, init_composite_pipeline)
             .add_systems(
                 Core2d,
@@ -187,6 +196,8 @@ pub struct RetainedUiLayerWork {
     pub repair_pixels: u64,
     /// Individual paint items replayed across all repair regions.
     pub items_replayed: u64,
+    /// Prepared quads submitted across all replayed paint items.
+    pub quads_replayed: u64,
     /// Layer composites encoded over world output.
     pub composites: u64,
     /// Scissored texture draws issued by layer composites.
@@ -202,6 +213,7 @@ pub struct RetainedUiLayerCounters {
     repairs: AtomicU64,
     repair_pixels: AtomicU64,
     items_replayed: AtomicU64,
+    quads_replayed: AtomicU64,
     composites: AtomicU64,
     composite_draws: AtomicU64,
     composite_pixels: AtomicU64,
@@ -215,6 +227,7 @@ impl RetainedUiLayerCounters {
             repairs: self.repairs.load(Ordering::Relaxed),
             repair_pixels: self.repair_pixels.load(Ordering::Relaxed),
             items_replayed: self.items_replayed.load(Ordering::Relaxed),
+            quads_replayed: self.quads_replayed.load(Ordering::Relaxed),
             composites: self.composites.load(Ordering::Relaxed),
             composite_draws: self.composite_draws.load(Ordering::Relaxed),
             composite_pixels: self.composite_pixels.load(Ordering::Relaxed),
@@ -433,6 +446,7 @@ fn phase_is_ready(
     phase: &bevy::render::render_phase::SortedRenderPhase<TransparentUi>,
     pipeline_cache: &PipelineCache,
     world: &World,
+    draw_functions: RetainedDrawFunctionIds,
 ) -> bool {
     if phase.items.is_empty() {
         return false;
@@ -449,7 +463,7 @@ fn phase_is_ready(
         let Some(metadata) = items.get(&item.entity()) else {
             return false;
         };
-        if world.get::<UiItemBatch>(item.entity()).is_none() {
+        if item_batch_range(world, item, draw_functions).is_none() {
             let unavailable_image = metadata.image
                 != bevy::asset::AssetId::<bevy::image::Image>::default()
                 && gpu_images.get(metadata.image).is_none()
@@ -464,6 +478,49 @@ fn phase_is_ready(
         }
     }
     true
+}
+
+#[derive(Clone, Copy)]
+struct RetainedDrawFunctionIds {
+    ui: DrawFunctionId,
+    texture_slice: DrawFunctionId,
+}
+
+fn retained_draw_function_ids(world: &World) -> RetainedDrawFunctionIds {
+    let draw_functions = world.resource::<DrawFunctions<TransparentUi>>().read();
+    RetainedDrawFunctionIds {
+        ui: draw_functions.id::<DrawUiItem>(),
+        texture_slice: draw_functions.id::<DrawUiTextureSliceItem>(),
+    }
+}
+
+fn item_batch_range(
+    world: &World,
+    item: &TransparentUi,
+    draw_functions: RetainedDrawFunctionIds,
+) -> Option<Range<u32>> {
+    if item.draw_function == draw_functions.ui {
+        world
+            .get::<UiItemBatch>(item.entity())
+            .map(|batch| batch.range.clone())
+    } else if item.draw_function == draw_functions.texture_slice {
+        world
+            .get::<UiTextureSlicerBatch>(item.entity())
+            .map(|batch| batch.range.clone())
+    } else {
+        None
+    }
+}
+
+fn prepared_quad_count(
+    world: &World,
+    item: &TransparentUi,
+    draw_functions: RetainedDrawFunctionIds,
+) -> u64 {
+    let indices = item_batch_range(world, item, draw_functions)
+        .map(|range| range.len())
+        .unwrap_or_default();
+    u64::try_from(indices / 6).expect("prepared UI quad count exceeds u64")
 }
 
 fn target_rect(size: UVec2) -> PhysicalRect {
@@ -541,15 +598,16 @@ fn synchronize_pending_layer(surface: &LayerSurface, pending: usize, ctx: &mut R
 
 fn replay_runs(
     phase: &bevy::render::render_phase::SortedRenderPhase<TransparentUi>,
-    items: &HashMap<bevy::ecs::entity::Entity, RetainedItem>,
+    items: &HashMap<Entity, RetainedItem>,
     region: PhysicalRect,
     world: &World,
+    draw_functions: RetainedDrawFunctionIds,
 ) -> Vec<Range<usize>> {
     let mut runs = Vec::new();
     let mut start = None;
     for index in 0..phase.items.len() {
         let item = phase.items.get_index(index).unwrap().1;
-        let intersects = world.get::<UiItemBatch>(item.entity()).is_some()
+        let intersects = item_batch_range(world, item, draw_functions).is_some()
             && items.get(&item.entity()).is_none_or(|item| {
                 item.coverage
                     .iter()
@@ -572,9 +630,10 @@ fn replay_runs(
 
 fn exact_composite_regions(
     phase: Option<&bevy::render::render_phase::SortedRenderPhase<TransparentUi>>,
-    items: &HashMap<bevy::ecs::entity::Entity, RetainedItem>,
+    items: &HashMap<Entity, RetainedItem>,
     size: UVec2,
     world: &World,
+    draw_functions: RetainedDrawFunctionIds,
 ) -> Vec<PhysicalRect> {
     let Some(phase) = phase else {
         return Vec::new();
@@ -583,7 +642,7 @@ fn exact_composite_regions(
     let mut occupied = Vec::with_capacity(phase.items.len());
     for index in 0..phase.items.len() {
         let item = phase.items.get_index(index).unwrap().1;
-        if world.get::<UiItemBatch>(item.entity()).is_none() {
+        if item_batch_range(world, item, draw_functions).is_none() {
             continue;
         }
         let Some(item) = items.get(&item.entity()) else {
@@ -629,6 +688,7 @@ fn retained_ui_pass(
     };
 
     let phase = transparent_render_phases.get(&extracted_view.retained_view_entity);
+    let draw_functions = retained_draw_function_ids(world);
     let phase_has_items = phase.is_some_and(|phase| !phase.items.is_empty());
     let scene = world.resource::<RetainedUiScene>();
     let repair_plan = scene.repair_plan(ui_view_target.0);
@@ -640,7 +700,7 @@ fn retained_ui_pass(
     }
     let repair_requested = phase_has_items || (repair_plan.is_some() && !damage_regions.is_empty());
     let repair_ready = if phase_has_items {
-        phase.is_some_and(|phase| phase_is_ready(phase, &pipeline_cache, world))
+        phase.is_some_and(|phase| phase_is_ready(phase, &pipeline_cache, world, draw_functions))
     } else {
         repair_plan.is_some()
     };
@@ -693,7 +753,8 @@ fn retained_ui_pass(
             .unwrap_or_else(PoisonError::into_inner);
         let mut result = Ok(());
         let mut replayed = 0;
-        let composite_regions = exact_composite_regions(phase, &items, size, world);
+        let mut replayed_quads = 0;
+        let composite_regions = exact_composite_regions(phase, &items, size, world, draw_functions);
         for region in &damage_regions {
             let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
                 label: Some("retained_ui_repair"),
@@ -721,8 +782,12 @@ fn retained_ui_pass(
             pass.draw(0..3, 0..1);
 
             if let Some(phase) = phase.filter(|phase| !phase.items.is_empty()) {
-                for run in replay_runs(phase, &items, *region, world) {
+                for run in replay_runs(phase, &items, *region, world, draw_functions) {
                     replayed += run.len() as u64;
+                    for index in run.clone() {
+                        let item = phase.items.get_index(index).unwrap().1;
+                        replayed_quads += prepared_quad_count(world, item, draw_functions);
+                    }
                     if let Err(err) = phase.render_range(&mut pass, world, ui_view_entity, run) {
                         result = Err(err);
                         break;
@@ -746,6 +811,9 @@ fn retained_ui_pass(
                 counters
                     .items_replayed
                     .fetch_add(replayed, Ordering::Relaxed);
+                counters
+                    .quads_replayed
+                    .fetch_add(replayed_quads, Ordering::Relaxed);
                 if let Some(plan) = repair_plan.as_ref() {
                     world
                         .resource::<RetainedUiScene>()

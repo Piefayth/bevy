@@ -14,9 +14,12 @@ use bevy::{
     image::Image,
     math::{Affine2, Rect, Vec2},
     render::sync_world::MainEntity,
-    sprite::BorderRect,
+    sprite::{BorderRect, SliceScaleMode, SpriteImageMode},
     ui::ResolvedBorderRadius,
-    ui_render::{ExtractedGlyph, ExtractedUiItem, ExtractedUiNode, ExtractedUiNodes, NodeType},
+    ui_render::{
+        ui_texture_slice_pipeline::{ExtractedUiTextureSlice, ExtractedUiTextureSlices},
+        ExtractedGlyph, ExtractedUiItem, ExtractedUiNode, ExtractedUiNodes, NodeType,
+    },
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::{
@@ -69,6 +72,7 @@ pub(crate) enum ResourceFingerprint {
 pub(crate) enum RetainedDrawItem {
     Node(RetainedNodeItem),
     Glyphs(Box<[RetainedGlyph]>),
+    TextureSlice(RetainedTextureSliceItem),
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +85,18 @@ pub(crate) struct RetainedNodeItem {
     pub(crate) border: BorderRect,
     pub(crate) border_radius: ResolvedBorderRadius,
     pub(crate) node_type: NodeType,
+}
+
+#[derive(Clone)]
+pub(crate) struct RetainedTextureSliceItem {
+    pub(crate) stack_index: u32,
+    pub(crate) rect: Rect,
+    pub(crate) atlas_rect: Option<Rect>,
+    pub(crate) color: bevy::color::LinearRgba,
+    pub(crate) image_scale_mode: SpriteImageMode,
+    pub(crate) flip_x: bool,
+    pub(crate) flip_y: bool,
+    pub(crate) inverse_scale_factor: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -159,6 +175,39 @@ struct RetainedNodeFingerprint {
 enum RetainedItemFingerprint {
     Node(RetainedNodeFingerprint),
     Glyphs,
+    TextureSlice(RetainedTextureSliceFingerprint),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedTextureSliceFingerprint {
+    rect: [FloatBits; 4],
+    atlas_rect: Option<[FloatBits; 4]>,
+    color: [FloatBits; 4],
+    image_scale_mode: TextureSliceModeFingerprint,
+    flip_x: bool,
+    flip_y: bool,
+    inverse_scale_factor: FloatBits,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TextureSliceModeFingerprint {
+    Sliced {
+        border: [FloatBits; 4],
+        center: SliceScaleModeFingerprint,
+        sides: SliceScaleModeFingerprint,
+        max_corner_scale: FloatBits,
+    },
+    Tiled {
+        tile_x: bool,
+        tile_y: bool,
+        stretch_value: FloatBits,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SliceScaleModeFingerprint {
+    Stretch,
+    Tile { stretch_value: FloatBits },
 }
 
 struct RetainedRecord {
@@ -222,6 +271,17 @@ impl RetainedRecord {
                 })
             }
             RetainedDrawItem::Glyphs(_) => RetainedItemFingerprint::Glyphs,
+            RetainedDrawItem::TextureSlice(item) => {
+                RetainedItemFingerprint::TextureSlice(RetainedTextureSliceFingerprint {
+                    rect: rect_fingerprint(item.rect),
+                    atlas_rect: item.atlas_rect.map(rect_fingerprint),
+                    color: item.color.to_f32_array().map(FloatBits::new),
+                    image_scale_mode: texture_slice_mode_fingerprint(&item.image_scale_mode),
+                    flip_x: item.flip_x,
+                    flip_y: item.flip_y,
+                    inverse_scale_factor: FloatBits::new(item.inverse_scale_factor),
+                })
+            }
         };
         Self {
             common: RetainedCommonFingerprint {
@@ -253,6 +313,48 @@ impl RetainedRecord {
             return None;
         };
         Some((&self.common, &node.merge, flags))
+    }
+}
+
+fn rect_fingerprint(rect: Rect) -> [FloatBits; 4] {
+    [rect.min.x, rect.min.y, rect.max.x, rect.max.y].map(FloatBits::new)
+}
+
+fn texture_slice_mode_fingerprint(mode: &SpriteImageMode) -> TextureSliceModeFingerprint {
+    match mode {
+        SpriteImageMode::Sliced(slicer) => TextureSliceModeFingerprint::Sliced {
+            border: [
+                slicer.border.min_inset.x,
+                slicer.border.min_inset.y,
+                slicer.border.max_inset.x,
+                slicer.border.max_inset.y,
+            ]
+            .map(FloatBits::new),
+            center: slice_scale_mode_fingerprint(slicer.center_scale_mode),
+            sides: slice_scale_mode_fingerprint(slicer.sides_scale_mode),
+            max_corner_scale: FloatBits::new(slicer.max_corner_scale),
+        },
+        SpriteImageMode::Tiled {
+            tile_x,
+            tile_y,
+            stretch_value,
+        } => TextureSliceModeFingerprint::Tiled {
+            tile_x: *tile_x,
+            tile_y: *tile_y,
+            stretch_value: FloatBits::new(*stretch_value),
+        },
+        SpriteImageMode::Auto | SpriteImageMode::Scale(_) => {
+            unreachable!("retained texture slices require sliced or tiled image mode")
+        }
+    }
+}
+
+fn slice_scale_mode_fingerprint(mode: SliceScaleMode) -> SliceScaleModeFingerprint {
+    match mode {
+        SliceScaleMode::Stretch => SliceScaleModeFingerprint::Stretch,
+        SliceScaleMode::Tile { stretch_value } => SliceScaleModeFingerprint::Tile {
+            stretch_value: FloatBits::new(stretch_value),
+        },
     }
 }
 
@@ -464,6 +566,7 @@ pub(crate) fn replay_retained_ui(
     counters: Res<RetainedUiPaintCounters>,
     items: Res<RetainedItems>,
     mut extracted: ResMut<ExtractedUiNodes>,
+    mut extracted_slices: ResMut<ExtractedUiTextureSlices>,
 ) {
     let mut surfaces = state.lock();
     let mut items = items.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -514,6 +617,7 @@ pub(crate) fn replay_retained_ui(
                 }
                 push_replayed(
                     &mut extracted,
+                    &mut extracted_slices,
                     &mut items,
                     &record.value.draw,
                     coverage,
@@ -524,6 +628,7 @@ pub(crate) fn replay_retained_ui(
 
             push_replayed(
                 &mut extracted,
+                &mut extracted_slices,
                 &mut items,
                 &record.value.draw,
                 record.coverage.clone(),
@@ -536,6 +641,7 @@ pub(crate) fn replay_retained_ui(
 
 fn push_replayed(
     extracted: &mut ExtractedUiNodes,
+    extracted_slices: &mut ExtractedUiTextureSlices,
     items: &mut HashMap<Entity, RetainedItem>,
     draw: &RetainedDraw,
     coverage: PaintCoverage,
@@ -564,6 +670,32 @@ fn push_replayed(
             ExtractedUiItem::Glyphs {
                 range: start..extracted.glyphs.len(),
             }
+        }
+        RetainedDrawItem::TextureSlice(item) => {
+            extracted_slices.slices.push(ExtractedUiTextureSlice {
+                stack_index: item.stack_index,
+                transform: draw.transform,
+                rect: item.rect,
+                atlas_rect: item.atlas_rect,
+                image: draw.image,
+                clip: draw.clip,
+                extracted_camera_entity: draw.camera,
+                color: item.color,
+                image_scale_mode: item.image_scale_mode.clone(),
+                flip_x: item.flip_x,
+                flip_y: item.flip_y,
+                inverse_scale_factor: item.inverse_scale_factor,
+                main_entity: draw.main_entity,
+                render_entity: draw.render_entity,
+            });
+            items.insert(
+                draw.render_entity,
+                RetainedItem {
+                    coverage,
+                    image: draw.image,
+                },
+            );
+            return;
         }
     };
     items.insert(

@@ -37,26 +37,39 @@ pub struct UiTextureSlicerPlugin;
 
 impl Plugin for UiTextureSlicerPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(UiTextureSlicerInfrastructurePlugin);
+
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app
+                .add_systems(
+                    ExtractSchedule,
+                    extract_ui_texture_slices.in_set(RenderUiSystems::ExtractTextureSlice),
+                )
+                .add_systems(Render, queue_ui_slices.in_set(RenderSystems::Queue));
+        }
+    }
+}
+
+/// GPU pipeline and preparation shared by UI texture-slice render policies.
+#[derive(Default)]
+pub struct UiTextureSlicerInfrastructurePlugin;
+
+impl Plugin for UiTextureSlicerInfrastructurePlugin {
+    fn build(&self, app: &mut App) {
         embedded_asset!(app, "ui_texture_slice.wgsl");
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .add_render_command::<TransparentUi, DrawUiTextureSlices>()
+                .add_render_command::<TransparentUi, DrawUiTextureSliceItem>()
                 .init_resource::<ExtractedUiTextureSlices>()
                 .init_gpu_resource::<UiTextureSliceMeta>()
                 .init_gpu_resource::<UiTextureSliceImageBindGroups>()
                 .init_gpu_resource::<SpecializedRenderPipelines<UiTextureSlicePipeline>>()
                 .add_systems(RenderStartup, init_ui_texture_slice_pipeline)
                 .add_systems(
-                    ExtractSchedule,
-                    extract_ui_texture_slices.in_set(RenderUiSystems::ExtractTextureSlice),
-                )
-                .add_systems(
                     Render,
-                    (
-                        queue_ui_slices.in_set(RenderSystems::Queue),
-                        prepare_ui_slices.in_set(RenderSystems::PrepareBindGroups),
-                    ),
+                    prepare_ui_slices.in_set(RenderSystems::PrepareBindGroups),
                 );
         }
     }
@@ -307,56 +320,72 @@ pub fn extract_ui_texture_slices(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "it's a system that needs a lot of them"
-)]
-pub fn queue_ui_slices(
-    extracted_ui_slicers: ResMut<ExtractedUiTextureSlices>,
-    ui_slicer_pipeline: Res<UiTextureSlicePipeline>,
-    mut pipelines: ResMut<SpecializedRenderPipelines<UiTextureSlicePipeline>>,
-    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    mut render_views: Query<&UiCameraView, With<ExtractedView>>,
-    camera_views: Query<&ExtractedView>,
-    pipeline_cache: Res<PipelineCache>,
-    draw_functions: Res<DrawFunctions<TransparentUi>>,
-) {
-    let draw_function = draw_functions.read().id::<DrawUiTextureSlices>();
-    for (index, extracted_slicer) in extracted_ui_slicers.slices.iter().enumerate() {
-        let Ok(default_camera_view) =
-            render_views.get_mut(extracted_slicer.extracted_camera_entity)
-        else {
-            continue;
-        };
+#[derive(SystemParam)]
+pub struct UiTextureSliceQueue<'w, 's> {
+    ui_slicer_pipeline: Res<'w, UiTextureSlicePipeline>,
+    pipelines: ResMut<'w, SpecializedRenderPipelines<UiTextureSlicePipeline>>,
+    transparent_render_phases: ResMut<'w, ViewSortedRenderPhases<TransparentUi>>,
+    render_views: Query<'w, 's, &'static UiCameraView, With<ExtractedView>>,
+    camera_views: Query<'w, 's, &'static ExtractedView>,
+    pipeline_cache: Res<'w, PipelineCache>,
+    draw_functions: Res<'w, DrawFunctions<TransparentUi>>,
+}
 
-        let Ok(view) = camera_views.get(default_camera_view.0) else {
-            continue;
-        };
+impl UiTextureSliceQueue<'_, '_> {
+    fn queue(&mut self, extracted: &ExtractedUiTextureSlices, draw_function: DrawFunctionId) {
+        for (index, extracted_slicer) in extracted.slices.iter().enumerate() {
+            let Ok(default_camera_view) = self
+                .render_views
+                .get(extracted_slicer.extracted_camera_entity)
+            else {
+                continue;
+            };
 
-        let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
-        else {
-            continue;
-        };
+            let Ok(view) = self.camera_views.get(default_camera_view.0) else {
+                continue;
+            };
 
-        let pipeline = pipelines.specialize(
-            &pipeline_cache,
-            &ui_slicer_pipeline,
-            UiTextureSlicePipelineKey {
-                target_format: view.target_format,
-            },
-        );
+            let Some(transparent_phase) = self
+                .transparent_render_phases
+                .get_mut(&view.retained_view_entity)
+            else {
+                continue;
+            };
 
-        transparent_phase.add_transient(TransparentUi {
-            draw_function,
-            pipeline,
-            entity: (extracted_slicer.render_entity, extracted_slicer.main_entity),
-            sort_key: FloatOrd(extracted_slicer.stack_index as f32 + stack_z_offsets::IMAGE),
-            batch_range: 0..0,
-            extra_index: PhaseItemExtraIndex::None,
-            index,
-            indexed: true,
-        });
+            let pipeline = self.pipelines.specialize(
+                &self.pipeline_cache,
+                &self.ui_slicer_pipeline,
+                UiTextureSlicePipelineKey {
+                    target_format: view.target_format,
+                },
+            );
+
+            transparent_phase.add_transient(TransparentUi {
+                draw_function,
+                pipeline,
+                entity: (extracted_slicer.render_entity, extracted_slicer.main_entity),
+                sort_key: FloatOrd(extracted_slicer.stack_index as f32 + stack_z_offsets::IMAGE),
+                batch_range: 0..0,
+                extra_index: PhaseItemExtraIndex::None,
+                index,
+                indexed: true,
+            });
+        }
     }
+}
+
+pub fn queue_ui_slices(extracted: Res<ExtractedUiTextureSlices>, mut queue: UiTextureSliceQueue) {
+    let draw_function = queue.draw_functions.read().id::<DrawUiTextureSlices>();
+    queue.queue(&extracted, draw_function);
+}
+
+/// Queues each texture slice as an independently drawable phase item.
+pub fn queue_ui_slice_items(
+    extracted: Res<ExtractedUiTextureSlices>,
+    mut queue: UiTextureSliceQueue,
+) {
+    let draw_function = queue.draw_functions.read().id::<DrawUiTextureSliceItem>();
+    queue.queue(&extracted, draw_function);
 }
 
 pub fn prepare_ui_slices(
@@ -372,6 +401,7 @@ pub fn prepare_ui_slices(
     gpu_images: Res<RenderAssets<GpuImage>>,
     mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     events: Res<SpriteAssetEvents>,
+    draw_functions: Res<DrawFunctions<TransparentUi>>,
     mut previous_len: Local<usize>,
 ) {
     // If an image has changed, the GpuImage has (probably) changed
@@ -385,6 +415,18 @@ pub fn prepare_ui_slices(
                 image_bind_groups.values.remove(id);
             }
         };
+    }
+
+    let item_draw_function = draw_functions.read().id::<DrawUiTextureSliceItem>();
+    for phase in phases.values() {
+        for index in 0..phase.items.len() {
+            let item = phase.items.get_index(index).unwrap().1;
+            if item.draw_function == item_draw_function {
+                commands
+                    .entity(item.entity())
+                    .remove::<UiTextureSlicerBatch>();
+            }
+        }
     }
 
     if let Some(view_binding) = view_uniforms.uniforms.binding() {
@@ -406,9 +448,11 @@ pub fn prepare_ui_slices(
             let mut batch_item_index = 0;
             let mut batch_image_handle = None;
             let mut batch_image_size = Vec2::ZERO;
+            let mut prepared_individual_items = Vec::new();
 
             for item_index in 0..ui_phase.items.len() {
                 let item = &mut ui_phase.items[item_index];
+                let prepares_individual_item = item.draw_function == item_draw_function;
                 if let Some(texture_slices) = extracted_slices
                     .slices
                     .get(item.index)
@@ -416,7 +460,8 @@ pub fn prepare_ui_slices(
                 {
                     let mut existing_batch = batches.last_mut();
 
-                    if batch_image_handle.is_none()
+                    if prepares_individual_item
+                        || batch_image_handle.is_none()
                         || existing_batch.is_none()
                         || (batch_image_handle != Some(AssetId::default())
                             && texture_slices.image != AssetId::default()
@@ -621,11 +666,17 @@ pub fn prepare_ui_slices(
                     vertices_index += 6;
                     indices_index += 4;
 
+                    if prepares_individual_item {
+                        prepared_individual_items.push(item_index);
+                    }
                     existing_batch.unwrap().1.range.end = vertices_index;
                     ui_phase.items[batch_item_index].batch_range_mut().end += 1;
                 } else {
                     batch_image_handle = None;
                 }
+            }
+            for item_index in prepared_individual_items {
+                ui_phase.items[item_index].batch_range = 0..1;
             }
         }
         ui_meta.vertices.write_buffer(&render_device, &render_queue);
@@ -641,6 +692,14 @@ pub type DrawUiTextureSlices = (
     SetSlicerViewBindGroup<0>,
     SetSlicerTextureBindGroup<1>,
     DrawSlicer,
+);
+
+/// Draws exactly one extracted UI texture-slice item without phase batching.
+pub type DrawUiTextureSliceItem = (
+    SetItemPipeline,
+    SetSlicerViewBindGroup<0>,
+    SetSlicerTextureBindGroup<1, true>,
+    DrawSlicer<true>,
 );
 
 pub struct SetSlicerViewBindGroup<const I: usize>;
@@ -663,8 +722,10 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetSlicerViewBindGroup<I
         RenderCommandResult::Success
     }
 }
-pub struct SetSlicerTextureBindGroup<const I: usize>;
-impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetSlicerTextureBindGroup<I> {
+pub struct SetSlicerTextureBindGroup<const I: usize, const REQUIRED: bool = false>;
+impl<P: PhaseItem, const I: usize, const REQUIRED: bool> RenderCommand<P>
+    for SetSlicerTextureBindGroup<I, REQUIRED>
+{
     type Param = SRes<UiTextureSliceImageBindGroups>;
     type ViewQuery = ();
     type ItemQuery = Read<UiTextureSlicerBatch>;
@@ -679,15 +740,19 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetSlicerTextureBindGrou
     ) -> RenderCommandResult {
         let image_bind_groups = image_bind_groups.into_inner();
         let Some(batch) = batch else {
-            return RenderCommandResult::Skip;
+            return if REQUIRED {
+                RenderCommandResult::Failure("individual UI texture-slice batch not available")
+            } else {
+                RenderCommandResult::Skip
+            };
         };
 
         pass.set_bind_group(I, image_bind_groups.values.get(&batch.image).unwrap(), &[]);
         RenderCommandResult::Success
     }
 }
-pub struct DrawSlicer;
-impl<P: PhaseItem> RenderCommand<P> for DrawSlicer {
+pub struct DrawSlicer<const REQUIRED: bool = false>;
+impl<P: PhaseItem, const REQUIRED: bool> RenderCommand<P> for DrawSlicer<REQUIRED> {
     type Param = SRes<UiTextureSliceMeta>;
     type ViewQuery = ();
     type ItemQuery = Read<UiTextureSlicerBatch>;
@@ -701,14 +766,18 @@ impl<P: PhaseItem> RenderCommand<P> for DrawSlicer {
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         let Some(batch) = batch else {
-            return RenderCommandResult::Skip;
+            return if REQUIRED {
+                RenderCommandResult::Failure("individual UI texture-slice batch not available")
+            } else {
+                RenderCommandResult::Skip
+            };
         };
         let ui_meta = ui_meta.into_inner();
         let Some(vertices) = ui_meta.vertices.buffer() else {
-            return RenderCommandResult::Failure("missing vertices to draw ui");
+            return RenderCommandResult::Failure("missing vertices to draw UI texture slices");
         };
         let Some(indices) = ui_meta.indices.buffer() else {
-            return RenderCommandResult::Failure("missing indices to draw ui");
+            return RenderCommandResult::Failure("missing indices to draw UI texture slices");
         };
 
         // Store the vertices

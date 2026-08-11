@@ -140,6 +140,15 @@ the infrastructure directly. This preserves a maintainable third-party
 renderer while requiring a small patch only to the crate it replaces. No
 `bevy_ecs` or `bevy_core_pipeline` fork is required.
 
+Sliced and tiled images exposed the same boundary one level down: Bevy's
+`UiTextureSlicerPlugin` coupled stock extraction to reusable pipeline setup and
+preparation. It is now composed from a public
+`UiTextureSlicerInfrastructurePlugin` plus the stock extractor and batched
+queue. The retained renderer uses the infrastructure with its own exact-item
+queue. `DrawUiTextureSliceItem` prepares and draws one retained quad, so damage
+culling cannot silently submit adjacent same-texture slices as a stock batch.
+This remains a focused `bevy_ui_render` patch; it does not expand crate scope.
+
 ## Model learned from other UI systems
 
 Mature UI systems retain several representations rather than one:
@@ -440,8 +449,9 @@ allows it:
   text transforms, sampled surfaces, resize, and resource unavailability;
 - a deterministic adversarial scene rendered once with retention and once with
   full redraw, followed by an exact pixel comparison;
-- counters asserted by tests: entities extracted, paint records changed,
-  elements replayed, damaged pixels, surfaces repaired, and composite coverage.
+- counters asserted by tests: entities extracted, paint records changed, items
+  and prepared quads replayed, damaged pixels, surfaces repaired, and composite
+  coverage.
 
 Every regression test must first fail with the named defect reintroduced.
 
@@ -462,10 +472,10 @@ trees:
 Wall-clock samples catch constant-factor regressions. Deterministic counters
 catch complexity regressions even when timing noise is high. Benchmarked work
 counts include roots and entities visited, entities extracted, paint records
-compared/changed, bytes uploaded, records replayed, damaged physical pixels,
-surface repairs, composite instances, and composite pixel coverage. The quiet
-case is required to report zero for every counter except unavoidable
-composition when another renderer produces a fresh target frame.
+compared/changed, bytes uploaded, records and prepared quads replayed, damaged
+physical pixels, surface repairs, composite instances, and composite pixel
+coverage. The quiet case is required to report zero for every counter except
+unavoidable composition when another renderer produces a fresh target frame.
 
 - [Bevy benchmark instructions](../benches/README.md)
 
@@ -499,8 +509,8 @@ constructed stock final scene is byte-identical to the retained scene reached
 through movement, recoloring, and removal, including translucent overlap.
 
 The integrated retained families are backgrounds (`BackgroundColor` and
-`OuterColor`), ordinary unsliced `ImageNode`s, solid borders and outlines, and
-all stock UI text paint. They share one scene, one stable
+`OuterColor`), ordinary, sliced, and tiled `ImageNode`s, solid borders and
+outlines, and all stock UI text paint. They share one scene, one stable
 `(entity, family, ordinal)` identity space, and one damage journal per camera.
 Family extractors only update canonical records; a single later replay stage
 sorts every visible family together. This is required for correctness:
@@ -565,6 +575,15 @@ GPU suite proves quiet images match stock output, image tint changes rebuild
 underlying backgrounds, sampled pixel modifications repaint exact readers,
 unsampled and equal-byte modifications do no retained work, selected atlas
 changes repaint, and irrelevant atlas edits do not.
+
+Sliced and tiled nodes are canonical records in that same image identity;
+switching modes does not create a parallel retained path. Their fingerprints
+include target and atlas rectangles, tint, flips, inverse scale, slice borders,
+scale modes, and every floating-point mode parameter as exact bits. They reuse
+the common sampled-image dependencies. GPU differentials cover quiet sliced
+and tiled output, tint repair, and same-texture siblings; the last asserts that
+a one-node repair submits exactly one prepared quad rather than the stock
+texture batch.
 
 Availability follows Bevy's render-asset lifecycle rather than main-world
 `Assets<Image>` membership. Removing a main-world asset does not unload its GPU

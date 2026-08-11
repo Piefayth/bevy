@@ -338,6 +338,79 @@ fn spawn_sampled_strip(world: &mut World, camera: Entity) -> Handle<Image> {
     image
 }
 
+fn add_slice_image(world: &mut World) -> Handle<Image> {
+    world.resource_mut::<Assets<Image>>().add(Image::new_fill(
+        Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[
+            220, 40, 30, 255, 220, 130, 20, 255, 220, 130, 20, 255, 30, 180, 70, 255, 40, 80, 210,
+            255, 210, 210, 40, 255, 210, 210, 40, 255, 180, 40, 190, 255, 40, 80, 210, 255, 210,
+            210, 40, 255, 210, 210, 40, 255, 180, 40, 190, 255, 40, 180, 210, 255, 130, 70, 210,
+            255, 130, 70, 210, 255, 210, 90, 40, 255,
+        ],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    ))
+}
+
+fn spawn_slice_leaf(world: &mut World, camera: Entity, mode: NodeImageMode, tint: Color) -> Entity {
+    let image = add_slice_image(world);
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(7),
+                top: px(9),
+                width: px(24),
+                height: px(20),
+                ..default()
+            },
+            ImageNode::new(image).with_mode(mode).with_color(tint),
+            UiTargetCamera(camera),
+        ))
+        .id()
+}
+
+fn sliced_mode() -> NodeImageMode {
+    NodeImageMode::Sliced(TextureSlicer {
+        border: BorderRect::all(1.0),
+        center_scale_mode: SliceScaleMode::Stretch,
+        sides_scale_mode: SliceScaleMode::Stretch,
+        max_corner_scale: 1.0,
+    })
+}
+
+fn spawn_slice_pair(world: &mut World, camera: Entity, first_tint: Color) -> Entity {
+    let image = add_slice_image(world);
+    let mut first = Entity::PLACEHOLDER;
+    for (index, tint) in [first_tint, Color::WHITE].into_iter().enumerate() {
+        let entity = world
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(4 + index as i32 * 28),
+                    top: px(9),
+                    width: px(20),
+                    height: px(20),
+                    ..default()
+                },
+                ImageNode::new(image.clone())
+                    .with_mode(sliced_mode())
+                    .with_color(tint),
+                UiTargetCamera(camera),
+            ))
+            .id();
+        if index == 0 {
+            first = entity;
+        }
+    }
+    first
+}
+
 fn spawn_image_leaf(
     world: &mut World,
     camera: Entity,
@@ -712,7 +785,7 @@ fn quiet_image_pixels_match_stock_without_another_repair() {
                 .pixels
                 .chunks_exact(BYTES_PER_PIXEL)
                 .any(|pixel| pixel[..3] != [0, 0, 0]),
-            "the default font must produce glyph pixels"
+            "the image must produce visible pixels"
         );
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
@@ -722,6 +795,162 @@ fn quiet_image_pixels_match_stock_without_another_repair() {
             retained.paint_after_mutation,
             retained.paint_before_mutation
         );
+    });
+}
+
+#[test]
+fn quiet_sliced_image_matches_stock_without_another_repair() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_slice_leaf(world, camera, sliced_mode(), Color::WHITE)
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn sliced_image_tint_change_repairs_only_its_pixels() {
+    with_gpu_lock(|| {
+        let final_tint = Color::srgba_u8(70, 210, 130, 190);
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_slice_leaf(world, camera, sliced_mode(), final_tint),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_slice_leaf(world, camera, sliced_mode(), Color::WHITE),
+            move |world, entity| {
+                world
+                    .entity_mut(entity)
+                    .get_mut::<ImageNode>()
+                    .unwrap()
+                    .color = final_tint;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 24 * 20);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+    });
+}
+
+#[test]
+fn sliced_image_repair_submits_one_quad_from_a_shared_texture() {
+    with_gpu_lock(|| {
+        let final_tint = Color::srgba_u8(70, 210, 130, 190);
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_slice_pair(world, camera, final_tint),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_slice_pair(world, camera, Color::WHITE),
+            move |world, entity| {
+                world
+                    .entity_mut(entity)
+                    .get_mut::<ImageNode>()
+                    .unwrap()
+                    .color = final_tint;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+    });
+}
+
+#[test]
+fn switching_from_stretched_to_sliced_image_replaces_the_draw_family() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_slice_leaf(world, camera, sliced_mode(), Color::WHITE),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_slice_leaf(world, camera, NodeImageMode::Stretch, Color::WHITE),
+            |world, entity| {
+                world
+                    .entity_mut(entity)
+                    .get_mut::<ImageNode>()
+                    .unwrap()
+                    .image_mode = sliced_mode();
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+    });
+}
+
+#[test]
+fn quiet_tiled_image_matches_stock() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_slice_leaf(
+                world,
+                camera,
+                NodeImageMode::Tiled {
+                    tile_x: true,
+                    tile_y: true,
+                    stretch_value: 1.0,
+                },
+                Color::WHITE,
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
     });
 }
 
