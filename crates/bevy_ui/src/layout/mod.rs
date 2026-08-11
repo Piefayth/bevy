@@ -6,15 +6,13 @@ use crate::{
     ComputedNode, ComputedUiRenderTargetInfo, ContentSize, Display, IgnoreScroll, LayoutConfig,
     Node, Outline, OverflowAxis, ScrollPosition,
 };
-#[cfg(feature = "ghost_nodes")]
-use bevy_ecs::query::With;
 use bevy_ecs::{
-    change_detection::{DetectChanges, DetectChangesMut},
-    entity::Entity,
-    hierarchy::Children,
+    change_detection::{DetectChanges, DetectChangesMut, Mut},
+    entity::{Entity, EntityHashSet},
+    hierarchy::{ChildOf, Children},
     lifecycle::RemovedComponents,
-    query::Added,
-    system::{Query, ResMut},
+    query::{Added, Changed, Or, With},
+    system::{Local, ParamSet, Query, ResMut, SystemParam},
     world::Ref,
 };
 
@@ -30,6 +28,10 @@ use bevy_text::FontCx;
 mod convert;
 pub mod debug;
 pub mod ui_surface;
+
+fn drain_removed<T: bevy_ecs::component::Component>(removed: &mut RemovedComponents<T>) -> bool {
+    removed.read().count() != 0
+}
 
 pub struct LayoutContext {
     pub scale_factor: f32,
@@ -192,38 +194,223 @@ pub fn ui_layout_system(
     }
 }
 
+#[derive(SystemParam)]
+#[doc(hidden)]
+pub struct GeometryChanges<'w, 's> {
+    layout: Query<
+        'w,
+        's,
+        Entity,
+        Or<(
+            Changed<Node>,
+            Changed<ContentSize>,
+            Changed<ComputedUiRenderTargetInfo>,
+        )>,
+    >,
+    hierarchy: Query<'w, 's, Entity, Or<(Changed<Children>, Changed<ChildOf>)>>,
+    subtrees: Query<
+        'w,
+        's,
+        Entity,
+        (
+            With<Node>,
+            Or<(
+                Changed<UiTransform>,
+                Changed<LayoutConfig>,
+                Changed<ScrollPosition>,
+                Changed<IgnoreScroll>,
+            )>,
+        ),
+    >,
+    outlines: Query<'w, 's, Entity, (With<Node>, Changed<Outline>)>,
+    removed_node: RemovedComponents<'w, 's, Node>,
+    removed_content_size: RemovedComponents<'w, 's, ContentSize>,
+    removed_target: RemovedComponents<'w, 's, ComputedUiRenderTargetInfo>,
+    removed_children: RemovedComponents<'w, 's, Children>,
+    removed_parent: RemovedComponents<'w, 's, ChildOf>,
+    removed_transform: RemovedComponents<'w, 's, UiTransform>,
+    removed_config: RemovedComponents<'w, 's, LayoutConfig>,
+    removed_outline: RemovedComponents<'w, 's, Outline>,
+    removed_scroll: RemovedComponents<'w, 's, ScrollPosition>,
+    removed_ignore_scroll: RemovedComponents<'w, 's, IgnoreScroll>,
+}
+
+impl GeometryChanges<'_, '_> {
+    fn requires_all_roots(&mut self) -> bool {
+        !self.hierarchy.is_empty()
+            | drain_removed(&mut self.removed_node)
+            | drain_removed(&mut self.removed_content_size)
+            | drain_removed(&mut self.removed_target)
+            | drain_removed(&mut self.removed_children)
+            | drain_removed(&mut self.removed_parent)
+    }
+
+    fn collect_local(
+        &mut self,
+        dirty_subtrees: &mut EntityHashSet,
+        dirty_nodes: &mut EntityHashSet,
+    ) {
+        dirty_subtrees.extend(self.subtrees.iter());
+        dirty_subtrees.extend(self.removed_transform.read());
+        dirty_subtrees.extend(self.removed_config.read());
+        dirty_subtrees.extend(self.removed_scroll.read());
+        dirty_subtrees.extend(self.removed_ignore_scroll.read());
+        dirty_nodes.extend(self.outlines.iter());
+        dirty_nodes.extend(self.removed_outline.read());
+    }
+}
+
+struct GeometryContext {
+    inherited_use_rounding: bool,
+    target_size: Vec2,
+    inherited_transform: Affine2,
+    inverse_target_scale_factor: f32,
+    parent_size: Vec2,
+    parent_scroll_position: Vec2,
+}
+
+fn geometry_context(
+    entity: Entity,
+    ui_children: &UiChildren,
+    target_query: &Query<&ComputedUiRenderTargetInfo>,
+    context_query: &Query<(&ComputedNode, &UiGlobalTransform, Option<&LayoutConfig>)>,
+) -> Option<GeometryContext> {
+    let computed_target = target_query.get(entity).ok()?;
+    let parent = ui_children.get_parent(entity);
+    let (inherited_transform, parent_size, parent_scroll_position) = parent
+        .and_then(|parent| context_query.get(parent).ok())
+        .map(|(node, transform, _)| (**transform, node.size, node.scroll_position))
+        .unwrap_or((Affine2::IDENTITY, Vec2::ZERO, Vec2::ZERO));
+
+    let mut inherited_use_rounding = true;
+    let mut ancestor = parent;
+    while let Some(parent) = ancestor {
+        let Ok((_, _, layout_config)) = context_query.get(parent) else {
+            break;
+        };
+        if let Some(layout_config) = layout_config {
+            inherited_use_rounding = layout_config.use_rounding;
+            break;
+        }
+        ancestor = ui_children.get_parent(parent);
+    }
+
+    Some(GeometryContext {
+        inherited_use_rounding,
+        target_size: computed_target.physical_size().as_vec2(),
+        inherited_transform,
+        inverse_target_scale_factor: computed_target.scale_factor.recip(),
+        parent_size,
+        parent_scroll_position,
+    })
+}
+
 /// Resolves Taffy output, transforms, scrolling, outlines, and radii into render geometry.
+///
+/// Layout-affecting changes resolve their complete UI roots because Taffy may move siblings.
+/// Placement changes resolve only the changed subtrees, and outline changes resolve only the
+/// changed nodes.
 pub fn ui_geometry_system(
     mut ui_surface: ResMut<UiSurface>,
     ui_root_node_query: UiRootNodes,
     ui_children: UiChildren,
     target_query: Query<&ComputedUiRenderTargetInfo>,
-    mut node_update_query: Query<(
-        &mut ComputedNode,
-        &UiTransform,
-        &mut UiGlobalTransform,
-        &Node,
-        Option<&LayoutConfig>,
-        Option<&Outline>,
-        Option<&ScrollPosition>,
-        Option<&IgnoreScroll>,
+    mut node_queries: ParamSet<(
+        Query<(
+            &mut ComputedNode,
+            &UiTransform,
+            &mut UiGlobalTransform,
+            &Node,
+            Option<&LayoutConfig>,
+            Option<&Outline>,
+            Option<&ScrollPosition>,
+            Option<&IgnoreScroll>,
+        )>,
+        Query<(&ComputedNode, &UiGlobalTransform, Option<&LayoutConfig>)>,
     )>,
+    mut changes: GeometryChanges,
+    mut dirty_subtrees: Local<EntityHashSet>,
+    mut dirty_nodes: Local<EntityHashSet>,
+    mut subtree_roots: Local<Vec<Entity>>,
 ) {
-    for ui_root_entity in ui_root_node_query.iter() {
-        let Ok(computed_target) = target_query.get(ui_root_entity) else {
+    dirty_subtrees.clear();
+    dirty_nodes.clear();
+    subtree_roots.clear();
+
+    changes.collect_local(&mut dirty_subtrees, &mut dirty_nodes);
+    for entity in changes.layout.iter() {
+        let mut root = entity;
+        while let Some(parent) = ui_children.get_parent(root) {
+            root = parent;
+        }
+        dirty_subtrees.insert(root);
+    }
+    if changes.requires_all_roots() {
+        dirty_subtrees.clear();
+        dirty_nodes.clear();
+        dirty_subtrees.extend(ui_root_node_query.iter());
+    }
+
+    for &entity in dirty_subtrees.iter() {
+        let mut ancestor = ui_children.get_parent(entity);
+        let mut covered_by_ancestor = false;
+        while let Some(parent) = ancestor {
+            if dirty_subtrees.contains(&parent) {
+                covered_by_ancestor = true;
+                break;
+            }
+            ancestor = ui_children.get_parent(parent);
+        }
+        if !covered_by_ancestor {
+            subtree_roots.push(entity);
+        }
+    }
+
+    for entity in subtree_roots.drain(..) {
+        let context = {
+            let context_query = node_queries.p1();
+            geometry_context(entity, &ui_children, &target_query, &context_query)
+        };
+        let Some(context) = context else {
             continue;
         };
+        let mut node_update_query = node_queries.p0();
         update_uinode_geometry_recursive(
-            ui_root_entity,
+            entity,
             &mut ui_surface,
-            true,
-            computed_target.physical_size().as_vec2(),
-            Affine2::IDENTITY,
+            context.inherited_use_rounding,
+            context.target_size,
+            context.inherited_transform,
             &mut node_update_query,
             &ui_children,
-            computed_target.scale_factor.recip(),
-            Vec2::ZERO,
-            Vec2::ZERO,
+            context.inverse_target_scale_factor,
+            context.parent_size,
+            context.parent_scroll_position,
+        );
+    }
+
+    for entity in dirty_nodes.drain() {
+        let mut ancestor = Some(entity);
+        let mut covered_by_subtree = false;
+        while let Some(node) = ancestor {
+            if dirty_subtrees.contains(&node) {
+                covered_by_subtree = true;
+                break;
+            }
+            ancestor = ui_children.get_parent(node);
+        }
+        if covered_by_subtree {
+            continue;
+        }
+        let Ok(computed_target) = target_query.get(entity) else {
+            continue;
+        };
+        let mut node_update_query = node_queries.p0();
+        update_outline_geometry(
+            entity,
+            &mut node_update_query,
+            computed_target.scale_factor,
+            computed_target.physical_size().as_vec2(),
         );
     }
 }
@@ -260,6 +447,10 @@ fn update_uinode_geometry_recursive(
         maybe_scroll_sticky,
     )) = node_update_query.get_mut(entity)
     {
+        #[cfg(test)]
+        {
+            ui_surface.geometry_visits += 1;
+        }
         let use_rounding = maybe_layout_config
             .map(|layout_config| layout_config.use_rounding)
             .unwrap_or(inherited_use_rounding);
@@ -323,35 +514,13 @@ fn update_uinode_geometry_recursive(
             target_size,
         );
 
-        if let Some(outline) = maybe_outline {
-            // don't trigger change detection when only outlines are changed
-            let node = node.bypass_change_detection();
-            node.outline_width = if style.display != Display::None {
-                outline
-                    .width
-                    .resolve(
-                        inverse_target_scale_factor.recip(),
-                        node.size().x,
-                        target_size,
-                    )
-                    .unwrap_or(0.)
-                    .max(0.)
-            } else {
-                0.
-            };
-
-            node.outline_offset = outline
-                .offset
-                .resolve(
-                    inverse_target_scale_factor.recip(),
-                    node.size().x,
-                    target_size,
-                )
-                .unwrap_or(0.)
-                // Clamp outline offsets to at least the length of the node's shorter side
-                // Negative offset outlines can be useful to create thing like in-set focus indicators
-                .max(-0.5 * node.size.min_element());
-        }
+        update_outline_values(
+            &mut node,
+            style,
+            maybe_outline,
+            inverse_target_scale_factor.recip(),
+            target_size,
+        );
 
         node.bypass_change_detection().scrollbar_size =
             Vec2::new(layout.scrollbar_size.width, layout.scrollbar_size.height);
@@ -396,6 +565,59 @@ fn update_uinode_geometry_recursive(
             );
         }
     }
+}
+
+fn update_outline_geometry(
+    entity: Entity,
+    node_update_query: &mut Query<(
+        &mut ComputedNode,
+        &UiTransform,
+        &mut UiGlobalTransform,
+        &Node,
+        Option<&LayoutConfig>,
+        Option<&Outline>,
+        Option<&ScrollPosition>,
+        Option<&IgnoreScroll>,
+    )>,
+    scale_factor: f32,
+    target_size: Vec2,
+) {
+    let Ok((mut node, _, _, style, _, maybe_outline, _, _)) = node_update_query.get_mut(entity)
+    else {
+        return;
+    };
+    update_outline_values(&mut node, style, maybe_outline, scale_factor, target_size);
+}
+
+fn update_outline_values(
+    node: &mut Mut<ComputedNode>,
+    style: &Node,
+    maybe_outline: Option<&Outline>,
+    scale_factor: f32,
+    target_size: Vec2,
+) {
+    let Some(outline) = maybe_outline else {
+        let node = node.bypass_change_detection();
+        node.outline_width = 0.0;
+        node.outline_offset = 0.0;
+        return;
+    };
+
+    let node = node.bypass_change_detection();
+    node.outline_width = if style.display != Display::None {
+        outline
+            .width
+            .resolve(scale_factor, node.size().x, target_size)
+            .unwrap_or(0.0)
+            .max(0.0)
+    } else {
+        0.0
+    };
+    node.outline_offset = outline
+        .offset
+        .resolve(scale_factor, node.size().x, target_size)
+        .unwrap_or(0.0)
+        .max(-0.5 * node.size.min_element());
 }
 
 #[cfg(test)]
@@ -485,6 +707,68 @@ mod tests {
         ));
 
         app
+    }
+
+    #[test]
+    fn placement_resolves_only_the_changed_subtree() {
+        let mut app = setup_ui_test_app();
+        let root_a = app.world_mut().spawn(Node::default()).id();
+        let branch_a = app.world_mut().spawn(Node::default()).id();
+        let leaf_a = app.world_mut().spawn(Node::default()).id();
+        app.world_mut().entity_mut(branch_a).add_child(leaf_a);
+        app.world_mut().entity_mut(root_a).add_child(branch_a);
+
+        let root_b = app.world_mut().spawn(Node::default()).id();
+        let leaf_b = app.world_mut().spawn(Node::default()).id();
+        app.world_mut().entity_mut(root_b).add_child(leaf_b);
+        app.update();
+
+        app.world_mut().resource_mut::<UiSurface>().geometry_visits = 0;
+        app.world_mut()
+            .get_mut::<UiTransform>(branch_a)
+            .unwrap()
+            .translation
+            .x = Val::Px(1.0);
+        app.update();
+        assert_eq!(app.world().resource::<UiSurface>().geometry_visits, 2);
+
+        app.world_mut().resource_mut::<UiSurface>().geometry_visits = 0;
+        app.world_mut().get_mut::<Node>(leaf_a).unwrap().width = Val::Px(1.0);
+        app.update();
+        assert_eq!(app.world().resource::<UiSurface>().geometry_visits, 3);
+    }
+
+    #[test]
+    fn removing_outline_clears_derived_outline_without_walking_descendants() {
+        let mut app = setup_ui_test_app();
+        let root = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(10.0),
+                    height: Val::Px(10.0),
+                    ..default()
+                },
+                Outline::default(),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ComputedNode>(root)
+                .unwrap()
+                .outline_width(),
+            1.0
+        );
+
+        app.world_mut().resource_mut::<UiSurface>().geometry_visits = 0;
+        app.world_mut().entity_mut(root).remove::<Outline>();
+        app.update();
+
+        let computed = app.world().get::<ComputedNode>(root).unwrap();
+        assert_eq!(computed.outline_width(), 0.0);
+        assert_eq!(computed.outline_offset(), 0.0);
+        assert_eq!(app.world().resource::<UiSurface>().geometry_visits, 0);
     }
 
     #[test]

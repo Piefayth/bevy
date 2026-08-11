@@ -17,6 +17,10 @@ use bevy::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 
+fn drain_removed<T: bevy::ecs::component::Component>(removed: &mut RemovedComponents<T>) -> bool {
+    removed.read().count() != 0
+}
+
 /// Main-world recursive work completed since startup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetainedUiMainWorldWork {
@@ -156,13 +160,11 @@ impl RemovedLayoutInputs<'_, '_> {
             children,
             parent,
         } = self;
-        node.read()
-            .chain(content_size.read())
-            .chain(target.read())
-            .chain(children.read())
-            .chain(parent.read())
-            .next()
-            .is_some()
+        drain_removed(node)
+            | drain_removed(content_size)
+            | drain_removed(target)
+            | drain_removed(children)
+            | drain_removed(parent)
     }
 }
 
@@ -215,18 +217,16 @@ impl RemovedGeometryInputs<'_, '_> {
             children,
             parent,
         } = self;
-        node.read()
-            .chain(content_size.read())
-            .chain(target.read())
-            .chain(transform.read())
-            .chain(config.read())
-            .chain(outline.read())
-            .chain(scroll.read())
-            .chain(ignore_scroll.read())
-            .chain(children.read())
-            .chain(parent.read())
-            .next()
-            .is_some()
+        drain_removed(node)
+            | drain_removed(content_size)
+            | drain_removed(target)
+            | drain_removed(transform)
+            | drain_removed(config)
+            | drain_removed(outline)
+            | drain_removed(scroll)
+            | drain_removed(ignore_scroll)
+            | drain_removed(children)
+            | drain_removed(parent)
     }
 }
 
@@ -279,13 +279,11 @@ impl RemovedStackInputs<'_, '_> {
             children,
             parent,
         } = self;
-        node.read()
-            .chain(global_z.read())
-            .chain(local_z.read())
-            .chain(children.read())
-            .chain(parent.read())
-            .next()
-            .is_some()
+        drain_removed(node)
+            | drain_removed(global_z)
+            | drain_removed(local_z)
+            | drain_removed(children)
+            | drain_removed(parent)
     }
 }
 
@@ -332,15 +330,13 @@ impl RemovedClippingInputs<'_, '_> {
             children,
             parent,
         } = self;
-        node.read()
-            .chain(computed.read())
-            .chain(transform.read())
-            .chain(clip.read())
-            .chain(override_clip.read())
-            .chain(children.read())
-            .chain(parent.read())
-            .next()
-            .is_some()
+        drain_removed(node)
+            | drain_removed(computed)
+            | drain_removed(transform)
+            | drain_removed(clip)
+            | drain_removed(override_clip)
+            | drain_removed(children)
+            | drain_removed(parent)
     }
 }
 

@@ -62,6 +62,8 @@ pub struct UiSurface {
     pub(super) entity_to_taffy: EntityHashMap<LayoutNode>,
     pub(super) taffy: UiTree<NodeMeasure>,
     taffy_children_scratch: Vec<taffy::NodeId>,
+    #[cfg(test)]
+    pub(super) geometry_visits: usize,
     #[cfg(feature = "ghost_nodes")]
     pub(super) dirty_ghost_children_scratch: EntityHashSet,
 }
@@ -96,6 +98,8 @@ impl Default for UiSurface {
             entity_to_taffy: Default::default(),
             taffy,
             taffy_children_scratch: Vec::new(),
+            #[cfg(test)]
+            geometry_visits: 0,
             #[cfg(feature = "ghost_nodes")]
             dirty_ghost_children_scratch: EntityHashSet::new(),
         }

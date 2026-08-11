@@ -241,3 +241,19 @@ fn node_removal_wakes_every_recursive_domain_and_cleans_the_stack() {
     assert_eq!(after.clip_runs, before.clip_runs + 1);
     assert!(!app.world().resource::<UiStack>().uinodes.contains(&leaf));
 }
+
+#[test]
+fn every_removal_is_consumed_in_the_frame_that_handles_it() {
+    let (mut app, root, first) = test_app();
+    let second = app.world_mut().spawn(Node::default()).id();
+    app.world_mut().entity_mut(root).add_child(second);
+    app.world_mut().run_schedule(PostUpdate);
+
+    app.world_mut().despawn(first);
+    app.world_mut().despawn(second);
+    app.world_mut().run_schedule(PostUpdate);
+    let after_removals = retained_work(&app);
+
+    app.world_mut().run_schedule(PostUpdate);
+    assert_eq!(retained_work(&app), after_removals);
+}

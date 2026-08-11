@@ -195,7 +195,7 @@ impl Default for UiTransform {
 /// Absolute 2D transform for UI nodes
 ///
 /// [`UiGlobalTransform`]s are updated from [`UiTransform`] and [`Node`](crate::ui_node::Node)
-///  in [`ui_layout_system`](crate::layout::ui_layout_system)
+/// in [`ui_geometry_system`](crate::layout::ui_geometry_system).
 #[derive(Component, Debug, PartialEq, Clone, Copy, Reflect, Deref)]
 #[reflect(Component, Default, PartialEq, Debug, Clone)]
 #[cfg_attr(

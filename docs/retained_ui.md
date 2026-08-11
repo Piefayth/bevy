@@ -78,8 +78,11 @@ ordered `ui_layout_system` and `ui_geometry_system` systems. The former owns
 Taffy synchronization and computation; the latter owns placement, scrolling,
 rounding, outlines, radii, and derived render geometry. This is the second
 justified `bevy_ui` expansion: it lets a `UiTransform` or scroll animation skip
-Taffy without duplicating Bevy internals. Static-tree quiescence alone would not
-have justified it.
+Taffy without duplicating Bevy internals. Geometry nomination is exact:
+layout-affecting changes resolve their affected root because Taffy may move
+siblings, transforms and scrolling resolve only the changed subtree, and an
+outline resolves only its node. Static-tree quiescence alone would not have
+justified this patch.
 
 There is a second possible `bevy_ui` boundary for O(changes) candidate
 nomination. In Bevy 0.19, lifecycle hooks run for component insertion,
@@ -551,17 +554,20 @@ run fell from approximately 1.145 ms to 0.200 ms after layout, geometry, stack,
 and clipping were gated. A localized width change still requires Bevy's
 whole-root Taffy and geometry walk. After splitting placement from Taffy, a
 localized `UiTransform` change at 10,000 nodes fell from approximately 1.27 ms
-on the stock path to 0.60 ms on the retained path. It still walks the whole UI
-tree for geometry, so it remains linear and is not the desired endpoint. These
-are local comparison points, not portable claims. The quiet remainder includes
-the exact `Changed<T>` scans and other ungated `PostUpdate` systems; it is not
-described as zero CPU work. Atomic counters separately prove zero Taffy,
-geometry, stack, and clipping walks on static and paint-only frames. Tests also
-prove width changes wake Taffy, geometry, and clipping; `UiTransform` wakes
-geometry and clipping but not Taffy; `ZIndex` wakes only stack; `OverrideClip`
-wakes only clipping; hierarchy changes wake every recursive domain; removal
-cleans the stack; and custom systems in the public UI sets continue to run
-normally.
+on the stock path to 0.60 ms after the initial split, then to roughly 0.38 ms
+after geometry was restricted to the changed one-node subtree. The remaining
+size-dependent cost is candidate nomination through `Changed<T>` queries, not
+Taffy or geometry traversal. These are local comparison points, not portable
+claims. The quiet remainder includes those exact scans and other ungated
+`PostUpdate` systems; it is not described as zero CPU work. Atomic counters
+separately prove zero Taffy, geometry, stack, and clipping walks on static and
+paint-only frames. A deterministic visit-count test proves a transform visits
+exactly its changed branch and a layout mutation visits its affected root
+without touching another root. Tests also prove width changes wake Taffy,
+geometry, and clipping; `UiTransform` wakes geometry and clipping but not Taffy;
+`ZIndex` wakes only stack; `OverrideClip` wakes only clipping; hierarchy changes
+wake every recursive domain; removal cleans the stack; and custom systems in
+the public UI sets continue to run normally.
 
 The first retained-core benchmark on the same machine measured quiet repair
 planning at roughly 6 ns and one canonical record change plus exact damage at
