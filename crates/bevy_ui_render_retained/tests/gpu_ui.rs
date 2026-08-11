@@ -3,8 +3,9 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use bevy::ui_render::RenderUiSystems;
-use bevy::ui_render::{UiRenderInfrastructurePlugin, UiRenderPlugin};
+use bevy::ui_render::{
+    BoxShadowSamples, RenderUiSystems, UiRenderInfrastructurePlugin, UiRenderPlugin,
+};
 use bevy::{
     asset::{AssetId, RenderAssetUsages},
     camera::{ClearColorConfig, RenderTarget, Viewport},
@@ -405,6 +406,24 @@ fn spawn_gradient_leaf(world: &mut World, camera: Entity, gradient: BackgroundGr
                 ..default()
             },
             gradient,
+            UiTargetCamera(camera),
+        ))
+        .id()
+}
+
+fn spawn_shadow_leaf(world: &mut World, camera: Entity, shadow: BoxShadow) -> Entity {
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(16),
+                top: px(14),
+                width: px(20),
+                height: px(20),
+                border_radius: BorderRadius::all(px(5)),
+                ..default()
+            },
+            shadow,
             UiTargetCamera(camera),
         ))
         .id()
@@ -889,6 +908,365 @@ fn quiet_linear_gradient_matches_stock_without_another_repair() {
             retained.paint_after_mutation,
             retained.paint_before_mutation
         );
+    });
+}
+
+#[test]
+fn quiet_box_shadow_matches_stock_without_another_repair() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_shadow_leaf(
+                world,
+                camera,
+                BoxShadow::new(
+                    Color::srgba_u8(220, 70, 35, 210),
+                    px(3),
+                    px(2),
+                    px(4),
+                    px(3),
+                ),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn changed_box_shadow_repairs_its_exact_possible_pixels_and_one_quad() {
+    with_gpu_lock(|| {
+        let initial = Color::srgba_u8(220, 70, 35, 170);
+        let final_color = Color::srgba_u8(35, 100, 230, 220);
+        let setup = move |world: &mut World, camera, color| {
+            spawn_shadow_leaf(
+                world,
+                camera,
+                BoxShadow::new(color, px(3), px(2), px(4), px(2)),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, final_color),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, initial),
+            move |world, entity| {
+                world.entity_mut(entity).get_mut::<BoxShadow>().unwrap().0[0].color = final_color;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 36 * 36);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+    });
+}
+
+#[test]
+fn changed_box_shadow_offset_repairs_exact_old_union_new_bounds() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera, x_offset| {
+            spawn_shadow_leaf(
+                world,
+                camera,
+                BoxShadow::new(
+                    Color::srgba_u8(220, 70, 35, 210),
+                    x_offset,
+                    px(2),
+                    px(4),
+                    px(2),
+                ),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, px(4)),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, px(0)),
+            |world, entity| {
+                world.entity_mut(entity).get_mut::<BoxShadow>().unwrap().0[0].x_offset = px(4);
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 40 * 36);
+    });
+}
+
+#[test]
+fn removing_box_shadow_repairs_its_vacated_pixels() {
+    with_gpu_lock(|| {
+        let shadow = || {
+            BoxShadow::new(
+                Color::srgba_u8(220, 70, 35, 210),
+                px(3),
+                px(2),
+                px(4),
+                px(2),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                world
+                    .spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(16),
+                            top: px(14),
+                            width: px(20),
+                            height: px(20),
+                            ..default()
+                        },
+                        UiTargetCamera(camera),
+                    ))
+                    .id()
+            },
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_shadow_leaf(world, camera, shadow()),
+            |world, entity| {
+                world.entity_mut(entity).remove::<BoxShadow>();
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 36 * 36);
+    });
+}
+
+#[test]
+fn multiple_box_shadows_match_stock_back_to_front_order() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_shadow_leaf(
+                world,
+                camera,
+                BoxShadow(vec![
+                    ShadowStyle {
+                        color: Color::srgba_u8(220, 40, 30, 180),
+                        x_offset: px(-2),
+                        y_offset: px(1),
+                        spread_radius: px(5),
+                        blur_radius: px(2),
+                    },
+                    ShadowStyle {
+                        color: Color::srgba_u8(30, 90, 230, 150),
+                        x_offset: px(4),
+                        y_offset: px(3),
+                        spread_radius: px(2),
+                        blur_radius: px(1),
+                    },
+                ]),
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+    });
+}
+
+#[test]
+fn changed_camera_shadow_samples_repairs_only_that_cameras_shadow() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera: Entity, samples: u32| {
+            world.entity_mut(camera).insert(BoxShadowSamples(samples));
+            (
+                spawn_shadow_leaf(
+                    world,
+                    camera,
+                    BoxShadow::new(
+                        Color::srgba_u8(220, 70, 35, 210),
+                        px(3),
+                        px(2),
+                        px(4),
+                        px(5),
+                    ),
+                ),
+                camera,
+            )
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, 10),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, 1),
+            |world, (_, camera)| {
+                world.entity_mut(camera).insert(BoxShadowSamples(10));
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 54 * 53);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+    });
+}
+
+#[test]
+fn equal_box_shadow_replacement_compares_without_repair() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                spawn_shadow_leaf(
+                    world,
+                    camera,
+                    BoxShadow::new(
+                        Color::srgba_u8(220, 70, 35, 210),
+                        px(3),
+                        px(2),
+                        px(4),
+                        px(2),
+                    ),
+                )
+            },
+            |world, entity| {
+                let shadow = world.entity(entity).get::<BoxShadow>().unwrap().clone();
+                world.entity_mut(entity).insert(shadow);
+            },
+        );
+
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        let paint_before = output.paint_before_mutation.unwrap();
+        let paint_after = output.paint_after_mutation.unwrap();
+        assert_eq!(paint_after.candidates, paint_before.candidates + 1);
+        assert_eq!(
+            paint_after.records_compared,
+            paint_before.records_compared + 1
+        );
+        assert_eq!(paint_after.records_changed, paint_before.records_changed);
+    });
+}
+
+#[test]
+fn box_shadow_damage_replays_the_background_above_it() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera, color| {
+            let entity = spawn_shadow_leaf(
+                world,
+                camera,
+                BoxShadow::new(color, px(3), px(2), px(4), px(2)),
+            );
+            world
+                .entity_mut(entity)
+                .insert(BackgroundColor(Color::srgba_u8(30, 190, 80, 170)));
+            entity
+        };
+        let final_color = Color::srgba_u8(35, 100, 230, 220);
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, final_color),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| setup(world, camera, Color::srgba_u8(220, 70, 35, 170)),
+            move |world, entity| {
+                world.entity_mut(entity).get_mut::<BoxShadow>().unwrap().0[0].color = final_color;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repair_pixels, before.repair_pixels + 36 * 36);
+        assert_eq!(after.items_replayed, before.items_replayed + 2);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 2);
+    });
+}
+
+#[test]
+fn transparent_box_shadow_does_no_paint_work() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                (
+                    spawn_shadow_leaf(
+                        world,
+                        camera,
+                        BoxShadow::new(Color::NONE, px(3), px(2), px(4), px(2)),
+                    ),
+                    camera,
+                )
+            },
+            |world, (_, camera)| {
+                world.entity_mut(camera).insert(BoxShadowSamples(10));
+            },
+        );
+
+        assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.surfaces_created, 0);
     });
 }
 

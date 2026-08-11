@@ -17,6 +17,7 @@ use bevy::{
     sprite::{BorderRect, SliceScaleMode, SpriteImageMode},
     ui::ResolvedBorderRadius,
     ui_render::{
+        box_shadow::{ExtractedBoxShadow, ExtractedBoxShadows, ResolvedBoxShadow},
         gradient::{ExtractedColorStops, ExtractedGradient, ExtractedGradients, ResolvedGradient},
         ui_texture_slice_pipeline::{ExtractedUiTextureSlice, ExtractedUiTextureSlices},
         ExtractedGlyph, ExtractedUiItem, ExtractedUiNode, ExtractedUiNodes, NodeType,
@@ -30,6 +31,7 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum PaintFamily {
+    BoxShadow,
     Background,
     Border,
     Image,
@@ -73,10 +75,62 @@ pub(crate) enum ResourceFingerprint {
 
 #[derive(Clone)]
 pub(crate) enum RetainedDrawItem {
+    BoxShadow(RetainedBoxShadowItem),
     Gradient(RetainedGradientItem),
     Node(RetainedNodeItem),
     Glyphs(Box<[RetainedGlyph]>),
     TextureSlice(RetainedTextureSliceItem),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RetainedBoxShadowItem {
+    stack_index: u32,
+    samples: u32,
+    bounds: [FloatBits; 2],
+    color: [FloatBits; 4],
+    radius: [FloatBits; 4],
+    blur_radius: FloatBits,
+    size: [FloatBits; 2],
+}
+
+impl RetainedBoxShadowItem {
+    pub(crate) fn new(stack_index: u32, shadow: ResolvedBoxShadow, samples: u32) -> Self {
+        Self {
+            stack_index,
+            samples,
+            bounds: shadow.bounds.to_array().map(FloatBits::new),
+            color: shadow.color.to_f32_array().map(FloatBits::new),
+            radius: <[f32; 4]>::from(shadow.radius).map(FloatBits::new),
+            blur_radius: FloatBits::new(shadow.blur_radius),
+            size: shadow.size.to_array().map(FloatBits::new),
+        }
+    }
+
+    fn bounds(&self) -> Vec2 {
+        Vec2::new(self.bounds[0].get(), self.bounds[1].get())
+    }
+
+    fn color(&self) -> bevy::color::LinearRgba {
+        bevy::color::LinearRgba::new(
+            self.color[0].get(),
+            self.color[1].get(),
+            self.color[2].get(),
+            self.color[3].get(),
+        )
+    }
+
+    fn radius(&self) -> ResolvedBorderRadius {
+        ResolvedBorderRadius {
+            top_left: self.radius[0].get(),
+            top_right: self.radius[1].get(),
+            bottom_right: self.radius[2].get(),
+            bottom_left: self.radius[3].get(),
+        }
+    }
+
+    fn size(&self) -> Vec2 {
+        Vec2::new(self.size[0].get(), self.size[1].get())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -309,6 +363,7 @@ struct RetainedNodeFingerprint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RetainedItemFingerprint {
+    BoxShadow,
     Gradient,
     Node(RetainedNodeFingerprint),
     Glyphs,
@@ -360,6 +415,9 @@ impl PartialEq for RetainedRecord {
             && self.item == other.item
             && match (&self.draw.item, &other.draw.item) {
                 (RetainedDrawItem::Glyphs(left), RetainedDrawItem::Glyphs(right)) => left == right,
+                (RetainedDrawItem::BoxShadow(left), RetainedDrawItem::BoxShadow(right)) => {
+                    left == right
+                }
                 (RetainedDrawItem::Gradient(left), RetainedDrawItem::Gradient(right)) => {
                     left == right
                 }
@@ -411,6 +469,7 @@ impl RetainedRecord {
                 })
             }
             RetainedDrawItem::Glyphs(_) => RetainedItemFingerprint::Glyphs,
+            RetainedDrawItem::BoxShadow(_) => RetainedItemFingerprint::BoxShadow,
             RetainedDrawItem::Gradient(_) => RetainedItemFingerprint::Gradient,
             RetainedDrawItem::TextureSlice(item) => {
                 RetainedItemFingerprint::TextureSlice(RetainedTextureSliceFingerprint {
@@ -717,10 +776,18 @@ pub(crate) fn replay_retained_ui(
     mut extracted_slices: ResMut<ExtractedUiTextureSlices>,
     mut extracted_gradients: ResMut<ExtractedGradients>,
     mut extracted_stops: ResMut<ExtractedColorStops>,
+    mut extracted_shadows: ResMut<ExtractedBoxShadows>,
 ) {
     let mut surfaces = state.lock();
     let mut items = items.0.lock().unwrap_or_else(PoisonError::into_inner);
     items.clear();
+    let mut buffers = ReplayBuffers {
+        nodes: &mut extracted,
+        slices: &mut extracted_slices,
+        gradients: &mut extracted_gradients,
+        stops: &mut extracted_stops,
+        shadows: &mut extracted_shadows,
+    };
 
     for paint in surfaces.paint.values_mut() {
         counters.add(paint.take_counters());
@@ -766,10 +833,7 @@ pub(crate) fn replay_retained_ui(
                     index += 1;
                 }
                 push_replayed(
-                    &mut extracted,
-                    &mut extracted_slices,
-                    &mut extracted_gradients,
-                    &mut extracted_stops,
+                    &mut buffers,
                     &mut items,
                     &record.value.draw,
                     coverage,
@@ -779,10 +843,7 @@ pub(crate) fn replay_retained_ui(
             }
 
             push_replayed(
-                &mut extracted,
-                &mut extracted_slices,
-                &mut extracted_gradients,
-                &mut extracted_stops,
+                &mut buffers,
                 &mut items,
                 &record.value.draw,
                 record.coverage.clone(),
@@ -793,20 +854,48 @@ pub(crate) fn replay_retained_ui(
     }
 }
 
+struct ReplayBuffers<'a> {
+    nodes: &'a mut ExtractedUiNodes,
+    slices: &'a mut ExtractedUiTextureSlices,
+    gradients: &'a mut ExtractedGradients,
+    stops: &'a mut ExtractedColorStops,
+    shadows: &'a mut ExtractedBoxShadows,
+}
+
 fn push_replayed(
-    extracted: &mut ExtractedUiNodes,
-    extracted_slices: &mut ExtractedUiTextureSlices,
-    extracted_gradients: &mut ExtractedGradients,
-    extracted_stops: &mut ExtractedColorStops,
+    buffers: &mut ReplayBuffers,
     items: &mut HashMap<Entity, RetainedItem>,
     draw: &RetainedDraw,
     coverage: PaintCoverage,
     node_type: Option<NodeType>,
 ) {
     let item = match &draw.item {
+        RetainedDrawItem::BoxShadow(item) => {
+            buffers.shadows.box_shadows.push(ExtractedBoxShadow {
+                stack_index: item.stack_index,
+                transform: draw.transform,
+                bounds: item.bounds(),
+                clip: draw.clip,
+                extracted_camera_entity: draw.camera,
+                color: item.color(),
+                radius: item.radius(),
+                blur_radius: item.blur_radius.get(),
+                size: item.size(),
+                main_entity: draw.main_entity,
+                render_entity: draw.render_entity,
+            });
+            items.insert(
+                draw.render_entity,
+                RetainedItem {
+                    coverage,
+                    image: draw.image,
+                },
+            );
+            return;
+        }
         RetainedDrawItem::Gradient(item) => {
-            let range_start = extracted_stops.0.len();
-            extracted_stops.0.extend(item.stops.iter().map(|stop| {
+            let range_start = buffers.stops.0.len();
+            buffers.stops.0.extend(item.stops.iter().map(|stop| {
                 (
                     bevy::color::LinearRgba::new(
                         stop.color[0].get(),
@@ -818,13 +907,13 @@ fn push_replayed(
                     stop.hint.get(),
                 )
             }));
-            extracted_gradients.items.push(ExtractedGradient {
+            buffers.gradients.items.push(ExtractedGradient {
                 stack_index: item.stack_index,
                 transform: draw.transform,
                 rect: item.rect(),
                 clip: draw.clip,
                 extracted_camera_entity: draw.camera,
-                stops_range: range_start..extracted_stops.0.len(),
+                stops_range: range_start..buffers.stops.0.len(),
                 node_type: item.node_type(),
                 main_entity: draw.main_entity,
                 render_entity: draw.render_entity,
@@ -853,8 +942,9 @@ fn push_replayed(
             node_type: node_type.unwrap_or(item.node_type),
         },
         RetainedDrawItem::Glyphs(glyphs) => {
-            let start = extracted.glyphs.len();
-            extracted
+            let start = buffers.nodes.glyphs.len();
+            buffers
+                .nodes
                 .glyphs
                 .extend(glyphs.iter().map(|glyph| ExtractedGlyph {
                     color: glyph.color(),
@@ -862,11 +952,11 @@ fn push_replayed(
                     rect: glyph.rect(),
                 }));
             ExtractedUiItem::Glyphs {
-                range: start..extracted.glyphs.len(),
+                range: start..buffers.nodes.glyphs.len(),
             }
         }
         RetainedDrawItem::TextureSlice(item) => {
-            extracted_slices.slices.push(ExtractedUiTextureSlice {
+            buffers.slices.slices.push(ExtractedUiTextureSlice {
                 stack_index: item.stack_index,
                 transform: draw.transform,
                 rect: item.rect,
@@ -899,7 +989,7 @@ fn push_replayed(
             image: draw.image,
         },
     );
-    extracted.uinodes.push(ExtractedUiNode {
+    buffers.nodes.uinodes.push(ExtractedUiNode {
         render_entity: draw.render_entity,
         z_order: draw.z_order,
         clip: draw.clip,

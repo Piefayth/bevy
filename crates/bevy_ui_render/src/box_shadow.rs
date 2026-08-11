@@ -28,7 +28,7 @@ use bevy_render::{GpuResourceAppExt, RenderApp, RenderStartup};
 use bevy_shader::{Shader, ShaderDefVal};
 use bevy_ui::{
     BoxShadow, CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
-    ComputedUiTargetCamera, ResolvedBorderRadius, UiGlobalTransform, Val,
+    ComputedUiTargetCamera, ResolvedBorderRadius, ShadowStyle, UiGlobalTransform, Val,
 };
 use bevy_utils::default;
 use bytemuck::{Pod, Zeroable};
@@ -42,6 +42,23 @@ pub struct BoxShadowPlugin;
 
 impl Plugin for BoxShadowPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(BoxShadowInfrastructurePlugin);
+
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.add_systems(
+                ExtractSchedule,
+                extract_shadows.in_set(RenderUiSystems::ExtractBoxShadows),
+            );
+        }
+    }
+}
+
+/// GPU pipeline, queueing, and preparation shared by UI box-shadow render policies.
+#[derive(Default)]
+pub struct BoxShadowInfrastructurePlugin;
+
+impl Plugin for BoxShadowInfrastructurePlugin {
+    fn build(&self, app: &mut App) {
         embedded_asset!(app, "box_shadow.wgsl");
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
@@ -51,10 +68,6 @@ impl Plugin for BoxShadowPlugin {
                 .init_gpu_resource::<BoxShadowMeta>()
                 .init_gpu_resource::<SpecializedRenderPipelines<BoxShadowPipeline>>()
                 .add_systems(RenderStartup, init_box_shadow_pipeline)
-                .add_systems(
-                    ExtractSchedule,
-                    extract_shadows.in_set(RenderUiSystems::ExtractBoxShadows),
-                )
                 .add_systems(
                     Render,
                     (
@@ -203,6 +216,67 @@ pub struct ExtractedBoxShadows {
     pub box_shadows: Vec<ExtractedBoxShadow>,
 }
 
+/// Exact result of resolving one logical box shadow for a render target.
+#[derive(Clone, Copy)]
+pub struct ResolvedBoxShadow {
+    pub offset: Vec2,
+    pub color: LinearRgba,
+    pub bounds: Vec2,
+    pub radius: ResolvedBorderRadius,
+    pub blur_radius: f32,
+    pub size: Vec2,
+}
+
+/// Resolves a box shadow into the geometry consumed by the GPU pipeline.
+pub fn resolve_box_shadow(
+    shadow: &ShadowStyle,
+    node_size: Vec2,
+    border_radius: ResolvedBorderRadius,
+    scale_factor: f32,
+    physical_viewport_size: Vec2,
+) -> Option<ResolvedBoxShadow> {
+    if shadow.color.is_fully_transparent() {
+        return None;
+    }
+
+    let resolve_val = |val, base| match val {
+        Val::Auto => 0.0,
+        Val::Px(px) => px * scale_factor,
+        Val::Percent(percent) => percent / 100.0 * base,
+        Val::Vw(percent) => percent / 100.0 * physical_viewport_size.x,
+        Val::Vh(percent) => percent / 100.0 * physical_viewport_size.y,
+        Val::VMin(percent) => percent / 100.0 * physical_viewport_size.min_element(),
+        Val::VMax(percent) => percent / 100.0 * physical_viewport_size.max_element(),
+    };
+
+    let spread_x = resolve_val(shadow.spread_radius, node_size.x);
+    let spread_ratio = (spread_x + node_size.x) / node_size.x;
+    let spread = vec2(spread_x, node_size.y * spread_ratio - node_size.y);
+    let blur_radius = resolve_val(shadow.blur_radius, node_size.x);
+    let offset = vec2(
+        resolve_val(shadow.x_offset, node_size.x),
+        resolve_val(shadow.y_offset, node_size.y),
+    );
+    let size = node_size + spread;
+    if size.cmple(Vec2::ZERO).any() {
+        return None;
+    }
+
+    Some(ResolvedBoxShadow {
+        offset,
+        color: shadow.color.into(),
+        bounds: size + 6.0 * blur_radius,
+        radius: ResolvedBorderRadius {
+            top_left: border_radius.top_left * spread_ratio,
+            top_right: border_radius.top_right * spread_ratio,
+            bottom_left: border_radius.bottom_left * spread_ratio,
+            bottom_right: border_radius.bottom_right * spread_ratio,
+        },
+        blur_radius,
+        size,
+    })
+}
+
 pub fn extract_shadows(
     mut commands: Commands,
     mut extracted_box_shadows: ResMut<ExtractedBoxShadows>,
@@ -235,58 +309,28 @@ pub fn extract_shadows(
             continue;
         };
 
-        let ui_physical_viewport_size = target.physical_size().as_vec2();
-        let scale_factor = target.scale_factor();
-
         for drop_shadow in box_shadow.iter() {
-            if drop_shadow.color.is_fully_transparent() {
+            let Some(shadow) = resolve_box_shadow(
+                drop_shadow,
+                uinode.size(),
+                uinode.border_radius(),
+                target.scale_factor(),
+                target.physical_size().as_vec2(),
+            ) else {
                 continue;
-            }
-
-            let resolve_val = |val, base, scale_factor| match val {
-                Val::Auto => 0.,
-                Val::Px(px) => px * scale_factor,
-                Val::Percent(percent) => percent / 100. * base,
-                Val::Vw(percent) => percent / 100. * ui_physical_viewport_size.x,
-                Val::Vh(percent) => percent / 100. * ui_physical_viewport_size.y,
-                Val::VMin(percent) => percent / 100. * ui_physical_viewport_size.min_element(),
-                Val::VMax(percent) => percent / 100. * ui_physical_viewport_size.max_element(),
-            };
-
-            let spread_x = resolve_val(drop_shadow.spread_radius, uinode.size().x, scale_factor);
-            let spread_ratio = (spread_x + uinode.size().x) / uinode.size().x;
-
-            let spread = vec2(spread_x, uinode.size().y * spread_ratio - uinode.size().y);
-
-            let blur_radius = resolve_val(drop_shadow.blur_radius, uinode.size().x, scale_factor);
-            let offset = vec2(
-                resolve_val(drop_shadow.x_offset, uinode.size().x, scale_factor),
-                resolve_val(drop_shadow.y_offset, uinode.size().y, scale_factor),
-            );
-
-            let shadow_size = uinode.size() + spread;
-            if shadow_size.cmple(Vec2::ZERO).any() {
-                continue;
-            }
-
-            let radius = ResolvedBorderRadius {
-                top_left: uinode.border_radius.top_left * spread_ratio,
-                top_right: uinode.border_radius.top_right * spread_ratio,
-                bottom_left: uinode.border_radius.bottom_left * spread_ratio,
-                bottom_right: uinode.border_radius.bottom_right * spread_ratio,
             };
 
             extracted_box_shadows.box_shadows.push(ExtractedBoxShadow {
                 render_entity: commands.spawn(TemporaryRenderEntity).id(),
                 stack_index: stack_index.0,
-                transform: Affine2::from(transform) * Affine2::from_translation(offset),
-                color: drop_shadow.color.into(),
-                bounds: shadow_size + 6. * blur_radius,
+                transform: Affine2::from(transform) * Affine2::from_translation(shadow.offset),
+                color: shadow.color,
+                bounds: shadow.bounds,
                 clip: clip.map(|clip| clip.clip),
                 extracted_camera_entity,
-                radius,
-                blur_radius,
-                size: shadow_size,
+                radius: shadow.radius,
+                blur_radius: shadow.blur_radius,
+                size: shadow.size,
                 main_entity: entity.into(),
             });
         }

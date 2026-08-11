@@ -66,6 +66,7 @@ pub(crate) struct RemovedGradientInputs<'w, 's> {
     background: RemovedComponents<'w, 's, BackgroundGradient>,
     border: RemovedComponents<'w, 's, BorderGradient>,
     clip: RemovedComponents<'w, 's, CalculatedClip>,
+    target: RemovedComponents<'w, 's, ComputedUiRenderTargetInfo>,
     computed_node: RemovedComponents<'w, 's, ComputedNode>,
     node: RemovedComponents<'w, 's, Node>,
     stack: RemovedComponents<'w, 's, ComputedStackIndex>,
@@ -109,6 +110,7 @@ pub(crate) fn extract_retained_gradients(
         background,
         border,
         clip,
+        target,
         computed_node,
         node,
         stack,
@@ -119,6 +121,7 @@ pub(crate) fn extract_retained_gradients(
     candidates.extend(background.read());
     candidates.extend(border.read());
     candidates.extend(clip.read());
+    candidates.extend(target.read());
 
     let mut surfaces = state.lock();
     for entity in computed_node

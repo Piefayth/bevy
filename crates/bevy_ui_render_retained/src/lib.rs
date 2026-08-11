@@ -21,6 +21,7 @@ mod layer;
 mod paint;
 mod sampled_image;
 mod scene;
+mod shadow;
 mod text;
 
 pub use damage::{DamageJournal, PhysicalRect, RepairPlan};

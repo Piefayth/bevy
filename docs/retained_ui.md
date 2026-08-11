@@ -159,6 +159,12 @@ optimization was removed. Resolution now represents a solid gradient as two
 equal stops, so every entry uses one ordered gradient pipeline and the retained
 renderer needs no special case.
 
+Box shadows use a `BoxShadowInfrastructurePlugin` and a shared
+`resolve_box_shadow` function for the same reason. The retained crate owns
+candidate extraction and canonical records while the stock and retained paths
+share target-relative value resolution, queueing, preparation, and the shader.
+This is still entirely inside the focused `bevy_ui_render` replacement patch.
+
 ## Model learned from other UI systems
 
 Mature UI systems retain several representations rather than one:
@@ -518,11 +524,11 @@ file lock. Its stock and retained apps run in one process. A directly
 constructed stock final scene is byte-identical to the retained scene reached
 through movement, recoloring, and removal, including translucent overlap.
 
-The integrated retained families are backgrounds (`BackgroundColor` and
-`OuterColor`), ordinary, sliced, and tiled `ImageNode`s, background and border
-gradients, solid borders and outlines, and all stock UI text paint. They share
-one scene, one stable `(entity, family, ordinal)` identity space, and one damage
-journal per camera.
+The integrated retained families are box shadows, backgrounds
+(`BackgroundColor` and `OuterColor`), ordinary, sliced, and tiled `ImageNode`s,
+background and border gradients, solid borders and outlines, and all stock UI
+text paint. They share one scene, one stable `(entity, family, ordinal)`
+identity space, and one damage journal per camera.
 Family extractors only update canonical records; a single later replay stage
 sorts every visible family together. This is required for correctness:
 repairing a translucent image or glyph must first replay the background
@@ -606,6 +612,20 @@ node box: a 24-by-20 test node repairs 340 possible border pixels and never its
 mixed-stack ordering, border mutation, equal replacement, and removal. The
 prepared-quad counter also proves that a three-stop change submits its two
 gradient segments and no unrelated item.
+
+Each declared box shadow has one canonical record containing its resolved
+target-space size, blur reach, corner radii, color, order, transform, clip, and
+camera sample count. Coverage is the shader's full possible output box, clipped
+to the target. A color change repairs exactly 1,296 possible pixels and submits
+one quad; a four-pixel offset repairs the exact 1,440-pixel old-union-new
+region. Removal, multiple-shadow back-to-front order, equal replacement, and
+quiet-frame behavior have GPU proofs. Another proof changes a shadow beneath a
+translucent background and requires both commands to replay bottom-up, while a
+transparent shadow creates no retained surface. `BoxShadowSamples` is a camera
+input, not a node input: changing it nominates only nodes targeting that camera
+and its value participates in canonical comparison. Deliberately removing that
+reverse nomination makes the pixel differential fail, confirming that the test
+detects the stale-sampling defect rather than passing vacuously.
 
 Availability follows Bevy's render-asset lifecycle rather than main-world
 `Assets<Image>` membership. Removing a main-world asset does not unload its GPU
