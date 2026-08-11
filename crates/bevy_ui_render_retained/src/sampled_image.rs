@@ -1,8 +1,13 @@
 //! Exact reverse dependencies for image-backed retained paint.
 
 use bevy::{
-    asset::{AssetEvent, AssetId, Assets, RenderAssetUsages},
-    ecs::{entity::Entity, message::MessageReader, system::ResMut},
+    asset::{AssetEvent, AssetId, Assets, Handle, RenderAssetUsages},
+    camera::{Camera, CameraOutputMode, RenderTarget},
+    ecs::{
+        entity::Entity,
+        message::MessageReader,
+        system::{Query, ResMut},
+    },
     image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor},
     math::{Rect, UVec3},
     render::{
@@ -13,11 +18,74 @@ use bevy::{
     },
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, PoisonError};
+
+#[derive(Clone, Copy)]
+enum ImageWriteRegion {
+    Full,
+    Rect { min: [i64; 2], max: [i64; 2] },
+}
+
+#[derive(Clone, Copy)]
+struct ImageWrite {
+    image: AssetId<Image>,
+    region: ImageWriteRegion,
+}
+
+/// Thread-safe invalidation input for images written outside Bevy's camera output path.
+///
+/// Call this before a custom render or compute pass writes an image sampled by retained UI.
+/// Calls made after extraction are retained and consumed during the next extraction.
+#[derive(bevy::prelude::Resource, Default)]
+pub struct RetainedUiImageWrites(Mutex<Vec<ImageWrite>>);
+
+impl RetainedUiImageWrites {
+    /// Invalidates every retained UI sample of `image`.
+    pub fn invalidate(&self, image: AssetId<Image>) {
+        self.push(ImageWrite {
+            image,
+            region: ImageWriteRegion::Full,
+        });
+    }
+
+    /// Invalidates retained UI samples intersecting a physical texel rectangle.
+    ///
+    /// Invalid rectangles conservatively invalidate the whole image. Empty rectangles do nothing.
+    pub fn invalidate_region(&self, image: AssetId<Image>, region: Rect) {
+        let region = if region.min.is_finite()
+            && region.max.is_finite()
+            && region.min.cmple(region.max).all()
+        {
+            if region.min.cmpeq(region.max).any() {
+                return;
+            }
+            ImageWriteRegion::Rect {
+                min: [region.min.x.floor() as i64, region.min.y.floor() as i64],
+                max: [region.max.x.ceil() as i64, region.max.y.ceil() as i64],
+            }
+        } else {
+            ImageWriteRegion::Full
+        };
+        self.push(ImageWrite { image, region });
+    }
+
+    fn push(&self, write: ImageWrite) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(write);
+    }
+
+    fn take(&self) -> Vec<ImageWrite> {
+        core::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ImageReader {
     Node(Entity),
     Text(Entity),
+    Viewport(Entity),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -93,6 +161,8 @@ pub(crate) struct RetainedSampledImages {
     samples: HashMap<ImageSample, SampleState>,
     pending: HashSet<AssetId<Image>>,
     nominated: HashSet<ImageReader>,
+    active_render_targets: HashSet<AssetId<Image>>,
+    rendered_revisions: HashMap<AssetId<Image>, u64>,
     next_revision: u64,
 }
 
@@ -132,6 +202,19 @@ impl RetainedSampledImages {
                 });
             }
         }
+        let newly_active: Vec<_> = dependencies
+            .images
+            .iter()
+            .filter(|image| {
+                self.active_render_targets.contains(image)
+                    && !self.rendered_revisions.contains_key(image)
+            })
+            .copied()
+            .collect();
+        for image in newly_active {
+            let revision = self.new_revision();
+            self.rendered_revisions.insert(image, revision);
+        }
         self.readers.insert(reader, dependencies);
         self.prune_unused();
     }
@@ -162,6 +245,8 @@ impl RetainedSampledImages {
         self.pending
             .retain(|image| self.image_readers.contains_key(image));
         self.samples.retain(|_, state| !state.readers.is_empty());
+        self.rendered_revisions
+            .retain(|image, _| self.image_readers.contains_key(image));
     }
 
     pub(crate) fn mark_pending(&mut self, image: AssetId<Image>, asset: Option<&Image>) {
@@ -232,14 +317,21 @@ impl RetainedSampledImages {
     pub(crate) fn take_nodes(&mut self) -> HashSet<Entity> {
         self.take(|reader| match reader {
             ImageReader::Node(entity) => Some(entity),
-            ImageReader::Text(_) => None,
+            ImageReader::Text(_) | ImageReader::Viewport(_) => None,
         })
     }
 
     pub(crate) fn take_text(&mut self) -> HashSet<Entity> {
         self.take(|reader| match reader {
             ImageReader::Text(entity) => Some(entity),
-            ImageReader::Node(_) => None,
+            ImageReader::Node(_) | ImageReader::Viewport(_) => None,
+        })
+    }
+
+    pub(crate) fn take_viewports(&mut self) -> HashSet<Entity> {
+        self.take(|reader| match reader {
+            ImageReader::Viewport(entity) => Some(entity),
+            ImageReader::Node(_) | ImageReader::Text(_) => None,
         })
     }
 
@@ -264,6 +356,9 @@ impl RetainedSampledImages {
         let mut samples: Vec<_> = samples.into_iter().collect();
         samples.sort_unstable();
         core::iter::once(self.metadata.get(&image).map_or(0, |state| state.revision))
+            .chain(core::iter::once(
+                self.rendered_revisions.get(&image).copied().unwrap_or(0),
+            ))
             .chain(
                 samples
                     .into_iter()
@@ -289,13 +384,62 @@ impl RetainedSampledImages {
             .expect("retained sampled-image revision exhausted");
         self.next_revision
     }
+
+    fn mark_render_targets(&mut self, active: HashSet<AssetId<Image>>) {
+        self.active_render_targets = active;
+        let active: Vec<_> = self
+            .active_render_targets
+            .iter()
+            .filter(|image| self.image_readers.contains_key(image))
+            .copied()
+            .collect();
+        for image in active {
+            let revision = self.new_revision();
+            self.rendered_revisions.insert(image, revision);
+            if let Some(readers) = self.image_readers.get(&image) {
+                self.nominated.extend(readers);
+            }
+        }
+        self.prune_unused();
+    }
+
+    fn image_written(&mut self, write: ImageWrite) {
+        let samples: Vec<_> = self
+            .samples
+            .keys()
+            .filter(|sample| {
+                sample.image() == write.image && sample_intersects(**sample, write.region)
+            })
+            .copied()
+            .collect();
+        for sample in samples {
+            let revision = self.new_revision();
+            let state = self.samples.get_mut(&sample).unwrap();
+            state.revision = revision;
+            self.nominated.extend(&state.readers);
+        }
+    }
 }
 
 pub(crate) fn extract_sampled_image_changes(
     mut retained: ResMut<RetainedSampledImages>,
+    writes: bevy::ecs::system::Res<RetainedUiImageWrites>,
     images: Extract<bevy::ecs::system::Res<Assets<Image>>>,
+    cameras: Extract<Query<(&'static Camera, &'static RenderTarget)>>,
     mut events: Extract<MessageReader<AssetEvent<Image>>>,
 ) {
+    for write in writes.take() {
+        retained.image_written(write);
+    }
+    retained.mark_render_targets(
+        cameras
+            .iter()
+            .filter(|(camera, _)| {
+                camera.is_active && matches!(camera.output_mode, CameraOutputMode::Write { .. })
+            })
+            .filter_map(|(_, target)| target.as_image().map(Handle::id))
+            .collect(),
+    );
     for event in events.read() {
         match *event {
             AssetEvent::Added { id } | AssetEvent::Modified { id } => {
@@ -303,6 +447,27 @@ pub(crate) fn extract_sampled_image_changes(
             }
             AssetEvent::Unused { id } => retained.image_changed(id, images.get(id), false),
             AssetEvent::Removed { .. } | AssetEvent::LoadedWithDependencies { .. } => {}
+        }
+    }
+}
+
+fn sample_intersects(sample: ImageSample, write: ImageWriteRegion) -> bool {
+    match (sample.region, write) {
+        (SampleRegion::All, _) | (_, ImageWriteRegion::Full) => true,
+        (
+            SampleRegion::Rect {
+                min: sample_min,
+                max: sample_max,
+            },
+            ImageWriteRegion::Rect {
+                min: write_min,
+                max: write_max,
+            },
+        ) => {
+            sample_min[0] < write_max[0]
+                && write_min[0] < sample_max[0]
+                && sample_min[1] < write_max[1]
+                && write_min[1] < sample_max[1]
         }
     }
 }
@@ -514,5 +679,91 @@ mod tests {
             proven_sample(sample, &image, &default_sampler).region,
             SampleRegion::All
         ));
+    }
+
+    #[test]
+    fn active_render_target_nominates_its_exact_readers_until_inactive() {
+        let mut assets = Assets::default();
+        let image = assets.add(test_image()).id();
+        let entity = Entity::from_raw_u32(7).unwrap();
+        let reader = ImageReader::Node(entity);
+        let sampler = DefaultImageSamplerDescriptor(ImageSamplerDescriptor::linear());
+        let mut retained = RetainedSampledImages::default();
+
+        retained.mark_render_targets(HashSet::from([image]));
+        assert_eq!(retained.next_revision, 0);
+        retained.replace_reader(reader, [ImageSample::all(image)], &assets, &sampler);
+        let initial_revision = retained.revisions(image, [ImageSample::all(image)]);
+        retained.mark_render_targets(HashSet::from([image]));
+
+        assert_eq!(retained.take_nodes(), HashSet::from([entity]));
+        assert_ne!(
+            retained.revisions(image, [ImageSample::all(image)]),
+            initial_revision
+        );
+
+        let settled_revision = retained.revisions(image, [ImageSample::all(image)]);
+        retained.mark_render_targets(HashSet::new());
+        assert!(retained.take_nodes().is_empty());
+        assert_eq!(
+            retained.revisions(image, [ImageSample::all(image)]),
+            settled_revision
+        );
+    }
+
+    #[test]
+    fn declared_gpu_write_nominates_only_intersecting_samples() {
+        let mut assets = Assets::default();
+        let image = assets.add(test_image()).id();
+        let left = Entity::from_raw_u32(7).unwrap();
+        let right = Entity::from_raw_u32(8).unwrap();
+        let sampler = DefaultImageSamplerDescriptor(ImageSamplerDescriptor::linear());
+        let mut retained = RetainedSampledImages::default();
+        retained.replace_reader(
+            ImageReader::Node(left),
+            [ImageSample::rect(
+                image,
+                Rect::from_corners(Vec2::ZERO, Vec2::new(1.0, 2.0)),
+            )],
+            &assets,
+            &sampler,
+        );
+        retained.replace_reader(
+            ImageReader::Node(right),
+            [ImageSample::rect(
+                image,
+                Rect::from_corners(Vec2::new(6.0, 0.0), Vec2::new(7.0, 2.0)),
+            )],
+            &assets,
+            &sampler,
+        );
+        let writes = RetainedUiImageWrites::default();
+        writes.invalidate_region(
+            image,
+            Rect::from_corners(Vec2::new(1.0, 0.0), Vec2::new(2.0, 2.0)),
+        );
+        for write in writes.take() {
+            retained.image_written(write);
+        }
+
+        assert_eq!(retained.take_nodes(), HashSet::from([left]));
+
+        writes.invalidate_region(
+            image,
+            Rect::from_corners(Vec2::new(2.0, 0.0), Vec2::new(2.0, 2.0)),
+        );
+        assert!(writes.take().is_empty());
+
+        writes.invalidate_region(
+            image,
+            Rect {
+                min: Vec2::new(4.0, 2.0),
+                max: Vec2::new(3.0, 1.0),
+            },
+        );
+        for write in writes.take() {
+            retained.image_written(write);
+        }
+        assert_eq!(retained.take_nodes(), HashSet::from([left, right]));
     }
 }

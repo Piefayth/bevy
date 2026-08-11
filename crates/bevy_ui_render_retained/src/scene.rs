@@ -35,6 +35,7 @@ pub(crate) enum PaintFamily {
     Background,
     Border,
     Image,
+    Viewport,
     Gradient,
     BorderGradient,
     TextBackground,

@@ -8,7 +8,7 @@ use bevy::ui_render::{
 };
 use bevy::{
     asset::{AssetId, RenderAssetUsages},
-    camera::{ClearColorConfig, RenderTarget, Viewport},
+    camera::{CameraOutputMode, ClearColorConfig, RenderTarget, Viewport},
     input_focus::InputFocus,
     log::LogPlugin,
     prelude::*,
@@ -301,6 +301,63 @@ fn add_solid_image(world: &mut World, color: [u8; 4]) -> Handle<Image> {
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
     ))
+}
+
+fn spawn_camera_target(world: &mut World, color: [u8; 4], active: bool) -> (Entity, Handle<Image>) {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: 20,
+            height: 20,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &color,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+        | TextureUsages::COPY_DST
+        | TextureUsages::COPY_SRC
+        | TextureUsages::RENDER_ATTACHMENT;
+    let image = world.resource_mut::<Assets<Image>>().add(image);
+    let source = world
+        .spawn((
+            Camera2d,
+            Camera {
+                is_active: active,
+                order: -1,
+                clear_color: ClearColorConfig::Custom(Color::srgb_u8(30, 100, 220)),
+                ..default()
+            },
+            RenderTarget::Image(image.clone().into()),
+        ))
+        .id();
+    (source, image)
+}
+
+fn spawn_viewport_leaf(
+    world: &mut World,
+    camera: Entity,
+    color: [u8; 4],
+    source_active: bool,
+) -> (Entity, Entity, Handle<Image>) {
+    let (source, image) = spawn_camera_target(world, color, source_active);
+    let viewport = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(8),
+                top: px(9),
+                width: px(20),
+                height: px(20),
+                border_radius: BorderRadius::all(px(4)),
+                ..default()
+            },
+            ViewportNode::new(source),
+            UiTargetCamera(camera),
+        ))
+        .id();
+    (viewport, source, image)
 }
 
 fn add_color_strip(world: &mut World) -> Handle<Image> {
@@ -840,6 +897,295 @@ fn quiet_image_pixels_match_stock_without_another_repair() {
             retained.paint_after_mutation,
             retained.paint_before_mutation
         );
+    });
+}
+
+#[test]
+fn quiet_viewport_node_matches_stock_without_another_repair() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            spawn_viewport_leaf(world, camera, [210, 70, 25, 255], false)
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn modified_viewport_image_repairs_only_its_node() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            let (_, _, image) = spawn_viewport_leaf(world, camera, [210, 70, 25, 255], false);
+            image
+        };
+        let mutate = |world: &mut World, image: Handle<Image>| {
+            world
+                .resource_mut::<Assets<Image>>()
+                .get_mut(&image)
+                .unwrap()
+                .data
+                .as_mut()
+                .unwrap()
+                .chunks_exact_mut(4)
+                .for_each(|pixel| pixel.copy_from_slice(&[25, 170, 80, 255]));
+        };
+        let stock = render_scene(UiRenderer::Stock, PaintSchedule::EveryFrame, setup, mutate);
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            mutate,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+    });
+}
+
+#[test]
+fn switching_viewport_render_target_repairs_the_node() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            let (viewport, source, _) =
+                spawn_viewport_leaf(world, camera, [210, 70, 25, 255], false);
+            let (_, replacement) = spawn_camera_target(world, [25, 170, 80, 255], false);
+            (viewport, source, replacement)
+        };
+        let mutate =
+            |world: &mut World, (_, source, replacement): (Entity, Entity, Handle<Image>)| {
+                world
+                    .entity_mut(source)
+                    .insert(RenderTarget::Image(replacement.into()));
+            };
+        let stock = render_scene(UiRenderer::Stock, PaintSchedule::EveryFrame, setup, mutate);
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            mutate,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+    });
+}
+
+#[test]
+fn active_viewport_camera_repaints_only_its_reader() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            let (_, source, _) = spawn_viewport_leaf(world, camera, [0; 4], true);
+            source
+        };
+        let mutate = |world: &mut World, source: Entity| {
+            world
+                .entity_mut(source)
+                .get_mut::<Camera>()
+                .unwrap()
+                .clear_color = ClearColorConfig::Custom(Color::srgb_u8(210, 55, 35));
+        };
+        let stock = render_scene(UiRenderer::Stock, PaintSchedule::EveryFrame, setup, mutate);
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            mutate,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        let repairs = after.repairs - before.repairs;
+        assert!(repairs > 0);
+        assert_eq!(
+            after.repair_pixels - before.repair_pixels,
+            repairs * 20 * 20
+        );
+    });
+}
+
+#[test]
+fn skip_output_viewport_camera_is_quiet() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            let result = spawn_viewport_leaf(world, camera, [210, 70, 25, 255], true);
+            world
+                .entity_mut(result.1)
+                .get_mut::<Camera>()
+                .unwrap()
+                .output_mode = CameraOutputMode::Skip;
+            result
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
+fn ordinary_image_node_tracks_active_camera_target_writes() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            let (source, image) = spawn_camera_target(world, [0; 4], true);
+            spawn_image_leaf(world, camera, image, Color::WHITE);
+            source
+        };
+        let mutate = |world: &mut World, source: Entity| {
+            world
+                .entity_mut(source)
+                .get_mut::<Camera>()
+                .unwrap()
+                .clear_color = ClearColorConfig::Custom(Color::srgb_u8(210, 55, 35));
+        };
+        let stock = render_scene(UiRenderer::Stock, PaintSchedule::EveryFrame, setup, mutate);
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            mutate,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        let repairs = after.repairs - before.repairs;
+        assert!(repairs > 0);
+        assert_eq!(
+            after.repair_pixels - before.repair_pixels,
+            repairs * 10 * 10
+        );
+    });
+}
+
+#[test]
+fn clearing_viewport_camera_repairs_its_vacated_pixels() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            let (viewport, _, _) = spawn_viewport_leaf(world, camera, [210, 70, 25, 255], false);
+            viewport
+        };
+        let mutate = |world: &mut World, viewport: Entity| {
+            world
+                .entity_mut(viewport)
+                .get_mut::<ViewportNode>()
+                .unwrap()
+                .camera = None;
+        };
+        let stock = render_scene(UiRenderer::Stock, PaintSchedule::EveryFrame, setup, mutate);
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            mutate,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+    });
+}
+
+#[test]
+fn removing_viewport_source_camera_repairs_its_vacated_pixels() {
+    with_gpu_lock(|| {
+        let setup = |world: &mut World, camera| {
+            let (_, source, _) = spawn_viewport_leaf(world, camera, [210, 70, 25, 255], false);
+            source
+        };
+        let mutate = |world: &mut World, source: Entity| {
+            world.entity_mut(source).remove::<Camera>();
+        };
+        let stock = render_scene(UiRenderer::Stock, PaintSchedule::EveryFrame, setup, mutate);
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            setup,
+            mutate,
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+    });
+}
+
+#[test]
+fn equal_viewport_replacement_compares_without_repair() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let (viewport, _, _) =
+                    spawn_viewport_leaf(world, camera, [210, 70, 25, 255], false);
+                viewport
+            },
+            |world, viewport| {
+                let value = *world.entity(viewport).get::<ViewportNode>().unwrap();
+                world.entity_mut(viewport).insert(value);
+            },
+        );
+
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs, before.repairs);
+        let paint_before = output.paint_before_mutation.unwrap();
+        let paint_after = output.paint_after_mutation.unwrap();
+        assert_eq!(paint_after.candidates, paint_before.candidates + 1);
+        assert_eq!(
+            paint_after.records_compared,
+            paint_before.records_compared + 1
+        );
+        assert_eq!(paint_after.records_changed, paint_before.records_changed);
     });
 }
 

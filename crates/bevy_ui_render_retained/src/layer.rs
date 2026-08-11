@@ -6,6 +6,7 @@ use crate::gradient::{extract_retained_gradients, RetainedGradientDependencies};
 use crate::image::{extract_retained_images, RetainedImageDependencies};
 use crate::sampled_image::{
     extract_sampled_image_changes, resolve_ready_sampled_images, RetainedSampledImages,
+    RetainedUiImageWrites,
 };
 use crate::scene::{
     cleanup_retained_ui, replay_retained_ui, RetainedItem, RetainedItems, RetainedUiPaintCounters,
@@ -13,6 +14,7 @@ use crate::scene::{
 };
 use crate::shadow::{extract_retained_shadows, RetainedShadowDependencies};
 use crate::text::{extract_retained_text, RetainedTextDependencies};
+use crate::viewport::{extract_retained_viewports, RetainedViewportDependencies};
 use crate::{damage::exact_union, PhysicalRect, RepairPlan};
 use alloc::collections::VecDeque;
 use bevy::{
@@ -91,8 +93,10 @@ impl Plugin for RetainedUiRenderPlugin {
             .init_resource::<RetainedGradientDependencies>()
             .init_resource::<RetainedImageDependencies>()
             .init_resource::<RetainedSampledImages>()
+            .init_resource::<RetainedUiImageWrites>()
             .init_resource::<RetainedShadowDependencies>()
             .init_resource::<RetainedTextDependencies>()
+            .init_resource::<RetainedViewportDependencies>()
             .init_resource::<RetainedItems>()
             .init_resource::<RetainedUiPaintCounters>()
             .add_systems(
@@ -102,6 +106,12 @@ impl Plugin for RetainedUiRenderPlugin {
             .add_systems(
                 ExtractSchedule,
                 extract_retained_images.in_set(RenderUiSystems::ExtractImages),
+            )
+            .add_systems(
+                ExtractSchedule,
+                extract_retained_viewports
+                    .in_set(RenderUiSystems::ExtractViewportNodes)
+                    .before(replay_retained_ui),
             )
             .add_systems(
                 ExtractSchedule,
@@ -127,7 +137,8 @@ impl Plugin for RetainedUiRenderPlugin {
                 ExtractSchedule,
                 extract_sampled_image_changes
                     .before(extract_retained_images)
-                    .before(extract_retained_text),
+                    .before(extract_retained_text)
+                    .before(extract_retained_viewports),
             )
             .add_systems(
                 ExtractSchedule,

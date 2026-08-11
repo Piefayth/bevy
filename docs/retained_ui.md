@@ -165,6 +165,10 @@ candidate extraction and canonical records while the stock and retained paths
 share target-relative value resolution, queueing, preparation, and the shader.
 This is still entirely inside the focused `bevy_ui_render` replacement patch.
 
+`ViewportNode` needs no additional Bevy patch. It resolves to the existing UI
+image command, so the retained crate replaces only its extractor and reuses the
+same node pipeline and sampled-image dependency index.
+
 ## Model learned from other UI systems
 
 Mature UI systems retain several representations rather than one:
@@ -526,9 +530,9 @@ through movement, recoloring, and removal, including translucent overlap.
 
 The integrated retained families are box shadows, backgrounds
 (`BackgroundColor` and `OuterColor`), ordinary, sliced, and tiled `ImageNode`s,
-background and border gradients, solid borders and outlines, and all stock UI
-text paint. They share one scene, one stable `(entity, family, ordinal)`
-identity space, and one damage journal per camera.
+camera-backed `ViewportNode`s, background and border gradients, solid borders
+and outlines, and all stock UI text paint. They share one scene, one stable
+`(entity, family, ordinal)` identity space, and one damage journal per camera.
 Family extractors only update canonical records; a single later replay stage
 sorts every visible family together. This is required for correctness:
 repairing a translucent image or glyph must first replay the background
@@ -601,6 +605,27 @@ the common sampled-image dependencies. GPU differentials cover quiet sliced
 and tiled output, tint repair, and same-texture siblings; the last asserts that
 a one-node repair submits exactly one prepared quad rather than the stock
 texture batch.
+
+Camera render targets expose a dependency that CPU image bytes cannot capture.
+Every active camera using `CameraOutputMode::Write` makes its image target
+explicitly volatile; each frame nominates only readers of that image. A camera
+using `Skip` provably does not write the final target and is excluded. The GPU
+suite changes an active camera clear color and proves both `ViewportNode` and an
+ordinary `ImageNode` update; deliberately removing target marking leaves the
+old color behind and makes the differential fail. When the source camera is
+inactive, a quiet viewport has zero further comparisons or repairs. Active
+targets with no retained readers do not even advance a resource revision. CPU
+image changes, source-target switches, equal replacement, and removal each
+have separate proofs; localized viewport changes repair exactly its 20-by-20
+box.
+
+Custom render and compute writers use the public, thread-safe
+`RetainedUiImageWrites` render-world resource. `invalidate` declares a full
+image write; `invalidate_region` accepts an exact physical-texel rectangle and
+nominates only samples whose filter-expanded read regions intersect it.
+Invalid rectangles safely become full-image invalidations, while empty ones do
+nothing. A unit proof has two readers of one image and nominates only the reader
+intersecting a declared GPU write.
 
 Background and border gradients retain one canonical record per list entry.
 Resolved geometry, interpolation color space, exact-bit stops and hints,
@@ -739,7 +764,11 @@ Some behavior cannot be established by portable automated tests:
 - operating-system compositor behavior and partial presentation are hidden by
   `wgpu`;
 - device/driver command-buffer failures may only be observable through
-  backend-specific completion diagnostics.
+  backend-specific completion diagnostics;
+- ordering an arbitrary third-party GPU writer before its retained UI consumer
+  depends on that integration's render graph. The write-declaration mapping is
+  unit-tested and Bevy camera writers have GPU differentials, but each custom
+  writer must add its own graph-order/readback proof.
 
 These are reported as measured platform results, never inferred from desktop
 timings. Pixel correctness remains testable through image targets and device
