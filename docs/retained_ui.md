@@ -37,9 +37,12 @@ The implemented expansion decisions are:
    same idle cost and root invalidation. A focused `bevy_ui` patch was required
    for independent layout/geometry scheduling and semantic layout and paint
    containment.
-2. `bevy_core_pipeline`: no patch is currently required. The retained crate
-   replaces the public final-writer system and preserves Bevy's output attachment
-   and presentation bookkeeping.
+2. `bevy_core_pipeline`: a standalone retained crate can add a separate
+   composite pass, but cannot fold the retained layer into Bevy's existing
+   final blit. The implementation adds an optional premultiplied overlay input
+   to that blit. Views without an overlay still select the original two-binding
+   pipeline. `bevy_post_process` only supplies the new false pipeline-key field
+   for MSAA writeback.
 
 Focused changes remain in the crates whose behavior they own.
 `bevy_ui` now caches an image node's intrinsic-size inputs, so changing only an
@@ -216,28 +219,26 @@ re-exported it and deleted its private cache wrapper in favor of the identical
 `Local<Vec<Vec<_>>>`. Gating the whole public set from a third-party crate was
 rejected because it silently changes unrelated systems' execution semantics.
 
-The core-pipeline probe found a public and simpler interposition point than
-changing `CameraOutputMode` after target preparation. Bevy schedules the final
-`upscaling` writer as an ordinary system in `Core2d`/`Core3d`, and the public
-schedule API can remove a system by its function type. A third-party plugin can
-therefore remove that one system and install its own final writer after
-`Core2dSystems::PostProcess`/`Core3dSystems::PostProcess`. The proof in
-`bevy_ui_render_retained/tests/core_pipeline_scope.rs` removes exactly one stock
-writer and exactly one replacement.
+The core-pipeline probe found that a third-party plugin can remove Bevy's public
+`upscaling` system and install a correct final writer; the executable proof is
+`bevy_ui_render_retained/tests/core_pipeline_scope.rs`. That is a workable
+zero-vendoring fallback, but it duplicates Bevy's output semantics and owns a
+large rebase surface. A separate composite pass is simpler but adds another
+attachment load/store.
 
-This preserves Bevy's `ViewTarget`, output attachment, and later presentation
-bookkeeping without vendoring `bevy_core_pipeline`. The retained plugin now
-uses that interposition: it removes exactly one stock writer from each of
-`Core2d` and `Core3d`, mirrors Bevy's public pipeline key and blocking behavior,
-and installs one final blit with plain and fused shader entries. Bevy's private
-stock preparation system remains installed and prepares an unused stock
-pipeline component; removing that small per-camera scan is the only known
-reason this mechanism would need a `bevy_core_pipeline` patch. GPU differentials
+The selected implementation instead makes Bevy's existing final blit accept an
+optional premultiplied overlay. The retained pass repairs its private surfaces
+before `upscaling`, publishes a texture only for a visible committed layer, and
+the unchanged final writer selects plain or fused pipeline and bind-group
+layouts. `CameraOutputMode::Skip` returns before retained surface work and
+before the final writer, while owed damage remains intact. This is the first
+justified expansion beyond `bevy_ui_render`: it removes an otherwise
+irreducible extra fullscreen pass and keeps one owner for output blending,
+color conversion, attachment acquisition, and presentation. GPU differentials
 prove the no-UI path, premultiplied UI, nonzero viewports, default multi-camera
-alpha composition, and
-`CameraOutputMode::Skip` byte-identical to stock on an image target. Actual
-window presentation still requires one integration test on each supported
-backend.
+alpha composition, and `CameraOutputMode::Skip` byte-identical to stock on an
+image target. Actual window presentation still requires one integration test
+on each supported backend.
 
 Replacing individual stock extraction systems exposed one smaller
 `bevy_ui_render` composition boundary. `Schedule::remove_systems_in_set` first
@@ -253,7 +254,17 @@ no paint extraction or UI pass. Stock `UiRenderPlugin` composes that
 infrastructure with its existing extractors and pass; the retained crate uses
 the infrastructure directly. This preserves a maintainable third-party
 renderer while requiring a small patch only to the crate it replaces. No
-`bevy_ecs` or `bevy_core_pipeline` fork is required.
+`bevy_ecs` patch is required. The optional standalone-composite version could
+stop here; the fused implementation additionally carries the focused
+`bevy_core_pipeline` change described above.
+
+The infrastructure no longer serializes unrelated paint-family extractors.
+They all wait for camera extraction, then run concurrently, followed by one
+explicit retained apply/propagate barrier. Bevy's stock text background,
+shadow, glyph, and cursor extractors remain chained in that order: the GPU
+differential suite proved their shared transient representation is
+order-sensitive. Ambiguity detection is an error in every GPU test, so the
+parallel graph cannot silently acquire another unordered resource conflict.
 
 Sliced and tiled images exposed the same boundary one level down: Bevy's
 `UiTextureSlicerPlugin` coupled stock extraction to reusable pipeline setup and
@@ -564,16 +575,16 @@ apply that output blend twice and can double-multiply alpha. Restricting the
 optimization to the first or replace-mode camera was rejected as a parallel
 correctness path.
 
-The exact public-API implementation instead samples the premultiplied retained
-layer in Bevy's existing fullscreen final blit, combines it with the world, then
-applies color-space conversion and the camera output blend once. This deletes
-the standalone UI composite pass and its attachment load/store without
-vendoring `bevy_core_pipeline`. The price is one additional UI texture read for
-every output pixel while UI is visible, even outside occupied UI bounds. That
-trade is expected to favor tile GPUs but is not called free and must be included
-in the physical-device sweep. A camera with no visible UI selects a plain shader
-entry that never reads the bound transparent fallback, performs the same single
-world-texture draw as stock, and allocates no retained surface.
+The selected focused `bevy_core_pipeline` integration instead samples the
+premultiplied retained layer in Bevy's existing fullscreen final blit, combines
+it with the world, then applies color-space conversion and the camera output
+blend once. This deletes the standalone UI composite pass and its attachment
+load/store. The price is one additional UI texture read for every output pixel
+while UI is visible, even outside occupied UI bounds. That trade is expected to
+favor tile GPUs but is not called free and must be included in the
+physical-device sweep. A camera with no visible UI selects the original plain
+shader entry, performs the same single world-texture draw as stock, and
+allocates no retained surface.
 
 The public `wgpu::Surface` presentation API has no damage-region parameter, so
 portable platform partial-present behavior cannot currently be promised.
@@ -783,9 +794,10 @@ Each Criterion iteration mutates the next state and immediately runs
 `PostUpdate`, so every change row is sustained consecutive-frame work rather
 than a single cold spike. Consequently, a width animation inside one genuinely
 coupled 10,000-node flex root can cost about 4.1 ms on every animation frame on
-this machine; changing all 10,000 widths can sustain about 5.6 ms. Retention did
-not cause that cost, and it no longer regresses either case, but it cannot skip
-a real Taffy dependency. Containment changes the dependency: one changed leaf
+this machine; changing all 10,000 widths can sustain about 5.6 ms. In this
+isolated main-world benchmark retention does not regress either case, but it
+cannot skip a real Taffy dependency. The end-to-end table below separately
+includes render-world cost. Containment changes the dependency: one changed leaf
 inside a 100-node widget measured 0.173 ms retained, one changed leaf in every
 100-node widget measured 2.778 ms, and changing every leaf measured 4.236 ms.
 Independent dirty widgets therefore add; containment bounds the term but does
@@ -1043,16 +1055,14 @@ declared output coverage because an arbitrary shader may broadcast that texel
 everywhere. A future output-region mapping API is justified only when an
 application can prove a narrower influence relation.
 
-Solid borders and outlines retain four fixed edge records per visible family.
-This deliberately separates damage identity from GPU draw grouping. A first
-attempt drew every edge independently; GPU comparison rejected it because
-equal-color corner ties then alpha-blended more than once. The accepted path
-keeps edge identity stable, but merges equal canonical commands at replay time
-by OR-ing their border flags. Changing the left edge out of an equal-color
-group therefore damages only that edge's 140-pixel rounded-corner reach, while
-the other three edges still replay as one command through the damage mask.
-Equal-color borders, distinct-color regrouping, outlines, and component
-removal are byte-identical to stock in named GPU tests.
+Solid borders and outlines each retain one compound record with four canonical
+edge colors and four exact coverage regions. Persistent preparation groups
+equal colors by OR-ing their edge flags, matching stock's single-blend corner
+ties without retaining four arena records. Damage comparison remains per edge:
+changing the left edge out of an equal-color group damages only that edge's
+140-pixel rounded-corner reach, while the other three retain their pixels.
+Equal-color borders, distinct-color regrouping, outlines, and component removal
+are byte-identical to stock in named GPU tests.
 
 Text retains consecutive glyphs in the same section that use the same
 font-atlas texture as one draw record. Identity uses the stable section entity
@@ -1201,49 +1211,63 @@ executable has no universal pass/fail frame-time threshold:
 the same command is the measurement instrument, while the acceptable budget is
 chosen for the game's target hardware and frame rate.
 
-The same development machine's release-profile Vulkan runs on 2026-08-11/12
-measure the current persistent-instance and exact-mask implementation:
+The same development machine's fat-LTO `stress-test` Vulkan runs on 2026-08-12
+measure the current persistent-instance and exact-mask implementation. Every
+row contains 120 consecutive measured frames after 60 warmup frames and uses
+the same executable for stock and retained:
 
 | 10,000-node end-to-end windowed workload | Stock | Retained |
 |---|---:|---:|
-| grid mixed, quiet | 17.629 ms | 1.052 ms |
-| grid mixed, one paint change per frame | 18.429 ms | 1.281 ms |
-| grid mixed, one placement change per frame | 17.839 ms | 1.895 ms |
-| grid mixed, one layout change in a 100-node boundary | 18.107 ms | 1.278 ms |
-| overlap background, one paint change per frame | 3.259 ms | 1.836 ms |
-| overlap background, all paint changes per frame | 3.244 ms | 2.980 ms |
-| grid effects, all paint changes per frame | 46.019 ms | 42.109 ms |
-| grid mixed, all paint changes per frame | 17.875 ms | 19.336 ms |
-| grid background, all placement changes per frame | 3.298 ms | 5.113 ms |
-| grid mixed, all placement changes per frame | 18.001 ms | 23.692 ms |
-| grid background, all contained widths change per frame | 5.096 ms | 8.185 ms |
-| grid mixed, all contained widths change per frame | 98.769 ms | 114.767 ms |
+| grid mixed, quiet | 17.220 ms | 1.013 ms |
+| grid mixed, one paint change per frame | 17.730 ms | 1.250 ms |
+| overlap background, one paint change per frame | 3.302 ms | 1.488 ms |
+| overlap background, all paint changes per frame | 3.147 ms | 3.469 ms |
+| grid effects, all paint changes per frame | 44.549 ms | 34.683 ms |
+| grid mixed, all paint changes per frame | 17.410 ms | 16.488 ms |
+| grid background, all ordinary placements change | 3.380 ms | 3.020 ms |
+| grid mixed, all ordinary placements change | 17.211 ms | 21.727 ms |
+| grid background, all widths change | 4.942 ms | 6.622 ms |
+| grid effects, all widths change | 45.179 ms | 45.177 ms |
+| grid text, all widths change | 168.475 ms | 170.926 ms |
+| grid mixed, all widths change | 48.427 ms | 54.242 ms |
+| grid mixed, one layout change in a 100-node containment | 17.513 ms | 1.162 ms |
+| grid mixed, all 100 declared repaint boundaries move | 17.754 ms | 1.655 ms |
 
-These are 60--180 consecutive measured frames after a 60--80-frame warmup,
-not single events. The quiet and localized retained rows had no frame at or
-above 4 ms. The overlap/localized row is deliberately adversarial: one changed
-translucent node requires all 10,000 contributors beneath it to replay, yet the
-retained path still wins because unchanged extraction and preparation stay
-retained. The effect row also wins under complete paint mutation.
+The quiet, localized paint, contained layout, and declared-boundary placement
+retained rows had no frame at or above 4 ms. The overlapping one-change row is
+deliberately adversarial: one changed translucent node intersects all 10,000
+contributors, yet retained still wins because unchanged canonical preparation
+remains resident. Effect-heavy and mixed scenes also win under complete paint
+mutation because their persistent batching outweighs proof cost.
 
-Global paint, placement, and layout remain the honest boundary. When all
-content changes, canonical comparison is additional necessary proof work; a
-retained renderer cannot make that proof free. Prepared ordinary geometry,
-gradients, and shadows are now retained, damage unions are cached, dense direct
-changes skip spatial refits, and ordinary replay is instanced, reducing the old
-16.756 ms all-background-paint result to near stock. Mixed all-paint remains
-about 1.5 ms slower in the canonical run. One exact placement transaction per
-entity reduced the mixed global-placement path from 33.191 ms to 23.692 ms, but
-global geometry remains slower than stock because all 25,000 records still
-change pixels on the monolithic retained surface and must update old/new
-coverage and rerasterize.
+Global mutation is the honest boundary, and this table deliberately retains
+the non-winning rows. Changing all 10,000 overlapping simple backgrounds is
+about 0.32 ms slower; a reverse-order confirmation also lost (4.259 versus
+3.028 ms, with a noisier retained tail). Changing all mixed widths is about
+5.82 ms slower end to end, confirmed in reverse order at 54.266 versus 48.412
+ms. The main-world portions were nearly identical (46.463 versus 46.127 ms);
+the remainder is canonical coverage proof, retained replay, surface repair,
+and composition. The text-only result is similarly dominated by genuine Bevy
+reflow: retained proved that final glyph pixels were unchanged and did no
+raster repairs after initialization, but total time still measured 170.926
+versus 168.475 ms.
 
-The global-placement result identified a missing capability rather than a
-tuning problem. A node transform on one monolithic cached surface changes
-pixels, so 25,000 mixed-family records move and repaint. The implemented
-declared repaint boundaries instead create a compositor display list of cached
-chunks and island surfaces; moving an island changes one composite transform
-and zero island pixels. Ordinary `UiTransform` retains its normal paint
+These are not bugs that an area threshold or inferred mode switch can solve.
+Immediate mode only produces the new frame when every item changes; exact
+retention must first prove which old pixels are invalid. A claim that one path
+is strictly faster for every possible mutation distribution is therefore
+false unless the implementation keeps a second immediate renderer or guesses
+when to switch. Both are rejected here. The supported performance contract is
+instead explicit: static and localized work scale with actual changes;
+layout containment bounds semantic layout coupling; repaint boundaries make
+stable-content placement compositor-only; genuinely global paint/layout pays
+for genuinely global work and remains reported rather than hidden.
+
+The mixed global-placement result illustrates the same API boundary. A node
+transform on one monolithic cached surface changes pixels, so every affected
+mixed-family record moves and repaints. The declared repaint-boundary case
+instead moves 100 cached chunks, changes zero child pixels, and measures 1.655
+ms versus stock's 17.754 ms. Ordinary `UiTransform` retains its normal paint
 semantics. No full-redraw fallback, area threshold, or promotion heuristic can
 provide compositor-only placement without that explicit boundary contract.
 

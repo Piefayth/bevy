@@ -354,6 +354,7 @@ pub(crate) fn extract_boundaries(
                 clip: composite_clip,
                 image: AssetId::<Image>::default(),
                 transform: composite_transform,
+                layout_translation: Vec2::ZERO,
                 local_translation: Vec2::ZERO,
                 item: RetainedDrawItem::Boundary(boundary_item),
             },

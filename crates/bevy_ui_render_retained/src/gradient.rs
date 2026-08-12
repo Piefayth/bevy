@@ -4,8 +4,8 @@ use crate::{
     border::edge_rect,
     boundary::retained_clip,
     scene::{
-        coverage, coverage_rect, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw,
-        RetainedDrawItem, RetainedGradientItem, RetainedUiScene, RetainedUiSurfaces,
+        coverage, coverage_rect, PaintFamily, PaintId, PendingGradientPaints, PendingRetainedPaint,
+        ResourceFingerprint, RetainedDraw, RetainedDrawItem, RetainedGradientItem,
     },
 };
 use bevy::{
@@ -14,10 +14,10 @@ use bevy::{
     camera::visibility::InheritedVisibility,
     color::Alpha,
     ecs::{
-        entity::Entity,
+        entity::{Entity, EntityHashMap, EntityHashSet},
         lifecycle::RemovedComponents,
         query::{Changed, Or, With},
-        system::{Commands, Query, Res, ResMut, SystemParam},
+        system::{Query, ResMut, SystemParam},
     },
     image::Image,
     math::{Rect, Vec2},
@@ -29,15 +29,14 @@ use bevy::{
     },
     ui_render::{gradient::resolve_gradient, stack_z_offsets, UiCameraMap},
 };
-use std::collections::{HashMap, HashSet};
-
+use smallvec::SmallVec;
 #[derive(bevy::prelude::Resource, Default)]
 pub(crate) struct RetainedGradientDependencies {
-    entities: HashMap<Entity, HashSet<PaintId>>,
+    entities: EntityHashMap<SmallVec<[PaintId; 4]>>,
 }
 
 impl RetainedGradientDependencies {
-    fn set(&mut self, entity: Entity, paints: HashSet<PaintId>) {
+    fn set(&mut self, entity: Entity, paints: SmallVec<[PaintId; 4]>) {
         if paints.is_empty() {
             self.entities.remove(&entity);
         } else {
@@ -45,7 +44,7 @@ impl RetainedGradientDependencies {
         }
     }
 
-    fn remove(&mut self, entity: Entity) -> HashSet<PaintId> {
+    fn remove(&mut self, entity: Entity) -> SmallVec<[PaintId; 4]> {
         self.entities.remove(&entity).unwrap_or_default()
     }
 }
@@ -80,8 +79,6 @@ pub(crate) struct RemovedGradientInputs<'w, 's> {
 }
 
 pub(crate) fn extract_retained_gradients(
-    mut commands: Commands,
-    state: Res<RetainedUiScene>,
     mut dependencies: ResMut<RetainedGradientDependencies>,
     changed: Extract<
         Query<
@@ -107,8 +104,9 @@ pub(crate) fn extract_retained_gradients(
     >,
     camera_map: Extract<UiCameraMap>,
     mut removed: Extract<RemovedGradientInputs>,
+    mut pending: ResMut<PendingGradientPaints>,
 ) {
-    let mut extra_candidates = HashSet::new();
+    let mut extra_candidates = EntityHashSet::default();
     let RemovedGradientInputs {
         background,
         border,
@@ -127,7 +125,6 @@ pub(crate) fn extract_retained_gradients(
     extra_candidates.extend(target.read());
     extra_candidates.retain(|entity| !changed.contains(*entity));
 
-    let mut surfaces = state.lock();
     for entity in computed_node
         .read()
         .chain(node.read())
@@ -136,13 +133,17 @@ pub(crate) fn extract_retained_gradients(
         .chain(visibility.read())
         .chain(camera.read())
     {
-        remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
+        for id in dependencies.remove(entity) {
+            pending.remove(id);
+        }
     }
     extra_candidates.retain(|entity| {
         if all.contains(*entity) {
             true
         } else {
-            remove_entity(&mut dependencies, &mut surfaces, &mut commands, *entity);
+            for id in dependencies.remove(*entity) {
+                pending.remove(id);
+            }
             false
         }
     });
@@ -150,6 +151,7 @@ pub(crate) fn extract_retained_gradients(
     let mut camera_mapper = camera_map.get_mapper();
     let mut scratch = Vec::new();
     let mut resolved_stops = Vec::new();
+    pending.reserve(changed.iter().size_hint().0);
     for (
         entity,
         source_node,
@@ -169,7 +171,9 @@ pub(crate) fn extract_retained_gradients(
             .filter_map(|entity| all.get(entity).ok()),
     ) {
         let Some(camera) = camera_mapper.map(target_camera) else {
-            remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
+            for id in dependencies.remove(entity) {
+                pending.remove(id);
+            }
             continue;
         };
 
@@ -179,7 +183,7 @@ pub(crate) fn extract_retained_gradients(
             && !node.size().cmple(Vec2::ZERO).any();
         let clip = retained_clip(entity, node, transform, clip, owner);
         let transform = transform.affine();
-        let mut paint_ids = HashSet::new();
+        let mut paint_ids = SmallVec::new();
         for (gradients, border_gradient) in [
             (backgrounds.map(|gradients| &gradients.0), false),
             (borders.map(|gradients| &gradients.0), true),
@@ -214,11 +218,10 @@ pub(crate) fn extract_retained_gradients(
                     ordinal: u32::try_from(ordinal).expect("gradient count exceeds u32"),
                 };
                 let coverage = gradient_coverage(node, transform, clip, painted, border_gradient);
-                surfaces.upsert(
-                    &mut commands,
+                pending.upsert(PendingRetainedPaint {
                     id,
                     camera,
-                    RetainedDraw {
+                    draw: RetainedDraw {
                         render_entity: Entity::PLACEHOLDER,
                         camera,
                         main_entity: MainEntity::from(entity),
@@ -232,6 +235,7 @@ pub(crate) fn extract_retained_gradients(
                         clip,
                         image: AssetId::<Image>::default(),
                         transform,
+                        layout_translation: Vec2::ZERO,
                         local_translation: Vec2::ZERO,
                         item: RetainedDrawItem::Gradient(RetainedGradientItem::new(
                             stack.0,
@@ -244,19 +248,19 @@ pub(crate) fn extract_retained_gradients(
                             border_gradient,
                         )),
                     },
-                    ResourceFingerprint::None,
+                    resource: ResourceFingerprint::None,
                     coverage,
                     painted,
-                );
+                });
                 if painted {
-                    paint_ids.insert(id);
+                    paint_ids.push(id);
                 }
             }
         }
 
         for old in dependencies.remove(entity) {
             if !paint_ids.contains(&old) {
-                surfaces.remove(&mut commands, old);
+                pending.remove(old);
             }
         }
         dependencies.set(entity, paint_ids);
@@ -292,15 +296,4 @@ fn gradient_coverage(
             coverage_rect(edge_rect(node.size(), width, radii, edge), transform, clip)
         })
         .collect()
-}
-
-fn remove_entity(
-    dependencies: &mut RetainedGradientDependencies,
-    surfaces: &mut RetainedUiSurfaces,
-    commands: &mut Commands,
-    entity: Entity,
-) {
-    for id in dependencies.remove(entity) {
-        surfaces.remove(commands, id);
-    }
 }

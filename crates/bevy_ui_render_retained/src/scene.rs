@@ -1,33 +1,36 @@
 //! Retained UI paint records shared by every paint family.
 
 use crate::{
+    background::PendingRetainedBackgrounds,
     border::{edge_rect, EDGE_FLAGS},
     boundary::{retained_clip, RepaintBoundary},
     core::{
-        prepare_glyph_instance, prepare_persistent_instance, GpuUiInstance, RetainedCoreRuns,
-        RetainedCoreSource,
+        prepare_glyph_instance, prepare_node_instance, prepare_persistent_instance, GpuUiInstance,
+        RetainedCoreRuns, RetainedCoreSource,
     },
     damage::SpatialIndex,
-    gradient_render::RetainedGradientRuns,
+    gradient_render::{prepare_gradient_instances, GpuGradientInstance, RetainedGradientRuns},
     material::RetainedPendingMaterials,
-    shadow_render::RetainedShadowRuns,
-    FloatBits, PaintCoverage, PaintRecord, PhysicalRect, RepairPlan, RetainedPaint, WorkCounters,
+    paint::PaintState,
+    shadow_render::{prepare_shadow_instance, GpuShadowInstance, RetainedShadowRuns},
+    FloatBits, PaintCoverage, PaintRecord, PhysicalRect, RepairPlan, WorkCounters,
 };
 use bevy::{
     app::Inherited,
     asset::{AssetId, UntypedAssetId},
-    color::ColorToComponents,
+    color::{Alpha, ColorToComponents},
     ecs::{
-        entity::Entity,
+        change_detection::{DetectChanges, Ref},
+        entity::{Entity, EntityHashMap, EntityHashSet},
         lifecycle::RemovedComponents,
         query::{Changed, With},
         system::{Commands, Query, Res, ResMut},
     },
     image::Image,
     math::{Affine2, Rect, Vec2},
-    platform::collections::{hash_map::Entry, HashMap, HashSet},
     render::{
-        sync_world::{MainEntity, RenderEntity},
+        sync_world::{MainEntity, MainEntityHashMap, RenderEntity},
+        view::ExtractedView,
         Extract,
     },
     sprite::{BorderRect, SliceScaleMode, SpriteImageMode},
@@ -39,7 +42,7 @@ use bevy::{
         box_shadow::ResolvedBoxShadow,
         gradient::ResolvedGradient,
         ui_texture_slice_pipeline::{ExtractedUiTextureSlice, ExtractedUiTextureSlices},
-        NodeType,
+        NodeType, UiViewTarget,
     },
 };
 use core::{
@@ -87,7 +90,8 @@ pub(crate) struct RetainedDraw {
     pub(crate) clip: Option<Rect>,
     pub(crate) image: AssetId<Image>,
     pub(crate) transform: Affine2,
-    /// Kept separately so placement never needs to invert a potentially singular transform.
+    /// Layout and item offsets stay separate so layout movement never requires transform inversion.
+    pub(crate) layout_translation: Vec2,
     pub(crate) local_translation: Vec2,
     pub(crate) item: RetainedDrawItem,
 }
@@ -101,12 +105,111 @@ pub(crate) enum ResourceFingerprint {
 #[derive(Clone)]
 pub(crate) enum RetainedDrawItem {
     Boundary(RetainedBoundaryItem),
+    Border(RetainedBorderItem),
     BoxShadow(RetainedBoxShadowItem),
     Gradient(RetainedGradientItem),
     Material(RetainedMaterialItem),
     Node(RetainedNodeItem),
     Glyphs(Box<[RetainedGlyph]>),
     TextureSlice(RetainedTextureSliceItem),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RetainedBorderItem {
+    rect: [FloatBits; 4],
+    border: [FloatBits; 4],
+    border_radius: [FloatBits; 4],
+    colors: [[FloatBits; 4]; 4],
+    edge_coverage: [Option<PhysicalRect>; 4],
+}
+
+impl RetainedBorderItem {
+    pub(crate) fn new(
+        rect: Rect,
+        border: BorderRect,
+        border_radius: ResolvedBorderRadius,
+        mut colors: [bevy::color::LinearRgba; 4],
+        edge_coverage: [Option<PhysicalRect>; 4],
+    ) -> Self {
+        let widths = [
+            border.min_inset.x,
+            border.min_inset.y,
+            border.max_inset.x,
+            border.max_inset.y,
+        ];
+        for (edge, color) in colors.iter_mut().enumerate() {
+            if widths[edge] <= 0.0 || color.is_fully_transparent() {
+                *color = bevy::color::LinearRgba::NONE;
+            }
+        }
+        Self {
+            rect: rect_fingerprint(rect),
+            border: widths.map(FloatBits::new),
+            border_radius: <[f32; 4]>::from(border_radius).map(FloatBits::new),
+            colors: colors.map(|color| color.to_f32_array().map(FloatBits::new)),
+            edge_coverage,
+        }
+    }
+
+    fn rect(&self) -> Rect {
+        rect_from_fingerprint(self.rect)
+    }
+
+    fn border(&self) -> BorderRect {
+        BorderRect {
+            min_inset: Vec2::new(self.border[0].get(), self.border[1].get()),
+            max_inset: Vec2::new(self.border[2].get(), self.border[3].get()),
+        }
+    }
+
+    fn border_radius(&self) -> ResolvedBorderRadius {
+        ResolvedBorderRadius {
+            top_left: self.border_radius[0].get(),
+            top_right: self.border_radius[1].get(),
+            bottom_right: self.border_radius[2].get(),
+            bottom_left: self.border_radius[3].get(),
+        }
+    }
+
+    fn color(&self, edge: usize) -> bevy::color::LinearRgba {
+        let color = self.colors[edge];
+        bevy::color::LinearRgba::new(
+            color[0].get(),
+            color[1].get(),
+            color[2].get(),
+            color[3].get(),
+        )
+    }
+
+    pub(crate) fn grouped_nodes(&self) -> [Option<RetainedNodeItem>; 4] {
+        let mut nodes = [None; 4];
+        let mut completed = 0;
+        let border = self.border();
+        for edge in 0..4 {
+            if self.colors[edge][3].get() == 0.0 || completed & EDGE_FLAGS[edge] != 0 {
+                continue;
+            }
+            let mut flags = EDGE_FLAGS[edge];
+            for (next, _) in EDGE_FLAGS.iter().enumerate().skip(edge + 1) {
+                if self.colors[edge] == self.colors[next] {
+                    flags |= EDGE_FLAGS[next];
+                }
+            }
+            completed |= flags;
+            nodes[edge] = Some(RetainedNodeItem {
+                color: self.color(edge),
+                rect: self.rect(),
+                atlas_scaling: None,
+                image_extent: None,
+                flip_x: false,
+                flip_y: false,
+                border,
+                border_radius: self.border_radius(),
+                node_type: NodeType::Border(flags),
+            });
+        }
+        nodes
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -262,7 +365,7 @@ pub(crate) struct RetainedGradientItem {
     border: [FloatBits; 4],
     resolved: RetainedResolvedGradient,
     color_space: bevy::ui::InterpolationColorSpace,
-    stops: Box<[RetainedGradientStop]>,
+    stops: SmallVec<[RetainedGradientStop; 2]>,
     border_gradient: bool,
 }
 
@@ -520,13 +623,25 @@ enum SliceScaleModeFingerprint {
 struct RetainedRecord {
     resource: ResourceFingerprint,
     render_entity: Entity,
-    prepared_core: Option<PreparedCore>,
+    prepared: Option<PreparedDraw>,
     draw: RetainedDraw,
+}
+
+enum PreparedDraw {
+    Core(PreparedCore),
+    Gradient {
+        color_space: bevy::ui::InterpolationColorSpace,
+        instances: Vec<GpuGradientInstance>,
+    },
+    Shadow {
+        samples: u32,
+        instance: GpuShadowInstance,
+    },
 }
 
 enum PreparedCore {
     One(GpuUiInstance),
-    Many(Box<[GpuUiInstance]>),
+    Many(Vec<GpuUiInstance>),
 }
 
 impl PreparedCore {
@@ -534,6 +649,25 @@ impl PreparedCore {
         match self {
             Self::One(instance) => core::slice::from_ref(instance),
             Self::Many(instances) => instances,
+        }
+    }
+
+    fn reposition(&mut self, draw: &RetainedDraw) {
+        match (self, &draw.item) {
+            (Self::One(instance), RetainedDrawItem::Node(_)) => {
+                instance.set_placement(draw.transform, draw.clip, Vec2::ZERO);
+            }
+            (Self::Many(instances), RetainedDrawItem::Glyphs(glyphs)) => {
+                for (instance, glyph) in instances.iter_mut().zip(glyphs) {
+                    instance.set_placement(draw.transform, draw.clip, glyph.translation());
+                }
+            }
+            (Self::Many(instances), RetainedDrawItem::Border(_)) => {
+                for instance in instances {
+                    instance.set_placement(draw.transform, draw.clip, Vec2::ZERO);
+                }
+            }
+            _ => unreachable!("prepared core data must match its canonical draw family"),
         }
     }
 }
@@ -548,13 +682,20 @@ impl PartialEq for RetainedRecord {
 
 impl RetainedRecord {
     fn new(draw: RetainedDraw, resource: ResourceFingerprint) -> Self {
-        let prepared_core = prepare_core(&draw);
         Self {
             resource,
             render_entity: draw.render_entity,
-            prepared_core,
+            prepared: None,
             draw,
         }
+    }
+
+    fn prepare(&mut self) {
+        self.prepared = prepare_draw(&self.draw);
+    }
+
+    fn refresh_prepared(&mut self) {
+        refresh_prepared(&self.draw, &mut self.prepared);
     }
 
     fn reposition(
@@ -563,7 +704,8 @@ impl RetainedRecord {
         clip: Option<Rect>,
         previous_coverage: &PaintCoverage,
     ) -> Option<PaintCoverage> {
-        let transform = source_transform * Affine2::from_translation(self.draw.local_translation);
+        let transform = source_transform
+            * Affine2::from_translation(self.draw.layout_translation + self.draw.local_translation);
         if affine_bits(self.draw.transform) == affine_bits(transform)
             && self.draw.clip.map(rect_fingerprint) == clip.map(rect_fingerprint)
         {
@@ -571,29 +713,21 @@ impl RetainedRecord {
         }
         self.draw.transform = transform;
         self.draw.clip = clip;
-        self.prepared_core = prepare_core(&self.draw);
-        Some(draw_coverage(&self.draw, previous_coverage))
-    }
-
-    fn border_parts(&self) -> Option<(&RetainedNodeItem, u32)> {
-        let RetainedDrawItem::Node(node) = &self.draw.item else {
-            return None;
-        };
-        let NodeType::Border(flags) = node.node_type else {
-            return None;
-        };
-        Some((node, flags))
-    }
-
-    fn can_merge_border(&self, other: &Self) -> bool {
-        self.resource == other.resource
-            && retained_common_eq(&self.draw, &other.draw)
-            && match (&self.draw.item, &other.draw.item) {
-                (RetainedDrawItem::Node(left), RetainedDrawItem::Node(right)) => {
-                    retained_node_merge_eq(left, right)
+        refresh_border_coverage(&mut self.draw);
+        if let Some(prepared) = &mut self.prepared {
+            match prepared {
+                PreparedDraw::Core(prepared) => prepared.reposition(&self.draw),
+                PreparedDraw::Gradient { instances, .. } => {
+                    for instance in instances {
+                        instance.set_placement(self.draw.transform, self.draw.clip);
+                    }
                 }
-                _ => false,
+                PreparedDraw::Shadow { instance, .. } => {
+                    instance.set_placement(self.draw.transform, self.draw.clip);
+                }
             }
+        }
+        Some(draw_coverage(&self.draw, previous_coverage))
     }
 
     fn retint_glyphs(&mut self, color: bevy::color::LinearRgba) -> bool {
@@ -601,7 +735,7 @@ impl RetainedRecord {
             return false;
         };
         let mut changed = false;
-        if let Some(PreparedCore::Many(instances)) = &mut self.prepared_core {
+        if let Some(PreparedDraw::Core(PreparedCore::Many(instances))) = &mut self.prepared {
             for (glyph, instance) in glyphs.iter_mut().zip(instances) {
                 if glyph.retint(color) {
                     instance.set_color(color);
@@ -616,32 +750,43 @@ impl RetainedRecord {
         changed
     }
 
-    fn retint_node(&mut self, color: bevy::color::LinearRgba) -> bool {
-        let RetainedDrawItem::Node(node) = &mut self.draw.item else {
-            return false;
-        };
-        if node.color == color {
-            return false;
+    fn core_source(&self, id: PaintId) -> RetainedCoreSource<'_> {
+        match &self.prepared {
+            Some(PreparedDraw::Core(prepared)) => RetainedCoreSource::Prepared(prepared.as_slice()),
+            _ => RetainedCoreSource::Deferred(id),
         }
-        node.color = color;
-        if let Some(PreparedCore::One(instance)) = &mut self.prepared_core {
-            instance.set_color(color);
-        }
-        true
     }
 
-    fn core_source(&self, id: PaintId) -> RetainedCoreSource<'_> {
-        self.prepared_core
-            .as_ref()
-            .map_or(RetainedCoreSource::Deferred(id), |prepared| {
-                RetainedCoreSource::Prepared(prepared.as_slice())
-            })
+    fn gradient_source(
+        &self,
+    ) -> Option<(bevy::ui::InterpolationColorSpace, &[GpuGradientInstance])> {
+        match &self.prepared {
+            Some(PreparedDraw::Gradient {
+                color_space,
+                instances,
+            }) => Some((*color_space, instances)),
+            _ => None,
+        }
+    }
+
+    fn shadow_source(&self) -> Option<(u32, GpuShadowInstance)> {
+        match &self.prepared {
+            Some(PreparedDraw::Shadow { samples, instance }) => Some((*samples, *instance)),
+            _ => None,
+        }
     }
 }
 
-fn prepare_core(draw: &RetainedDraw) -> Option<PreparedCore> {
+fn prepare_draw(draw: &RetainedDraw) -> Option<PreparedDraw> {
     match &draw.item {
-        RetainedDrawItem::Node(_) => prepare_persistent_instance(draw).map(PreparedCore::One),
+        RetainedDrawItem::Border(border) => {
+            let mut instances = Vec::new();
+            prepare_border_instances(draw, border, &mut instances);
+            Some(PreparedDraw::Core(PreparedCore::Many(instances)))
+        }
+        RetainedDrawItem::Node(_) => prepare_persistent_instance(draw)
+            .map(PreparedCore::One)
+            .map(PreparedDraw::Core),
         RetainedDrawItem::Glyphs(glyphs) => glyphs
             .iter()
             .map(|&glyph| {
@@ -650,8 +795,83 @@ fn prepare_core(draw: &RetainedDraw) -> Option<PreparedCore> {
                     .map(|extent| prepare_glyph_instance(draw, glyph, extent))
             })
             .collect::<Option<Vec<_>>>()
-            .map(|instances| PreparedCore::Many(instances.into_boxed_slice())),
+            .map(PreparedCore::Many)
+            .map(PreparedDraw::Core),
+        RetainedDrawItem::Gradient(item) => {
+            let mut instances = Vec::new();
+            prepare_gradient_instances(draw, item, &mut instances);
+            Some(PreparedDraw::Gradient {
+                color_space: item.color_space(),
+                instances,
+            })
+        }
+        RetainedDrawItem::BoxShadow(item) => Some(PreparedDraw::Shadow {
+            samples: item.samples(),
+            instance: prepare_shadow_instance(draw, item),
+        }),
         _ => None,
+    }
+}
+
+fn prepare_border_instances(
+    draw: &RetainedDraw,
+    border: &RetainedBorderItem,
+    instances: &mut Vec<GpuUiInstance>,
+) {
+    instances.extend(
+        border
+            .grouped_nodes()
+            .into_iter()
+            .flatten()
+            .map(|node| prepare_node_instance(draw, &node, Vec2::ONE)),
+    );
+}
+
+fn refresh_prepared(draw: &RetainedDraw, prepared: &mut Option<PreparedDraw>) {
+    match (prepared.as_mut(), &draw.item) {
+        (Some(PreparedDraw::Core(PreparedCore::One(instance))), RetainedDrawItem::Node(_)) => {
+            if let Some(next) = prepare_persistent_instance(draw) {
+                *instance = next;
+            } else {
+                *prepared = None;
+            }
+        }
+        (
+            Some(PreparedDraw::Core(PreparedCore::Many(instances))),
+            RetainedDrawItem::Border(border),
+        ) => {
+            instances.clear();
+            prepare_border_instances(draw, border, instances);
+        }
+        (
+            Some(PreparedDraw::Core(PreparedCore::Many(instances))),
+            RetainedDrawItem::Glyphs(glyphs),
+        ) => {
+            instances.clear();
+            for &glyph in glyphs {
+                let Some(extent) = glyph.atlas_extent() else {
+                    *prepared = None;
+                    return;
+                };
+                instances.push(prepare_glyph_instance(draw, glyph, extent));
+            }
+        }
+        (
+            Some(PreparedDraw::Gradient {
+                color_space,
+                instances,
+            }),
+            RetainedDrawItem::Gradient(item),
+        ) => {
+            *color_space = item.color_space();
+            instances.clear();
+            prepare_gradient_instances(draw, item, instances);
+        }
+        (Some(PreparedDraw::Shadow { samples, instance }), RetainedDrawItem::BoxShadow(item)) => {
+            *samples = item.samples();
+            *instance = prepare_shadow_instance(draw, item);
+        }
+        _ => *prepared = prepare_draw(draw),
     }
 }
 
@@ -662,6 +882,7 @@ fn draw_coverage(draw: &RetainedDraw, previous: &PaintCoverage) -> PaintCoverage
                 .into_iter()
                 .collect()
         }
+        RetainedDrawItem::Border(border) => border_coverage(border),
         RetainedDrawItem::BoxShadow(shadow) => coverage(shadow.bounds(), draw.transform, draw.clip)
             .into_iter()
             .collect(),
@@ -745,6 +966,50 @@ fn draw_coverage(draw: &RetainedDraw, previous: &PaintCoverage) -> PaintCoverage
     }
 }
 
+fn border_coverage(border: &RetainedBorderItem) -> PaintCoverage {
+    border.edge_coverage.into_iter().flatten().collect()
+}
+
+fn refresh_border_coverage(draw: &mut RetainedDraw) {
+    let RetainedDrawItem::Border(border) = &mut draw.item else {
+        return;
+    };
+    let widths = border.border.map(FloatBits::get);
+    let radii = border.border_radius.map(FloatBits::get);
+    let size = border.rect().size();
+    border.edge_coverage = core::array::from_fn(|edge| {
+        (border.colors[edge][3].get() != 0.0)
+            .then(|| {
+                coverage_rect(
+                    edge_rect(size, widths[edge], radii, edge),
+                    draw.transform,
+                    draw.clip,
+                )
+            })
+            .flatten()
+    });
+}
+
+fn changed_border_damage(
+    previous_draw: &RetainedDraw,
+    previous: &RetainedBorderItem,
+    draw: &RetainedDraw,
+    border: &RetainedBorderItem,
+) -> PaintCoverage {
+    let all_edges = !retained_common_eq(previous_draw, draw)
+        || previous.rect != border.rect
+        || previous.border != border.border
+        || previous.border_radius != border.border_radius;
+    (0..4)
+        .filter(|&edge| all_edges || previous.colors[edge] != border.colors[edge])
+        .flat_map(|edge| {
+            [previous.edge_coverage[edge], border.edge_coverage[edge]]
+                .into_iter()
+                .flatten()
+        })
+        .collect()
+}
+
 fn affine_bits(transform: Affine2) -> [FloatBits; 6] {
     transform.to_cols_array().map(FloatBits::new)
 }
@@ -756,13 +1021,21 @@ fn retained_common_eq(left: &RetainedDraw, right: &RetainedDraw) -> bool {
         && left.clip.map(rect_fingerprint) == right.clip.map(rect_fingerprint)
         && left.image == right.image
         && affine_bits(left.transform) == affine_bits(right.transform)
-        && left.local_translation.to_array().map(FloatBits::new)
-            == right.local_translation.to_array().map(FloatBits::new)
+        && left.layout_translation.to_array().map(FloatBits::new)
+            == right.layout_translation.to_array().map(FloatBits::new)
 }
 
 fn retained_node_merge_eq(left: &RetainedNodeItem, right: &RetainedNodeItem) -> bool {
     left.color.to_f32_array().map(FloatBits::new) == right.color.to_f32_array().map(FloatBits::new)
-        && rect_fingerprint(left.rect) == rect_fingerprint(right.rect)
+        && retained_node_shape_eq(left, right)
+}
+
+fn retained_node_geometry_eq(left: &RetainedNodeItem, right: &RetainedNodeItem) -> bool {
+    retained_node_shape_eq(left, right) && left.node_type == right.node_type
+}
+
+fn retained_node_shape_eq(left: &RetainedNodeItem, right: &RetainedNodeItem) -> bool {
+    rect_fingerprint(left.rect) == rect_fingerprint(right.rect)
         && left
             .image_extent
             .map(|value| value.to_array().map(FloatBits::new))
@@ -798,11 +1071,12 @@ fn retained_node_merge_eq(left: &RetainedNodeItem, right: &RetainedNodeItem) -> 
 fn retained_item_eq(left: &RetainedDrawItem, right: &RetainedDrawItem) -> bool {
     match (left, right) {
         (RetainedDrawItem::Boundary(left), RetainedDrawItem::Boundary(right)) => left == right,
+        (RetainedDrawItem::Border(left), RetainedDrawItem::Border(right)) => left == right,
         (RetainedDrawItem::BoxShadow(left), RetainedDrawItem::BoxShadow(right)) => left == right,
         (RetainedDrawItem::Gradient(left), RetainedDrawItem::Gradient(right)) => left == right,
         (RetainedDrawItem::Material(left), RetainedDrawItem::Material(right)) => left == right,
         (RetainedDrawItem::Node(left), RetainedDrawItem::Node(right)) => {
-            retained_node_merge_eq(left, right) && left.node_type == right.node_type
+            retained_node_merge_eq(left, right)
         }
         (RetainedDrawItem::Glyphs(left), RetainedDrawItem::Glyphs(right)) => left == right,
         (RetainedDrawItem::TextureSlice(left), RetainedDrawItem::TextureSlice(right)) => {
@@ -872,70 +1146,183 @@ fn slice_scale_mode_fingerprint(mode: SliceScaleMode) -> SliceScaleModeFingerpri
 
 #[derive(Default)]
 pub(crate) struct RetainedUiSurfaces {
-    paint: HashMap<Entity, RetainedPaint<PaintId, RetainedRecord>>,
-    owners: HashMap<PaintId, PaintOwner>,
-    by_main_entity: HashMap<MainEntity, SmallVec<[PaintId; 8]>>,
-    surface_by_main_entity: HashMap<MainEntity, Entity>,
-    dirty_surfaces: HashSet<Entity>,
-    touched_surfaces: HashSet<Entity>,
-    propagated_epochs: HashMap<Entity, u64>,
-    order: HashMap<Entity, PaintOrder>,
+    paint: EntityHashMap<PaintState>,
+    records: RecordArena,
+    by_main_entity: MainEntityHashMap<SmallVec<[usize; 8]>>,
+    surface_by_main_entity: MainEntityHashMap<Entity>,
+    dirty_surfaces: Vec<Entity>,
+    touched_surfaces: Vec<Entity>,
+    propagated_epochs: EntityHashMap<u64>,
+    order: EntityHashMap<PaintOrder>,
 }
 
-struct PaintOwner {
+struct OwnedPaint {
+    id: PaintId,
     camera: Entity,
     main_entity: Option<MainEntity>,
-    render_entity: Entity,
     order: (FloatBits, u32),
     group: Option<usize>,
+    record: PaintRecord<RetainedRecord>,
+}
+
+#[derive(Default)]
+struct RecordArena {
+    slots: Vec<Option<OwnedPaint>>,
+    by_entity: EntityHashMap<SmallVec<[EntityRecordSlot; 8]>>,
+    free: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct EntityRecordSlot {
+    key: (PaintFamily, u32),
+    slot: usize,
+}
+
+impl RecordArena {
+    fn get(&self, id: &PaintId) -> Option<&OwnedPaint> {
+        self.slot(id).map(|slot| &self[slot])
+    }
+
+    fn slot(&self, id: &PaintId) -> Option<usize> {
+        let entries = self.by_entity.get(&id.entity)?;
+        let index = entries
+            .binary_search_by_key(&(id.family, id.ordinal), |entry| entry.key)
+            .ok()?;
+        Some(entries[index].slot)
+    }
+
+    fn insert(&mut self, owned: OwnedPaint) -> usize {
+        let id = owned.id;
+        let slot = self.free.pop().unwrap_or(self.slots.len());
+        if slot == self.slots.len() {
+            self.slots.push(Some(owned));
+        } else {
+            self.slots[slot] = Some(owned);
+        }
+        let entries = self.by_entity.entry(id.entity).or_default();
+        let index = entries
+            .binary_search_by_key(&(id.family, id.ordinal), |entry| entry.key)
+            .expect_err("a retained paint identity must have one arena slot");
+        entries.insert(
+            index,
+            EntityRecordSlot {
+                key: (id.family, id.ordinal),
+                slot,
+            },
+        );
+        slot
+    }
+
+    fn remove(&mut self, id: &PaintId) -> Option<(usize, OwnedPaint)> {
+        let slot = self.slot(id)?;
+        let owned = self.slots[slot]
+            .take()
+            .expect("record index must point to an occupied arena slot");
+        let entity_slots = self
+            .by_entity
+            .get_mut(&id.entity)
+            .expect("occupied record must have an entity index");
+        let index = entity_slots
+            .binary_search_by_key(&(id.family, id.ordinal), |entry| entry.key)
+            .expect("occupied record must have an entity index entry");
+        debug_assert_eq!(entity_slots[index].slot, slot);
+        entity_slots.remove(index);
+        if entity_slots.is_empty() {
+            self.by_entity.remove(&id.entity);
+        }
+        self.free.push(slot);
+        Some((slot, owned))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, &OwnedPaint)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, owned)| owned.as_ref().map(|owned| (slot, owned)))
+    }
+}
+
+impl core::ops::Index<usize> for RecordArena {
+    type Output = OwnedPaint;
+
+    fn index(&self, slot: usize) -> &Self::Output {
+        self.slots[slot]
+            .as_ref()
+            .expect("retained paint slot must be occupied")
+    }
+}
+
+impl core::ops::IndexMut<usize> for RecordArena {
+    fn index_mut(&mut self, slot: usize) -> &mut Self::Output {
+        self.slots[slot]
+            .as_mut()
+            .expect("retained paint slot must be occupied")
+    }
 }
 
 #[derive(Default)]
 struct PaintOrder {
-    ids: Vec<PaintId>,
+    slots: Vec<usize>,
     groups: Vec<core::ops::Range<usize>>,
-    group_by_id: HashMap<PaintId, usize>,
-    groups_by_entity: HashMap<Entity, SmallVec<[usize; 4]>>,
     spatial: Option<SpatialIndex<usize>>,
-    bounds_dirty: HashSet<usize>,
+    spatial_revision: u64,
+    bounds_dirty: Vec<usize>,
+    bounds_dirty_marks: Vec<bool>,
+    bounds_updates: Vec<(usize, PhysicalRect)>,
     direct_groups: Vec<usize>,
-    direct_epochs: Vec<Option<[u64; 2]>>,
+    direct_epochs: Vec<[u64; 2]>,
+    latest_direct_epoch: u64,
+    acknowledged_direct_epoch: u64,
     candidates: Vec<usize>,
+    cached_candidate_revision: u64,
+    cached_candidate_repair: Option<RepairPlan>,
+    cached_direct_groups: Vec<usize>,
     candidate_marks: Vec<u32>,
     candidate_generation: u32,
     order_dirty: bool,
-    group_dirty: bool,
 }
 
 impl PaintOrder {
+    fn note_bounds_dirty(&mut self, group: usize) {
+        if !self.bounds_dirty_marks[group] {
+            self.bounds_dirty_marks[group] = true;
+            self.bounds_dirty.push(group);
+        }
+    }
+
     fn note_direct(&mut self, group: Option<usize>, epoch: u64) {
         let Some(group) = group else {
             return;
         };
+        self.latest_direct_epoch = self.latest_direct_epoch.max(epoch);
         match &mut self.direct_epochs[group] {
-            Some([_, latest]) => {
+            [_, latest] if *latest > self.acknowledged_direct_epoch => {
                 debug_assert!(*latest <= epoch);
                 *latest = epoch;
             }
-            slot @ None => {
-                *slot = Some([epoch, epoch]);
+            slot => {
+                *slot = [epoch, epoch];
                 self.direct_groups.push(group);
             }
         }
     }
 
     fn acknowledge(&mut self, through_epoch: u64) {
+        self.acknowledged_direct_epoch = self.acknowledged_direct_epoch.max(through_epoch);
+        if self.latest_direct_epoch <= through_epoch {
+            self.direct_groups.clear();
+            return;
+        }
         self.direct_groups.retain(|&group| {
-            let [earliest, latest] = self.direct_epochs[group]
-                .expect("direct groups have an outstanding epoch interval");
+            let [earliest, latest] = self.direct_epochs[group];
+            debug_assert!(latest > self.acknowledged_direct_epoch);
             if earliest > through_epoch {
                 return true;
             }
             if latest > through_epoch {
-                self.direct_epochs[group] = Some([latest, latest]);
+                self.direct_epochs[group] = [latest, latest];
                 true
             } else {
-                self.direct_epochs[group] = None;
                 false
             }
         });
@@ -943,6 +1330,25 @@ impl PaintOrder {
 }
 
 impl RetainedUiSurfaces {
+    fn touch(&mut self, camera: Entity) {
+        if self.paint.entry(camera).or_default().list_touched() {
+            self.touched_surfaces.push(camera);
+        }
+    }
+
+    fn dirty(&mut self, camera: Entity) {
+        if self.paint.entry(camera).or_default().list_dirty() {
+            self.dirty_surfaces.push(camera);
+        }
+    }
+
+    fn clear_dirty(&mut self, camera: Entity) {
+        if let Some(paint) = self.paint.get_mut(&camera) {
+            paint.clear_dirty_listing();
+        }
+        self.dirty_surfaces.retain(|listed| *listed != camera);
+    }
+
     fn set_entity_surface(&mut self, entity: MainEntity, surface: Option<Entity>, camera: Entity) {
         let target = surface.unwrap_or(camera);
         match surface {
@@ -953,30 +1359,30 @@ impl RetainedUiSurfaces {
                 self.surface_by_main_entity.remove(&entity);
             }
         }
-        let Some(ids) = self.by_main_entity.get(&entity).cloned() else {
+        let Some(slots) = self.by_main_entity.get(&entity).cloned() else {
             return;
         };
-        for id in ids {
-            let old_camera = self.owners[&id].camera;
+        for slot in slots {
+            let owned = &mut self.records[slot];
+            let old_camera = owned.camera;
             if old_camera == target {
                 continue;
             }
-            let mut record = self
-                .paint
+            self.paint
                 .get_mut(&old_camera)
                 .expect("owned retained paint camera must exist")
-                .take(&id)
-                .expect("owned retained paint must exist");
-            record.value.draw.camera = target;
-            self.paint.entry(target).or_default().upsert(id, record);
-            self.dirty_surfaces.extend([old_camera, target]);
-            self.touched_surfaces.extend([old_camera, target]);
-            let owner = self
-                .owners
-                .get_mut(&id)
-                .expect("main-entity index must contain an owner");
-            owner.camera = target;
-            owner.group = None;
+                .remove(&owned.record.coverage);
+            owned.camera = target;
+            owned.group = None;
+            owned.record.value.draw.camera = target;
+            self.paint
+                .entry(target)
+                .or_default()
+                .upsert(None, &owned.record);
+            self.dirty(old_camera);
+            self.dirty(target);
+            self.touch(old_camera);
+            self.touch(target);
             for camera in [old_camera, target] {
                 let order = self.order.entry(camera).or_default();
                 order.order_dirty = true;
@@ -986,20 +1392,19 @@ impl RetainedUiSurfaces {
     }
 
     fn remove_main_entity(&mut self, commands: &mut Commands, entity: MainEntity) {
-        let Some(ids) = self.by_main_entity.get(&entity).cloned() else {
+        let Some(slots) = self.by_main_entity.get(&entity).cloned() else {
             self.surface_by_main_entity.remove(&entity);
             return;
         };
-        for id in ids {
+        for slot in slots {
+            let id = self.records[slot].id;
             self.remove(commands, id);
         }
         self.surface_by_main_entity.remove(&entity);
     }
 
     pub(crate) fn core_draw(&self, id: PaintId) -> Option<&RetainedDraw> {
-        let camera = self.owners.get(&id)?.camera;
-        let record = self.paint.get(&camera)?.get(&id)?;
-        Some(&record.value.draw)
+        Some(&self.records.get(&id)?.record.value.draw)
     }
 
     pub(crate) fn retint_text(
@@ -1012,24 +1417,30 @@ impl RetainedUiSurfaces {
             if id.entity != section || id.family != PaintFamily::Text {
                 continue;
             }
-            let Some(owner) = self.owners.get(&id) else {
+            let Some(slot) = self.records.slot(&id) else {
                 continue;
             };
-            let camera = owner.camera;
-            let group = owner.group;
+            let camera = self.records[slot].camera;
+            let group = self.records[slot].group;
+            self.touch(camera);
+            let owned = &mut self.records[slot];
             let paint = self
                 .paint
                 .get_mut(&camera)
                 .expect("owned text camera must exist");
-            self.touched_surfaces.insert(camera);
-            let outcome = paint.update_in_place(&id, |record| record.retint_glyphs(color));
-            if outcome.is_some_and(|outcome| outcome != crate::UpdateOutcome::Unchanged) {
+            let changed = owned.record.value.retint_glyphs(color);
+            let outcome = if changed {
+                paint.update(&owned.record.coverage, &owned.record.coverage)
+            } else {
+                paint.unchanged()
+            };
+            if outcome != crate::UpdateOutcome::Unchanged {
                 let epoch = paint.latest_damage_epoch();
                 self.order
                     .entry(camera)
                     .or_default()
                     .note_direct(group, epoch);
-                self.dirty_surfaces.insert(camera);
+                self.dirty(camera);
             }
         }
     }
@@ -1039,57 +1450,236 @@ impl RetainedUiSurfaces {
         id: PaintId,
         color: bevy::color::LinearRgba,
     ) -> bool {
-        let Some(owner) = self.owners.get(&id) else {
+        let Some(slot) = self.records.slot(&id) else {
             return false;
         };
-        let outcome = self
+        let camera = self.records[slot].camera;
+        let group = self.records[slot].group;
+        self.touch(camera);
+        let owned = &mut self.records[slot];
+        let paint = self
             .paint
-            .get_mut(&owner.camera)
-            .and_then(|paint| paint.update_in_place(&id, |record| record.retint_node(color)));
-        self.touched_surfaces.insert(owner.camera);
-        if outcome.is_some_and(|outcome| outcome != crate::UpdateOutcome::Unchanged) {
-            let camera = owner.camera;
-            let group = owner.group;
-            let epoch = self.paint[&camera].latest_damage_epoch();
+            .get_mut(&camera)
+            .expect("owned node camera must exist");
+        let RetainedDrawItem::Node(node) = &mut owned.record.value.draw.item else {
+            return false;
+        };
+        let changed = node.color != color;
+        if changed {
+            node.color = color;
+            if let Some(PreparedDraw::Core(PreparedCore::One(instance))) =
+                &mut owned.record.value.prepared
+            {
+                instance.set_color(color);
+            }
+        }
+        let outcome = if changed {
+            paint.update(&owned.record.coverage, &owned.record.coverage)
+        } else {
+            paint.unchanged()
+        };
+        if outcome != crate::UpdateOutcome::Unchanged {
+            let epoch = paint.latest_damage_epoch();
             self.order
                 .entry(camera)
                 .or_default()
                 .note_direct(group, epoch);
-            self.dirty_surfaces.insert(camera);
+            self.dirty(camera);
         }
-        outcome.is_some()
+        true
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "image layout has independent box, transform, clip, and scale outputs"
+    )]
+    pub(crate) fn relayout_image(
+        &mut self,
+        commands: &mut Commands,
+        entity: Entity,
+        size: Vec2,
+        center: Vec2,
+        source_transform: Affine2,
+        clip: Option<Rect>,
+        border_radius: ResolvedBorderRadius,
+        inverse_scale_factor: f32,
+        painted: bool,
+    ) -> bool {
+        let id = PaintId {
+            entity,
+            family: PaintFamily::Image,
+            ordinal: 0,
+        };
+        let transform = source_transform * Affine2::from_translation(center);
+        self.update_geometry(
+            commands,
+            id,
+            transform,
+            clip,
+            center,
+            painted,
+            |item| match item {
+                RetainedDrawItem::Node(node) => {
+                    let old_rect = rect_fingerprint(node.rect);
+                    let old_scaling = node
+                        .atlas_scaling
+                        .map(|value| value.to_array().map(FloatBits::new));
+                    let old_radius = <[f32; 4]>::from(node.border_radius).map(FloatBits::new);
+                    if let Some(old_scale) = node.atlas_scaling {
+                        let source = Rect::from_corners(
+                            node.rect.min / old_scale,
+                            node.rect.max / old_scale,
+                        );
+                        let scale = size / source.size();
+                        node.rect = Rect::from_corners(source.min * scale, source.max * scale);
+                        node.atlas_scaling = Some(scale);
+                    } else {
+                        node.rect = Rect::from_corners(Vec2::ZERO, size);
+                    }
+                    node.border_radius = border_radius;
+                    Some(
+                        old_rect != rect_fingerprint(node.rect)
+                            || old_scaling
+                                != node
+                                    .atlas_scaling
+                                    .map(|value| value.to_array().map(FloatBits::new))
+                            || old_radius
+                                != <[f32; 4]>::from(node.border_radius).map(FloatBits::new),
+                    )
+                }
+                RetainedDrawItem::TextureSlice(slice) => {
+                    let old_rect = rect_fingerprint(slice.rect);
+                    let old_scale = FloatBits::new(slice.inverse_scale_factor);
+                    slice.rect = Rect::from_corners(Vec2::ZERO, size);
+                    slice.inverse_scale_factor = inverse_scale_factor;
+                    Some(
+                        old_rect != rect_fingerprint(slice.rect)
+                            || old_scale != FloatBits::new(slice.inverse_scale_factor),
+                    )
+                }
+                _ => None,
+            },
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "canonical geometry has independent identity, placement, visibility, and item data"
+    )]
+    fn update_geometry(
+        &mut self,
+        commands: &mut Commands,
+        id: PaintId,
+        transform: Affine2,
+        clip: Option<Rect>,
+        local_translation: Vec2,
+        painted: bool,
+        update_item: impl FnOnce(&mut RetainedDrawItem) -> Option<bool>,
+    ) -> bool {
+        if !painted {
+            self.remove(commands, id);
+            return true;
+        }
+        let Some(slot) = self.records.slot(&id) else {
+            return false;
+        };
+        let camera = self.records[slot].camera;
+        let group = self.records[slot].group;
+        self.touch(camera);
+
+        let owned = &mut self.records[slot];
+        let draw = &mut owned.record.value.draw;
+        let placement_changed = affine_bits(draw.transform) != affine_bits(transform)
+            || draw.clip.map(rect_fingerprint) != clip.map(rect_fingerprint)
+            || draw.local_translation.to_array().map(FloatBits::new)
+                != local_translation.to_array().map(FloatBits::new);
+        let Some(item_changed) = update_item(&mut draw.item) else {
+            return false;
+        };
+        draw.transform = transform;
+        draw.clip = clip;
+        draw.local_translation = local_translation;
+        if !placement_changed && !item_changed {
+            self.paint
+                .get_mut(&camera)
+                .expect("owned geometry camera must have paint state")
+                .unchanged();
+            return true;
+        }
+
+        let coverage = draw_coverage(draw, &owned.record.coverage);
+        let visibility_changed = owned.record.coverage.is_empty() != coverage.is_empty();
+        let paint = self
+            .paint
+            .get_mut(&camera)
+            .expect("owned geometry camera must have paint state");
+        let outcome = paint.update(&owned.record.coverage, &coverage);
+        owned.record.coverage = coverage;
+        owned.record.value.refresh_prepared();
+        let epoch = paint.latest_damage_epoch();
+        let list_dirty = paint.list_dirty();
+        let order = self.order.entry(camera).or_default();
+        order.note_direct(group, epoch);
+        if visibility_changed {
+            order.order_dirty = true;
+            order.spatial = None;
+        } else if outcome.coverage_changed() {
+            if let Some(group) = group
+                && order.spatial.is_some()
+                && !order.order_dirty
+            {
+                order.note_bounds_dirty(group);
+            } else {
+                order.spatial = None;
+            }
+        }
+        if list_dirty {
+            self.dirty_surfaces.push(camera);
+        }
+        true
     }
 
     fn reposition(&mut self, entity: MainEntity, transform: Affine2, clip: Option<Rect>) {
-        let Some(ids) = self.by_main_entity.get(&entity).cloned() else {
+        self.reposition_layout(entity, transform, clip, None);
+    }
+
+    pub(crate) fn reposition_layout(
+        &mut self,
+        entity: MainEntity,
+        transform: Affine2,
+        clip: Option<Rect>,
+        layout_translation: Option<Vec2>,
+    ) {
+        let Some(slots) = self.by_main_entity.get(&entity).cloned() else {
             return;
         };
-        let camera = self.owners[&ids[0]].camera;
+        let camera = self.records[slots[0]].camera;
+        self.touch(camera);
         let paint = self
             .paint
             .get_mut(&camera)
             .expect("owned paint camera must exist");
-        self.touched_surfaces.insert(camera);
         let order = self.order.entry(camera).or_default();
         let mut changed = false;
-        for id in ids {
-            let owner = self
-                .owners
-                .get(&id)
-                .expect("main-entity index must contain an owned paint record");
-            debug_assert_eq!(owner.camera, camera);
-            let group = owner.group;
-            let mut visibility_changed = false;
-            let outcome = paint.update_with_coverage(&id, |record, previous| {
-                let coverage = record.reposition(transform, clip, previous)?;
-                visibility_changed = previous.is_empty() != coverage.is_empty();
-                Some(coverage)
-            });
-            let Some(outcome) =
-                outcome.filter(|outcome| *outcome != crate::UpdateOutcome::Unchanged)
+        for slot in slots {
+            let owned = &mut self.records[slot];
+            debug_assert_eq!(owned.camera, camera);
+            if let Some(layout_translation) = layout_translation {
+                owned.record.value.draw.layout_translation = layout_translation;
+            }
+            let group = owned.group;
+            let Some(coverage) =
+                owned
+                    .record
+                    .value
+                    .reposition(transform, clip, &owned.record.coverage)
             else {
+                paint.unchanged();
                 continue;
             };
+            let visibility_changed = owned.record.coverage.is_empty() != coverage.is_empty();
+            let outcome = paint.update(&owned.record.coverage, &coverage);
+            owned.record.coverage = coverage;
             let epoch = paint.latest_damage_epoch();
             changed = true;
             order.note_direct(group, epoch);
@@ -1100,47 +1690,48 @@ impl RetainedUiSurfaces {
                 if let Some(group) = group
                     && order.spatial.is_some()
                     && !order.order_dirty
-                    && !order.group_dirty
                 {
-                    order.bounds_dirty.insert(group);
+                    order.note_bounds_dirty(group);
                 } else {
                     order.spatial = None;
                 }
             }
         }
         if changed {
-            self.dirty_surfaces.insert(camera);
+            self.dirty(camera);
         }
     }
 
     pub(crate) fn remove(&mut self, commands: &mut Commands, id: PaintId) {
-        let Some(owner) = self.detach_owner(id) else {
+        let Some(owned) = self.detach_record(id) else {
             return;
         };
 
-        let paint = self.paint.get_mut(&owner.camera).unwrap();
-        paint.remove(&id);
-        self.dirty_surfaces.insert(owner.camera);
-        self.touched_surfaces.insert(owner.camera);
-        let index = self.order.entry(owner.camera).or_default();
+        self.paint
+            .get_mut(&owned.camera)
+            .expect("owned paint camera must exist")
+            .remove(&owned.record.coverage);
+        self.dirty(owned.camera);
+        self.touch(owned.camera);
+        let index = self.order.entry(owned.camera).or_default();
         index.order_dirty = true;
         index.spatial = None;
-        if let Ok(mut entity) = commands.get_entity(owner.render_entity) {
+        if let Ok(mut entity) = commands.get_entity(owned.record.value.render_entity) {
             entity.despawn();
         }
     }
 
-    fn detach_owner(&mut self, id: PaintId) -> Option<PaintOwner> {
-        let owner = self.owners.remove(&id)?;
-        if let Some(main_entity) = owner.main_entity
-            && let Some(ids) = self.by_main_entity.get_mut(&main_entity)
+    fn detach_record(&mut self, id: PaintId) -> Option<OwnedPaint> {
+        let (slot, owned) = self.records.remove(&id)?;
+        if let Some(main_entity) = owned.main_entity
+            && let Some(slots) = self.by_main_entity.get_mut(&main_entity)
         {
-            ids.retain(|candidate| *candidate != id);
-            if ids.is_empty() {
+            slots.retain(|candidate| *candidate != slot);
+            if slots.is_empty() {
                 self.by_main_entity.remove(&main_entity);
             }
         }
-        Some(owner)
+        Some(owned)
     }
 
     pub(crate) fn upsert(
@@ -1164,6 +1755,10 @@ impl RetainedUiSurfaces {
             .unwrap_or(camera);
         draw.camera = camera;
         let main_entity = draw.main_entity;
+        if self.can_update(id, camera, &draw, &resource, Some(main_entity)) {
+            self.update_existing(id, camera, draw, coverage);
+            return;
+        }
         self.upsert_at(
             commands,
             id,
@@ -1173,6 +1768,127 @@ impl RetainedUiSurfaces {
             coverage,
             Some(main_entity),
         );
+    }
+
+    fn can_update(
+        &self,
+        id: PaintId,
+        camera: Entity,
+        draw: &RetainedDraw,
+        resource: &ResourceFingerprint,
+        index_owner: Option<MainEntity>,
+    ) -> bool {
+        let Some(slot) = self.records.slot(&id) else {
+            return false;
+        };
+        let owned = &self.records[slot];
+        let previous = &owned.record.value;
+        let order = (FloatBits::new(draw.z_order), draw.paint_order);
+        if owned.camera != camera
+            || owned.main_entity != index_owner
+            || owned.order != order
+            || previous.resource != *resource
+            || previous.draw.main_entity != draw.main_entity
+            || previous.draw.image != draw.image
+            || previous
+                .draw
+                .layout_translation
+                .to_array()
+                .map(FloatBits::new)
+                != draw.layout_translation.to_array().map(FloatBits::new)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn update_existing(
+        &mut self,
+        id: PaintId,
+        camera: Entity,
+        mut draw: RetainedDraw,
+        coverage: PaintCoverage,
+    ) {
+        let slot = self
+            .records
+            .slot(&id)
+            .expect("an updateable paint must already exist");
+        let previous = &self.records[slot].record.value;
+        let same_common = retained_common_eq(&previous.draw, &draw);
+        let same_pixels = same_common && retained_item_eq(&previous.draw.item, &draw.item);
+        let same_coverage = self.records[slot].record.coverage == coverage;
+        let exact_border_damage = match (&previous.draw.item, &draw.item) {
+            (RetainedDrawItem::Border(previous_border), RetainedDrawItem::Border(border)) => Some(
+                changed_border_damage(&previous.draw, previous_border, &draw, border),
+            ),
+            _ => None,
+        };
+        let color_only_node_change = same_common
+            && same_coverage
+            && matches!(
+                (&previous.draw.item, &draw.item),
+                (RetainedDrawItem::Node(previous), RetainedDrawItem::Node(next))
+                    if retained_node_geometry_eq(previous, next)
+            );
+        self.records[slot].record.value.draw.local_translation = draw.local_translation;
+        let paint = self
+            .paint
+            .get_mut(&camera)
+            .expect("owned paint camera must have paint state");
+        if paint.list_touched() {
+            self.touched_surfaces.push(camera);
+        }
+        if same_pixels && same_coverage {
+            paint.unchanged();
+            return;
+        }
+
+        let owned = &mut self.records[slot];
+        let visibility_changed = owned.record.coverage.is_empty() != coverage.is_empty();
+        let outcome = if let Some(damage) = &exact_border_damage {
+            paint.update_exact(&owned.record.coverage, &coverage, damage)
+        } else {
+            paint.update(&owned.record.coverage, &coverage)
+        };
+        owned.record.coverage = coverage;
+        draw.render_entity = owned.record.value.render_entity;
+        let color = color_only_node_change.then(|| match &draw.item {
+            RetainedDrawItem::Node(node) => node.color,
+            _ => unreachable!("a color-only node change must contain a node"),
+        });
+        owned.record.value.draw = draw;
+        let group = owned.group;
+        let epoch = paint.latest_damage_epoch();
+        let list_dirty = paint.list_dirty();
+        if let Some(color) = color {
+            if let Some(PreparedDraw::Core(PreparedCore::One(instance))) =
+                &mut owned.record.value.prepared
+            {
+                instance.set_color(color);
+            } else {
+                owned.record.value.refresh_prepared();
+            }
+        } else {
+            owned.record.value.refresh_prepared();
+        }
+        let order = self.order.entry(camera).or_default();
+        order.note_direct(group, epoch);
+        if visibility_changed {
+            order.order_dirty = true;
+            order.spatial = None;
+        } else if outcome.coverage_changed() {
+            if let Some(group) = group
+                && order.spatial.is_some()
+                && !order.order_dirty
+            {
+                order.note_bounds_dirty(group);
+            } else {
+                order.spatial = None;
+            }
+        }
+        if list_dirty {
+            self.dirty_surfaces.push(camera);
+        }
     }
 
     pub(crate) fn upsert_boundary(
@@ -1209,79 +1925,104 @@ impl RetainedUiSurfaces {
         coverage: PaintCoverage,
         index_owner: Option<MainEntity>,
     ) {
-        self.touched_surfaces.insert(camera);
         let new_order = (FloatBits::new(draw.z_order), draw.paint_order);
-        let (old_camera, render_entity, old_order, old_index_owner) = match self.owners.entry(id) {
-            Entry::Occupied(mut owner) => {
-                let old_camera = owner.get().camera;
-                let previous = (
-                    Some(old_camera),
-                    owner.get().render_entity,
-                    Some(owner.get().order),
-                    Some(owner.get().main_entity),
-                );
-                owner.get_mut().camera = camera;
-                owner.get_mut().main_entity = index_owner;
-                owner.get_mut().order = new_order;
-                if old_camera != camera || previous.2 != Some(new_order) {
-                    owner.get_mut().group = None;
-                }
-                previous
-            }
-            Entry::Vacant(owner) => {
-                let render_entity = commands.spawn_empty().id();
-                owner.insert(PaintOwner {
-                    camera,
-                    main_entity: index_owner,
-                    render_entity,
-                    order: new_order,
-                    group: None,
-                });
-                (None, render_entity, None, None)
-            }
-        };
-        if old_index_owner != Some(index_owner) {
-            if let Some(Some(old_main_entity)) = old_index_owner
-                && let Some(ids) = self.by_main_entity.get_mut(&old_main_entity)
-            {
-                ids.retain(|candidate| *candidate != id);
-                if ids.is_empty() {
-                    self.by_main_entity.remove(&old_main_entity);
-                }
-            }
-            if let Some(index_owner) = index_owner {
-                self.by_main_entity.entry(index_owner).or_default().push(id);
+        let existing_slot = self.records.slot(&id);
+        let existing = existing_slot.map(|slot| &self.records[slot]);
+        let old_camera = existing.map(|owned| owned.camera);
+        let old_order = existing.map(|owned| owned.order);
+        let old_index_owner = existing.and_then(|owned| owned.main_entity);
+        let render_entity = existing.map_or_else(
+            || commands.spawn_empty().id(),
+            |owned| owned.record.value.render_entity,
+        );
+        if old_index_owner != index_owner
+            && let Some(old_main_entity) = old_index_owner
+            && let Some(slots) = self.by_main_entity.get_mut(&old_main_entity)
+        {
+            slots.retain(|candidate| Some(*candidate) != existing_slot);
+            if slots.is_empty() {
+                self.by_main_entity.remove(&old_main_entity);
             }
         }
         draw.render_entity = render_entity;
-
-        if let Some(old_camera) = old_camera
-            && old_camera != camera
-        {
-            self.paint.get_mut(&old_camera).unwrap().remove(&id);
-            self.dirty_surfaces.insert(old_camera);
-            self.touched_surfaces.insert(old_camera);
-            let index = self.order.entry(old_camera).or_default();
-            index.order_dirty = true;
-            index.spatial = None;
-        }
-        let visibility_changed = old_camera == Some(camera)
-            && self
-                .paint
-                .get(&camera)
-                .and_then(|paint| paint.get(&id))
-                .is_some_and(|record| record.coverage.is_empty() != coverage.is_empty());
-        let outcome = self.paint.entry(camera).or_default().upsert(
-            id,
-            PaintRecord {
-                coverage,
-                value: RetainedRecord::new(draw, resource),
-            },
-        );
+        let mut record = PaintRecord {
+            coverage,
+            value: RetainedRecord::new(draw, resource),
+        };
+        let visibility_changed = existing
+            .is_some_and(|owned| owned.record.coverage.is_empty() != record.coverage.is_empty());
+        let previous_group = existing.and_then(|owned| owned.group);
+        let (outcome, epoch, list_dirty) =
+            if let Some(old_camera) = old_camera.filter(|old| *old != camera) {
+                let previous = &self.records[existing_slot.expect("moved paint must exist")].record;
+                self.paint
+                    .get_mut(&old_camera)
+                    .expect("owned paint camera must exist")
+                    .remove(&previous.coverage);
+                self.dirty(old_camera);
+                self.touch(old_camera);
+                let index = self.order.entry(old_camera).or_default();
+                index.order_dirty = true;
+                index.spatial = None;
+                let paint = self.paint.entry(camera).or_default();
+                if paint.list_touched() {
+                    self.touched_surfaces.push(camera);
+                }
+                let outcome = paint.upsert(None, &record);
+                let epoch = paint.latest_damage_epoch();
+                let list_dirty = outcome != crate::UpdateOutcome::Unchanged && paint.list_dirty();
+                (outcome, epoch, list_dirty)
+            } else {
+                let paint = self.paint.entry(camera).or_default();
+                if paint.list_touched() {
+                    self.touched_surfaces.push(camera);
+                }
+                let outcome = paint.upsert(existing.map(|owned| &owned.record), &record);
+                let epoch = paint.latest_damage_epoch();
+                let list_dirty = outcome != crate::UpdateOutcome::Unchanged && paint.list_dirty();
+                (outcome, epoch, list_dirty)
+            };
         if outcome != crate::UpdateOutcome::Unchanged {
-            self.dirty_surfaces.insert(camera);
-            let epoch = self.paint[&camera].latest_damage_epoch();
-            let group = self.owners[&id].group;
+            record.value.prepare();
+        }
+        let slot = if let Some(slot) = existing_slot {
+            let owned = &mut self.records[slot];
+            owned.camera = camera;
+            owned.main_entity = index_owner;
+            owned.order = new_order;
+            if old_camera != Some(camera) || old_order != Some(new_order) {
+                owned.group = None;
+            }
+            if outcome != crate::UpdateOutcome::Unchanged || old_camera != Some(camera) {
+                owned.record = record;
+            } else {
+                owned.record.value.draw.layout_translation = record.value.draw.layout_translation;
+                owned.record.value.draw.local_translation = record.value.draw.local_translation;
+            }
+            slot
+        } else {
+            self.records.insert(OwnedPaint {
+                id,
+                camera,
+                main_entity: index_owner,
+                order: new_order,
+                group: None,
+                record,
+            })
+        };
+        if old_index_owner != index_owner
+            && let Some(index_owner) = index_owner
+        {
+            self.by_main_entity
+                .entry(index_owner)
+                .or_default()
+                .push(slot);
+        }
+        if outcome != crate::UpdateOutcome::Unchanged {
+            if list_dirty {
+                self.dirty_surfaces.push(camera);
+            }
+            let group = self.records[slot].group;
             self.order
                 .entry(camera)
                 .or_default()
@@ -1293,19 +2034,13 @@ impl RetainedUiSurfaces {
             index.order_dirty = true;
             index.spatial = None;
         }
-        if id.family == PaintFamily::Border && outcome != crate::UpdateOutcome::Unchanged {
-            let index = self.order.entry(camera).or_default();
-            index.group_dirty = true;
-            index.spatial = None;
-        }
         if coverage_changed {
             let index = self.order.entry(camera).or_default();
-            if let Some(&group) = index.group_by_id.get(&id)
+            if let Some(group) = previous_group
                 && index.spatial.is_some()
                 && !index.order_dirty
-                && !index.group_dirty
             {
-                index.bounds_dirty.insert(group);
+                index.note_bounds_dirty(group);
             } else {
                 index.spatial = None;
             }
@@ -1368,18 +2103,18 @@ impl RetainedUiScene {
             .or_default()
             .acknowledge(plan.through_epoch());
         if clean {
-            surfaces.dirty_surfaces.remove(&camera);
+            surfaces.clear_dirty(camera);
         }
     }
 
     pub(crate) fn has_visible_records(&self, camera: Entity, target: PhysicalRect) -> bool {
-        self.lock().paint.get(&camera).is_some_and(|paint| {
-            paint.iter().any(|(_, record)| {
-                record
+        self.lock().records.iter().any(|(_, owned)| {
+            owned.camera == camera
+                && owned
+                    .record
                     .coverage
                     .iter()
                     .any(|coverage| coverage.intersection(target).is_some())
-            })
         })
     }
 
@@ -1387,8 +2122,8 @@ impl RetainedUiScene {
         let mut surfaces = self.lock();
         if let Some(paint) = surfaces.paint.get_mut(&camera) {
             paint.invalidate(coverage);
-            surfaces.dirty_surfaces.insert(camera);
-            surfaces.touched_surfaces.insert(camera);
+            surfaces.dirty(camera);
+            surfaces.touch(camera);
         }
     }
 
@@ -1396,12 +2131,12 @@ impl RetainedUiScene {
         let mut surfaces = self.lock();
         let paint = surfaces.paint.entry(camera).or_default();
         paint.invalidate(coverage);
-        surfaces.dirty_surfaces.insert(camera);
-        surfaces.touched_surfaces.insert(camera);
+        surfaces.dirty(camera);
+        surfaces.touch(camera);
     }
 
     pub(crate) fn dirty_surfaces(&self) -> Vec<Entity> {
-        self.lock().dirty_surfaces.iter().copied().collect()
+        self.lock().dirty_surfaces.clone()
     }
 
     pub(crate) fn discard_damage(&self, camera: Entity) {
@@ -1413,7 +2148,7 @@ impl RetainedUiScene {
             paint.acknowledge(&plan);
         }
         if !paint.has_damage() {
-            surfaces.dirty_surfaces.remove(&camera);
+            surfaces.clear_dirty(camera);
         }
     }
 
@@ -1423,7 +2158,7 @@ impl RetainedUiScene {
             let Some(source_plan) = surfaces
                 .paint
                 .get_mut(&source)
-                .and_then(RetainedPaint::repair_plan)
+                .and_then(PaintState::repair_plan)
             else {
                 continue;
             };
@@ -1432,16 +2167,12 @@ impl RetainedUiScene {
                 continue;
             }
             surfaces.propagated_epochs.insert(source, source_epoch);
-            let Some(owner) = surfaces.owners.get(&id) else {
+            let Some(owned) = surfaces.records.get(&id) else {
                 continue;
             };
-            let parent = owner.camera;
-            let group = owner.group;
-            let boundary_draw = &surfaces.paint[&parent]
-                .get(&id)
-                .expect("owned boundary paint must exist")
-                .value
-                .draw;
+            let parent = owned.camera;
+            let group = owned.group;
+            let boundary_draw = &owned.record.value.draw;
             let RetainedDrawItem::Boundary(boundary) = &boundary_draw.item else {
                 unreachable!("boundary ownership must point to a boundary draw");
             };
@@ -1489,19 +2220,103 @@ impl RetainedUiScene {
                 .entry(parent)
                 .or_default()
                 .note_direct(group, epoch);
-            surfaces.touched_surfaces.insert(parent);
-            surfaces.dirty_surfaces.insert(parent);
+            surfaces.touch(parent);
+            surfaces.dirty(parent);
         }
     }
 }
 
+pub(crate) struct PendingRetainedPaint {
+    pub(crate) id: PaintId,
+    pub(crate) camera: Entity,
+    pub(crate) draw: RetainedDraw,
+    pub(crate) resource: ResourceFingerprint,
+    pub(crate) coverage: PaintCoverage,
+    pub(crate) painted: bool,
+}
+
+#[derive(bevy::prelude::Resource)]
+pub(crate) struct PendingRetainedPaints<const SOURCE: u8> {
+    upserts: Vec<PendingRetainedPaint>,
+    removals: Vec<PaintId>,
+}
+
+impl<const SOURCE: u8> Default for PendingRetainedPaints<SOURCE> {
+    fn default() -> Self {
+        Self {
+            upserts: Vec::new(),
+            removals: Vec::new(),
+        }
+    }
+}
+
+impl<const SOURCE: u8> PendingRetainedPaints<SOURCE> {
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.upserts.reserve(additional);
+    }
+
+    pub(crate) fn upsert(&mut self, paint: PendingRetainedPaint) {
+        self.upserts.push(paint);
+    }
+
+    pub(crate) fn remove(&mut self, id: PaintId) {
+        self.removals.push(id);
+    }
+}
+
+pub(crate) type PendingGradientPaints = PendingRetainedPaints<0>;
+pub(crate) type PendingImagePaints = PendingRetainedPaints<1>;
+pub(crate) type PendingShadowPaints = PendingRetainedPaints<2>;
+pub(crate) type PendingViewportPaints = PendingRetainedPaints<3>;
+
+pub(crate) fn apply_retained_paints(
+    mut commands: Commands,
+    state: Res<RetainedUiScene>,
+    mut backgrounds: ResMut<PendingRetainedBackgrounds>,
+    mut gradients: ResMut<PendingGradientPaints>,
+    mut images: ResMut<PendingImagePaints>,
+    mut shadows: ResMut<PendingShadowPaints>,
+    mut viewports: ResMut<PendingViewportPaints>,
+) {
+    let mut surfaces = state.lock();
+    for id in backgrounds
+        .removals()
+        .chain(gradients.removals.drain(..))
+        .chain(images.removals.drain(..))
+        .chain(shadows.removals.drain(..))
+        .chain(viewports.removals.drain(..))
+    {
+        surfaces.remove(&mut commands, id);
+    }
+    for paint in backgrounds
+        .upserts()
+        .chain(gradients.upserts.drain(..))
+        .chain(images.upserts.drain(..))
+        .chain(shadows.upserts.drain(..))
+        .chain(viewports.upserts.drain(..))
+    {
+        surfaces.upsert(
+            &mut commands,
+            paint.id,
+            paint.camera,
+            paint.draw,
+            paint.resource,
+            paint.coverage,
+            paint.painted,
+        );
+    }
+}
+
 #[derive(bevy::prelude::Resource, Default)]
-pub(crate) struct RetainedRepairPlans(pub(crate) HashMap<Entity, RepairPlan>);
+pub(crate) struct RetainedRepairPlans(pub(crate) EntityHashMap<RepairPlan>);
+
+#[derive(bevy::prelude::Resource, Default)]
+pub(crate) struct RetainedFullRebuilds(pub(crate) EntityHashSet);
 
 #[derive(bevy::prelude::Resource, Default)]
 pub(crate) struct RetainedItems {
-    pub(crate) items: Mutex<HashMap<Entity, RetainedItem>>,
-    pub(crate) boundaries: Mutex<HashMap<Entity, RetainedBoundaryDraw>>,
+    pub(crate) items: Mutex<EntityHashMap<RetainedItem>>,
+    pub(crate) boundaries: Mutex<EntityHashMap<RetainedBoundaryDraw>>,
 }
 
 #[derive(Clone)]
@@ -1589,19 +2404,22 @@ pub(crate) fn cleanup_retained_ui(
         .filter(|camera| surfaces.paint.contains_key(camera))
         .collect();
     for camera in removed_cameras {
-        if let Some(paint) = surfaces.paint.remove(&camera) {
-            for (id, record) in paint.iter() {
-                if let Ok(mut entity) = commands.get_entity(record.value.render_entity) {
-                    entity.despawn();
-                }
-                let owner = surfaces
-                    .detach_owner(*id)
-                    .expect("retained paint must have an owner");
-                debug_assert_eq!(owner.camera, camera);
+        surfaces.paint.remove(&camera);
+        let ids: Vec<_> = surfaces
+            .records
+            .iter()
+            .filter_map(|(_, owned)| (owned.camera == camera).then_some(owned.id))
+            .collect();
+        for id in ids {
+            let owned = surfaces
+                .detach_record(id)
+                .expect("retained paint must have an owned record");
+            if let Ok(mut entity) = commands.get_entity(owned.record.value.render_entity) {
+                entity.despawn();
             }
         }
-        surfaces.dirty_surfaces.remove(&camera);
-        surfaces.touched_surfaces.remove(&camera);
+        surfaces.dirty_surfaces.retain(|listed| *listed != camera);
+        surfaces.touched_surfaces.retain(|listed| *listed != camera);
         surfaces.propagated_epochs.remove(&camera);
         surfaces.order.remove(&camera);
     }
@@ -1660,7 +2478,7 @@ pub(crate) fn extract_retained_placements(
                 &'static UiGlobalTransform,
                 Option<&'static CalculatedClip>,
                 Option<&'static Inherited<ComputedUiPaintTarget>>,
-                &'static ComputedNode,
+                Ref<'static, ComputedNode>,
                 Option<&'static TextScroll>,
             ),
             (With<Node>, Changed<UiGlobalTransform>),
@@ -1669,7 +2487,10 @@ pub(crate) fn extract_retained_placements(
 ) {
     let mut surfaces = state.lock();
     for (entity, transform, clip, owner, node, scroll) in &changed {
-        let clip = retained_clip(entity, node, transform, clip, owner);
+        if node.is_changed() {
+            continue;
+        }
+        let clip = retained_clip(entity, &node, transform, clip, owner);
         let transform = transform.affine();
         let clip = if scroll.is_some() {
             let content_box = node.content_box();
@@ -1686,19 +2507,12 @@ pub(crate) fn extract_retained_placements(
 }
 
 fn group_bounds(
-    paint: &RetainedPaint<PaintId, RetainedRecord>,
-    ids: &[PaintId],
+    records: &RecordArena,
+    slots: &[usize],
     positions: core::ops::Range<usize>,
 ) -> PhysicalRect {
     positions
-        .flat_map(|position| {
-            paint
-                .get(&ids[position])
-                .expect("paint group only contains retained records")
-                .coverage
-                .iter()
-                .copied()
-        })
+        .flat_map(|position| records[slots[position]].record.coverage.iter().copied())
         .reduce(enclosing_rect)
         .expect("retained paint groups have visible coverage")
 }
@@ -1713,6 +2527,16 @@ fn enclosing_rect(left: PhysicalRect, right: PhysicalRect) -> PhysicalRect {
     .unwrap()
 }
 
+fn repair_covers_target(repair: &RepairPlan, target: PhysicalRect) -> bool {
+    repair
+        .regions()
+        .iter()
+        .filter_map(|region| region.intersection(target))
+        .map(|region| region.area())
+        .sum::<u64>()
+        == target.area()
+}
+
 pub(crate) fn replay_retained_ui(
     state: Res<RetainedUiScene>,
     counters: Res<RetainedUiPaintCounters>,
@@ -1723,7 +2547,9 @@ pub(crate) fn replay_retained_ui(
     mut extracted_slices: ResMut<ExtractedUiTextureSlices>,
     mut extracted_materials: ResMut<RetainedMaterialReplays>,
     pending_materials: Res<RetainedPendingMaterials>,
+    ui_views: Query<(&ExtractedView, &UiViewTarget)>,
     mut repair_plans: ResMut<RetainedRepairPlans>,
+    mut full_rebuilds: ResMut<RetainedFullRebuilds>,
 ) {
     let mut surfaces = state.lock();
     core_runs.clear();
@@ -1742,6 +2568,7 @@ pub(crate) fn replay_retained_ui(
     extracted_materials.0.clear();
     pending_materials.clear();
     repair_plans.0.clear();
+    full_rebuilds.0.clear();
     let mut buffers = ReplayBuffers {
         slices: &mut extracted_slices,
         materials: &mut extracted_materials,
@@ -1750,14 +2577,15 @@ pub(crate) fn replay_retained_ui(
     let touched_surfaces = core::mem::take(&mut surfaces.touched_surfaces);
     for camera in touched_surfaces {
         if let Some(paint) = surfaces.paint.get_mut(&camera) {
+            paint.clear_touched_listing();
             counters.add(paint.take_counters());
         }
     }
-    let dirty_surfaces: Vec<_> = surfaces.dirty_surfaces.iter().copied().collect();
+    let dirty_surfaces = surfaces.dirty_surfaces.clone();
 
     let RetainedUiSurfaces {
         paint,
-        owners,
+        records,
         by_main_entity: _,
         surface_by_main_entity: _,
         dirty_surfaces: _,
@@ -1775,162 +2603,159 @@ pub(crate) fn replay_retained_ui(
         repair_plans.0.insert(camera, repair.clone());
         let order = order.entry(camera).or_default();
         if order.order_dirty {
-            order.ids.clear();
-            order.ids.extend(
-                paint
+            order.slots.clear();
+            order.slots.extend(
+                records
                     .iter()
-                    .filter(|(_, record)| !record.coverage.is_empty())
-                    .map(|(id, _)| *id),
-            );
-            order.ids.sort_by(|left_id, right_id| {
-                let left = paint
-                    .get(left_id)
-                    .expect("ordered retained record must exist");
-                let right = paint
-                    .get(right_id)
-                    .expect("ordered retained record must exist");
-                left.value
-                    .draw
-                    .z_order
-                    .total_cmp(&right.value.draw.z_order)
-                    .then_with(|| left_id.family.cmp(&right_id.family))
-                    .then_with(|| {
-                        left.value
-                            .draw
-                            .paint_order
-                            .cmp(&right.value.draw.paint_order)
+                    .filter(|(_, owned)| {
+                        owned.camera == camera && !owned.record.coverage.is_empty()
                     })
-                    .then_with(|| left_id.entity.cmp(&right_id.entity))
-                    .then_with(|| left_id.ordinal.cmp(&right_id.ordinal))
+                    .map(|(slot, _)| slot),
+            );
+            order.slots.sort_by(|&left_slot, &right_slot| {
+                let left_owned = &records[left_slot];
+                let right_owned = &records[right_slot];
+                let left = &left_owned.record.value.draw;
+                let right = &right_owned.record.value.draw;
+                left.z_order
+                    .total_cmp(&right.z_order)
+                    .then_with(|| left_owned.id.family.cmp(&right_owned.id.family))
+                    .then_with(|| left.paint_order.cmp(&right.paint_order))
+                    .then_with(|| left_owned.id.entity.cmp(&right_owned.id.entity))
+                    .then_with(|| left_owned.id.ordinal.cmp(&right_owned.id.ordinal))
             });
-            order.group_dirty = true;
-            order.order_dirty = false;
-        }
-        if order.group_dirty {
             order.groups.clear();
-            order.group_by_id.clear();
-            order.groups_by_entity.clear();
-            let mut start = 0;
-            while start < order.ids.len() {
-                let id = order.ids[start];
-                let mut end = start + 1;
-                if id.family == PaintFamily::Border {
-                    let record = paint.get(&id).expect("ordered retained record must exist");
-                    while let Some(next_id) = order.ids.get(end).copied()
-                        && next_id.family == PaintFamily::Border
-                        && next_id.entity == id.entity
-                        && record.value.can_merge_border(
-                            &paint
-                                .get(&next_id)
-                                .expect("ordered retained record must exist")
-                                .value,
-                        )
-                    {
-                        end += 1;
-                    }
-                }
+            for (position, &slot) in order.slots.iter().enumerate() {
                 let group = order.groups.len();
-                for &id in &order.ids[start..end] {
-                    order.group_by_id.insert(id, group);
-                    owners
-                        .get_mut(&id)
-                        .expect("ordered paint must have an owner")
-                        .group = Some(group);
-                }
-                order
-                    .groups_by_entity
-                    .entry(id.entity)
-                    .or_default()
-                    .push(group);
-                order.groups.push(start..end);
-                start = end;
+                records[slot].group = Some(group);
+                order.groups.push(position..position + 1);
             }
-            order.group_dirty = false;
             order.spatial = None;
+            order.order_dirty = false;
         }
         if order.spatial.is_none() {
             let mut entries = Vec::new();
             for (group, positions) in order.groups.iter().enumerate() {
-                entries.push((group_bounds(paint, &order.ids, positions.clone()), group));
+                entries.push((
+                    group_bounds(records, &order.slots, positions.clone()),
+                    group,
+                ));
             }
             order.spatial = Some(SpatialIndex::new(entries));
+            order.spatial_revision = order
+                .spatial_revision
+                .checked_add(1)
+                .expect("retained UI spatial revision overflowed");
             order.candidate_marks.resize(order.groups.len(), 0);
             order.direct_groups.clear();
             order.direct_epochs.clear();
-            order.direct_epochs.resize(order.groups.len(), None);
+            order.direct_epochs.resize(order.groups.len(), [0, 0]);
             order.bounds_dirty.clear();
+            order.bounds_dirty_marks.clear();
+            order.bounds_dirty_marks.resize(order.groups.len(), false);
         }
+        let all_groups_changed = order.direct_groups.len() == order.groups.len();
+        if !all_groups_changed && !order.bounds_dirty.is_empty() {
+            order.bounds_updates.clear();
+            for group in order.bounds_dirty.drain(..) {
+                order.bounds_dirty_marks[group] = false;
+                order.bounds_updates.push((
+                    group,
+                    group_bounds(records, &order.slots, order.groups[group].clone()),
+                ));
+            }
+            order
+                .spatial
+                .as_mut()
+                .expect("retained spatial index was just built")
+                .update_many(order.bounds_updates.drain(..));
+            order.spatial_revision = order
+                .spatial_revision
+                .checked_add(1)
+                .expect("retained UI spatial revision overflowed");
+        }
+        let candidates_cached = order.cached_candidate_revision == order.spatial_revision
+            && order.cached_direct_groups == order.direct_groups
+            && order
+                .cached_candidate_repair
+                .as_ref()
+                .is_some_and(|cached| cached.shares_regions_with(&repair));
+        if !candidates_cached {
+            order.candidates.clear();
+            if all_groups_changed {
+                order.candidates.extend(0..order.groups.len());
+            } else {
+                order.candidate_generation = order.candidate_generation.wrapping_add(1);
+                if order.candidate_generation == 0 {
+                    order.candidate_marks.fill(0);
+                    order.candidate_generation = 1;
+                }
+                let generation = order.candidate_generation;
+                for &direct_group in &order.direct_groups {
+                    if order.direct_epochs[direct_group][0] <= repair.through_epoch()
+                        && order.candidate_marks[direct_group] != generation
+                    {
+                        order.candidate_marks[direct_group] = generation;
+                        order.candidates.push(direct_group);
+                    }
+                }
+                if order.candidates.len() != order.groups.len() {
+                    let spatial = order
+                        .spatial
+                        .as_ref()
+                        .expect("retained spatial index was just built");
+                    let mut mark = |position| {
+                        if order.candidate_marks[position] != generation {
+                            order.candidate_marks[position] = generation;
+                            order.candidates.push(position);
+                        }
+                    };
+                    if repair.regions().len() < spatial.len() {
+                        for &region in repair.regions() {
+                            spatial.query(region, &mut mark);
+                        }
+                    } else {
+                        spatial.query_intersecting(repair.spatial(), &mut mark);
+                    }
+                }
+                if order.candidates.len() == order.groups.len() {
+                    order.candidates.clear();
+                    order.candidates.extend(0..order.groups.len());
+                } else {
+                    order.candidates.sort_unstable();
+                }
+            }
+            order.cached_candidate_revision = order.spatial_revision;
+            order.cached_candidate_repair = Some(repair.clone());
+            order.cached_direct_groups.clone_from(&order.direct_groups);
+        }
+        counters.add_staged(order.candidates.len());
         order.candidate_generation = order.candidate_generation.wrapping_add(1);
         if order.candidate_generation == 0 {
             order.candidate_marks.fill(0);
             order.candidate_generation = 1;
         }
-        let generation = order.candidate_generation;
-        order.candidates.clear();
-        for &direct_group in &order.direct_groups {
-            if order.direct_epochs[direct_group]
-                .is_some_and(|[earliest, _]| earliest <= repair.through_epoch())
-            {
-                let entity = order.ids[order.groups[direct_group].start].entity;
-                for &group in &order.groups_by_entity[&entity] {
-                    if order.candidate_marks[group] != generation {
-                        order.candidate_marks[group] = generation;
-                        order.candidates.push(group);
-                    }
-                }
-            }
+        let replay_generation = order.candidate_generation;
+        for &group in &order.candidates {
+            order.candidate_marks[group] = replay_generation;
         }
-        if order.candidates.len() != order.groups.len() {
-            let updates: Vec<_> = order
-                .bounds_dirty
-                .drain()
-                .map(|group| {
-                    (
-                        group,
-                        group_bounds(paint, &order.ids, order.groups[group].clone()),
-                    )
-                })
-                .collect();
-            order
-                .spatial
-                .as_mut()
-                .expect("retained spatial index was just built")
-                .update_many(updates);
-            let spatial = order
-                .spatial
-                .as_ref()
-                .expect("retained spatial index was just built");
-            let mut mark = |position| {
-                if order.candidate_marks[position] != generation {
-                    order.candidate_marks[position] = generation;
-                    order.candidates.push(position);
-                }
-            };
-            if repair.regions().len() < spatial.len() {
-                for &region in repair.regions() {
-                    spatial.query(region, &mut mark);
-                }
-            } else {
-                spatial.query_intersecting(repair.spatial(), &mut mark);
-            }
-        }
-        if order.candidates.len() == order.groups.len() {
-            order.candidates.clear();
-            order.candidates.extend(0..order.groups.len());
-        } else {
-            order.candidates.sort_unstable();
-        }
-        counters.add_staged(order.candidates.len());
         let mut core_run = None;
         let mut gradient_run = None;
         let mut shadow_run = None;
-        for &group in &order.candidates {
+        let mut contains_boundary = false;
+        let mut candidate_index = 0;
+        while let Some(&group) = order.candidates.get(candidate_index) {
+            candidate_index += 1;
+            if order.candidate_marks[group] != replay_generation {
+                continue;
+            }
+            order.candidate_marks[group] = 0;
             let positions = order.groups[group].clone();
-            let id = order.ids[positions.start];
-            let record = paint
-                .get(&id)
-                .expect("spatial index only contains retained records");
+            let slot = order.slots[positions.start];
+            let id = records[slot].id;
+            let record = &records[slot].record;
             if let RetainedDrawItem::Boundary(boundary) = &record.value.draw.item {
+                contains_boundary = true;
                 core_run = None;
                 gradient_run = None;
                 shadow_run = None;
@@ -1948,9 +2773,8 @@ pub(crate) fn replay_retained_ui(
                     },
                 );
                 let coverage = PaintCoverage::from_regions(positions.flat_map(|position| {
-                    paint
-                        .get(&order.ids[position])
-                        .expect("paint group only contains retained records")
+                    records[order.slots[position]]
+                        .record
                         .coverage
                         .iter()
                         .copied()
@@ -1964,53 +2788,68 @@ pub(crate) fn replay_retained_ui(
                 );
                 continue;
             }
-            let border_flags = (id.family == PaintFamily::Border).then(|| {
-                positions
-                    .clone()
-                    .filter_map(|position| {
-                        paint
-                            .get(&order.ids[position])
-                            .and_then(|record| record.value.border_parts())
-                            .map(|(_, flags)| flags)
-                    })
-                    .fold(0, |combined, flags| combined | flags)
-            });
             if let RetainedDrawItem::BoxShadow(item) = &record.value.draw.item {
                 core_run = None;
                 gradient_run = None;
-                shadow_runs.push(&mut shadow_run, &record.value.draw, item);
+                let (samples, instance) = record
+                    .value
+                    .shadow_source()
+                    .expect("retained shadows are prepared when their record changes");
+                debug_assert_eq!(samples, item.samples());
+                shadow_runs.push(&mut shadow_run, &record.value.draw, samples, instance);
                 continue;
             }
             shadow_run = None;
             if let RetainedDrawItem::Gradient(item) = &record.value.draw.item {
                 core_run = None;
-                gradient_runs.push(&mut gradient_run, &record.value.draw, item);
+                let (color_space, instances) = record
+                    .value
+                    .gradient_source()
+                    .expect("retained gradients are prepared when their record changes");
+                debug_assert_eq!(color_space, item.color_space());
+                gradient_runs.push(
+                    &mut gradient_run,
+                    &record.value.draw,
+                    color_space,
+                    instances,
+                );
                 continue;
             }
             gradient_run = None;
             if matches!(
                 record.value.draw.item,
-                RetainedDrawItem::Node(_) | RetainedDrawItem::Glyphs(_)
+                RetainedDrawItem::Border(_)
+                    | RetainedDrawItem::Node(_)
+                    | RetainedDrawItem::Glyphs(_)
             ) {
                 push_core_replayed(
                     &mut core_runs,
                     &mut core_run,
                     record.value.core_source(id),
-                    border_flags,
+                    None,
                     &record.value.draw,
                 );
                 continue;
             }
             core_run = None;
             let coverage = PaintCoverage::from_regions(positions.flat_map(|position| {
-                paint
-                    .get(&order.ids[position])
-                    .expect("paint group only contains retained records")
+                records[order.slots[position]]
+                    .record
                     .coverage
                     .iter()
                     .copied()
             }));
             push_replayed(&mut buffers, &mut items, &record.value.draw, coverage);
+        }
+        let target = ui_views.iter().find_map(|(view, target)| {
+            (target.0 == camera).then(|| {
+                PhysicalRect::from_min_max(0, 0, view.viewport.z as i32, view.viewport.w as i32)
+                    .expect("UI views have nonzero physical viewports")
+            })
+        });
+        if !contains_boundary && target.is_some_and(|target| repair_covers_target(&repair, target))
+        {
+            full_rebuilds.0.insert(camera);
         }
     }
 }
@@ -2047,12 +2886,13 @@ struct ReplayBuffers<'a> {
 
 fn push_replayed(
     buffers: &mut ReplayBuffers,
-    items: &mut HashMap<Entity, RetainedItem>,
+    items: &mut EntityHashMap<RetainedItem>,
     draw: &RetainedDraw,
     coverage: PaintCoverage,
 ) {
     match &draw.item {
         RetainedDrawItem::Boundary(_) => unreachable!("boundaries use retained composition runs"),
+        RetainedDrawItem::Border(_) => unreachable!("borders use persistent preparation"),
         RetainedDrawItem::BoxShadow(_) => unreachable!("box shadows use retained instancing"),
         RetainedDrawItem::Gradient(_) => unreachable!("gradients use retained instancing"),
         RetainedDrawItem::Material(item) => {
@@ -2112,7 +2952,7 @@ mod tests {
     #[test]
     fn direct_damage_keeps_later_work_in_fixed_size_epoch_intervals() {
         let mut order = PaintOrder {
-            direct_epochs: vec![None],
+            direct_epochs: vec![[0, 0]],
             ..Default::default()
         };
 
@@ -2120,14 +2960,26 @@ mod tests {
         order.note_direct(Some(0), 4);
         order.note_direct(Some(0), 5);
         assert_eq!(order.direct_groups, [0]);
-        assert_eq!(order.direct_epochs, [Some([2, 5])]);
+        assert_eq!(order.direct_epochs, [[2, 5]]);
 
         order.acknowledge(4);
         assert_eq!(order.direct_groups, [0]);
-        assert_eq!(order.direct_epochs, [Some([5, 5])]);
+        assert_eq!(order.direct_epochs, [[5, 5]]);
 
         order.acknowledge(5);
         assert!(order.direct_groups.is_empty());
-        assert_eq!(order.direct_epochs, [None]);
+        assert_eq!(order.direct_epochs, [[5, 5]]);
+    }
+
+    #[test]
+    fn full_rebuild_requires_exact_target_coverage() {
+        let target = PhysicalRect::from_min_max(0, 0, 10, 10).unwrap();
+        let mut damage = crate::DamageJournal::default();
+        damage.record(PhysicalRect::from_min_max(0, 0, 4, 10).unwrap());
+        damage.record(PhysicalRect::from_min_max(6, 0, 10, 10).unwrap());
+        assert!(!repair_covers_target(&damage.plan().unwrap(), target));
+
+        damage.record(PhysicalRect::from_min_max(4, -5, 6, 15).unwrap());
+        assert!(repair_covers_target(&damage.plan().unwrap(), target));
     }
 }

@@ -153,7 +153,7 @@ pub fn ui_layout_system(
     #[cfg(feature = "ghost_nodes")] ghost_node_query: Query<(), With<GhostNode>>,
     mut dirty_scopes: Local<EntityHashSet>,
     mut dirty_outer_roots: Local<EntityHashSet>,
-    mut dirty_nodes: Local<EntityHashSet>,
+    mut dirty_nodes: Local<Vec<Entity>>,
     mut removed_containment_scratch: Local<EntityHashSet>,
     mut scope_roots: Local<Vec<Entity>>,
 ) {
@@ -164,11 +164,20 @@ pub fn ui_layout_system(
     removed_containment_scratch.clear();
     scope_roots.clear();
     removed_containment_scratch.extend(changes.removed_containment.read());
-    dirty_nodes.extend(node_queries.p0().iter());
-    dirty_nodes.extend(removed_containment_scratch.iter().copied());
+    {
+        let changed = node_queries.p0();
+        dirty_nodes.extend(changed.iter());
+        dirty_nodes.extend(
+            removed_containment_scratch
+                .iter()
+                .copied()
+                .filter(|entity| !changed.contains(*entity)),
+        );
+    }
 
     let mut node_query = node_queries.p1();
-    for entity in dirty_nodes.iter().copied() {
+    let mut previous_scope = None;
+    for entity in dirty_nodes.drain(..) {
         let Ok((_, node, mut content_size, computed_target, contained)) =
             node_query.get_mut(entity)
         else {
@@ -191,14 +200,14 @@ pub fn ui_layout_system(
             contained,
         );
         if target_changed || context_removed || layout_changed {
-            mark_layout_scope(
-                entity,
-                false,
-                &ui_children,
-                &changes.containment,
-                &mut dirty_scopes,
-                &mut dirty_outer_roots,
-            );
+            let scope = layout_scope(entity, false, &ui_children, &changes.containment);
+            if previous_scope != Some(scope) {
+                dirty_scopes.insert(scope.0);
+                if scope.1 {
+                    dirty_outer_roots.insert(scope.0);
+                }
+                previous_scope = Some(scope);
+            }
         }
     }
 

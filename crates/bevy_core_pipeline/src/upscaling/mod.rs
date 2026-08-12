@@ -1,11 +1,12 @@
 use crate::blit::{BlitPipeline, BlitPipelineKey};
 use bevy_app::prelude::*;
 use bevy_camera::CameraOutputMode;
-use bevy_ecs::prelude::*;
+use bevy_ecs::{entity::EntityHashMap, prelude::*};
 use bevy_render::{
     camera::ExtractedCamera, render_resource::*, view::ViewTarget, Render, RenderApp,
     RenderStartup, RenderSystems,
 };
+use std::sync::{Mutex, PoisonError};
 
 mod node;
 
@@ -28,12 +29,49 @@ impl Plugin for UpscalingPlugin {
                     .ambiguous_with_all(),
             );
             render_app.add_systems(RenderStartup, clear_view_upscaling_pipelines);
+            render_app.init_resource::<ViewOutputOverlays>();
         }
     }
 }
 
 #[derive(Component)]
-pub struct ViewUpscalingPipeline(CachedRenderPipelineId, BlitPipelineKey);
+pub struct ViewUpscalingPipeline {
+    plain: CachedRenderPipelineId,
+    overlay: Option<CachedRenderPipelineId>,
+    key: BlitPipelineKey,
+}
+
+/// Optional premultiplied-alpha layers folded into the existing final blit.
+#[derive(Resource, Default)]
+pub struct ViewOutputOverlays {
+    enabled: bool,
+    views: Mutex<EntityHashMap<TextureView>>,
+}
+
+impl ViewOutputOverlays {
+    /// Enables preparation of the overlay pipeline. Call once during renderer setup.
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    /// Selects the layer to composite for one view's current frame.
+    pub fn set(&self, view: Entity, overlay: Option<TextureView>) {
+        let mut views = self.views.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(overlay) = overlay {
+            views.insert(view, overlay);
+        } else {
+            views.remove(&view);
+        }
+    }
+
+    fn get(&self, view: Entity) -> Option<TextureView> {
+        self.views
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&view)
+            .cloned()
+    }
+}
 
 /// This is not required on first startup but is required during render recovery
 fn clear_view_upscaling_pipelines(
@@ -50,6 +88,7 @@ fn prepare_view_upscaling_pipelines(
     mut pipeline_cache: ResMut<PipelineCache>,
     mut pipelines: ResMut<SpecializedRenderPipelines<BlitPipeline>>,
     blit_pipeline: Res<BlitPipeline>,
+    overlays: Res<ViewOutputOverlays>,
     view_targets: Query<(
         Entity,
         &ViewTarget,
@@ -90,19 +129,35 @@ fn prepare_view_upscaling_pipelines(
             target_format,
             blend_state,
             samples: 1,
+            premultiplied_overlay: false,
             source_space: view_target.compositing_space,
         };
 
-        if maybe_pipeline.is_none_or(|ViewUpscalingPipeline(_, cached_key)| *cached_key != key) {
-            let pipeline = pipelines.specialize(&pipeline_cache, &blit_pipeline, key);
+        if maybe_pipeline.is_none_or(|pipeline| pipeline.key != key) {
+            let plain = pipelines.specialize(&pipeline_cache, &blit_pipeline, key);
+            let overlay = overlays.enabled.then(|| {
+                pipelines.specialize(
+                    &pipeline_cache,
+                    &blit_pipeline,
+                    BlitPipelineKey {
+                        premultiplied_overlay: true,
+                        ..key
+                    },
+                )
+            });
 
             // Ensure the pipeline is loaded before continuing the frame to prevent frames without
             // any GPU work submitted
-            pipeline_cache.block_on_render_pipeline(pipeline);
+            pipeline_cache.block_on_render_pipeline(plain);
+            if let Some(overlay) = overlay {
+                pipeline_cache.block_on_render_pipeline(overlay);
+            }
 
-            commands
-                .entity(entity)
-                .insert(ViewUpscalingPipeline(pipeline, key));
+            commands.entity(entity).insert(ViewUpscalingPipeline {
+                plain,
+                overlay,
+                key,
+            });
         }
     }
 }

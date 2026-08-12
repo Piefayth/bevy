@@ -1,6 +1,8 @@
 //! Persistent preparation and instanced drawing for ordinary UI nodes.
 
-use crate::scene::{PaintId, RetainedDraw, RetainedDrawItem, RetainedUiScene};
+use crate::scene::{
+    PaintId, RetainedDraw, RetainedDrawItem, RetainedFullRebuilds, RetainedUiScene,
+};
 use bevy::{
     app::SubApp,
     asset::{load_embedded_asset, AssetEvent, AssetId, AssetServer, Handle},
@@ -36,7 +38,6 @@ use bevy::{
     sprite_render::SpriteAssetEvents,
     ui_render::{
         init_ui_pipeline, shader_flags, TransparentUi, UiAntiAlias, UiCameraView, UiPipeline,
-        UiPipelineKey,
     },
 };
 use bytemuck::{Pod, Zeroable};
@@ -173,6 +174,25 @@ impl GpuUiInstance {
     pub(crate) fn set_color(&mut self, color: bevy::color::LinearRgba) {
         self.color = color.to_f32_array();
     }
+
+    pub(crate) fn set_placement(
+        &mut self,
+        transform: bevy::math::Affine2,
+        clip: Option<bevy::math::Rect>,
+        translation: bevy::math::Vec2,
+    ) {
+        let columns = transform.to_cols_array();
+        self.transform = [columns[0], columns[1], columns[2], columns[3]];
+        self.translation = transform.transform_point2(translation).to_array();
+        let clip_rect = clip.unwrap_or_default();
+        self.clip = [
+            clip_rect.min.x,
+            clip_rect.min.y,
+            clip_rect.max.x,
+            clip_rect.max.y,
+        ];
+        self.metadata[1] = (self.metadata[1] & !1) | u32::from(clip.is_some());
+    }
 }
 
 struct CoreBatch {
@@ -187,6 +207,7 @@ pub(crate) struct RetainedCore {
     batches: HashMap<Entity, CoreBatch>,
     image_bind_groups: HashMap<AssetId<Image>, BindGroup>,
     view_bind_group: Option<BindGroup>,
+    prepared_work: HashMap<Entity, (u64, u64)>,
 }
 
 impl Default for RetainedCore {
@@ -196,6 +217,7 @@ impl Default for RetainedCore {
             batches: HashMap::default(),
             image_bind_groups: HashMap::default(),
             view_bind_group: None,
+            prepared_work: HashMap::default(),
         }
     }
 }
@@ -205,8 +227,28 @@ impl RetainedCore {
         self.batches.get(&entity).map(|batch| batch.range.clone())
     }
 
-    pub(crate) fn item_count(&self, entity: Entity) -> Option<u32> {
-        self.batches.get(&entity).map(|batch| batch.items)
+    pub(crate) fn counts(&self, entity: Entity) -> Option<(u32, usize)> {
+        self.batches
+            .get(&entity)
+            .map(|batch| (batch.items, batch.range.len()))
+    }
+
+    pub(crate) fn prepared_work(&self, camera: Entity) -> (u64, u64) {
+        self.prepared_work.get(&camera).copied().unwrap_or_default()
+    }
+
+    pub(crate) fn image(&self, entity: Entity) -> Option<AssetId<Image>> {
+        self.batches.get(&entity).map(|batch| batch.image)
+    }
+
+    pub(crate) fn direct_ready(&self, entity: Entity) -> bool {
+        let Some(batch) = self.batches.get(&entity) else {
+            return false;
+        };
+        !batch.range.is_empty()
+            && self.instances.buffer().is_some()
+            && self.view_bind_group.is_some()
+            && self.image_bind_groups.contains_key(&batch.image)
     }
 }
 
@@ -219,7 +261,7 @@ pub(crate) struct RetainedCorePipeline {
 }
 
 impl SpecializedRenderPipeline for RetainedCorePipeline {
-    type Key = UiPipelineKey;
+    type Key = RetainedCorePipelineKey;
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let instance_layout = VertexBufferLayout::from_vertex_formats(
@@ -236,11 +278,14 @@ impl SpecializedRenderPipeline for RetainedCorePipeline {
                 VertexFormat::Uint32x2,
             ],
         );
-        let shader_defs: Vec<_> = key
+        let mut shader_defs: Vec<_> = key
             .anti_alias
             .then(|| "ANTI_ALIAS".into())
             .into_iter()
             .collect();
+        if key.full_rebuild {
+            shader_defs.push("FULL_REBUILD".into());
+        }
         RenderPipelineDescriptor {
             vertex: VertexState {
                 shader: self.shader.clone(),
@@ -258,15 +303,26 @@ impl SpecializedRenderPipeline for RetainedCorePipeline {
                 })],
                 ..Default::default()
             }),
-            layout: vec![
-                self.view_layout.clone(),
-                self.mask_layout.clone(),
-                self.image_layout.clone(),
-            ],
+            layout: if key.full_rebuild {
+                vec![self.view_layout.clone(), self.image_layout.clone()]
+            } else {
+                vec![
+                    self.view_layout.clone(),
+                    self.mask_layout.clone(),
+                    self.image_layout.clone(),
+                ]
+            },
             label: Some("retained_ui_core_pipeline".into()),
             ..Default::default()
         }
     }
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub(crate) struct RetainedCorePipelineKey {
+    target_format: bevy::render::render_resource::TextureFormat,
+    anti_alias: bool,
+    full_rebuild: bool,
 }
 
 pub(crate) fn init_retained_core_pipeline(
@@ -294,8 +350,11 @@ pub(crate) fn queue_retained_core(
     camera_views: bevy::ecs::system::Query<&ExtractedView>,
     pipeline_cache: Res<PipelineCache>,
     draw_functions: Res<DrawFunctions<TransparentUi>>,
+    full_rebuilds: Res<RetainedFullRebuilds>,
 ) {
-    let draw_function = draw_functions.read().id::<DrawRetainedCore>();
+    let draw_functions = draw_functions.read();
+    let masked_draw = draw_functions.id::<DrawRetainedCore>();
+    let rebuild_draw = draw_functions.id::<DrawRetainedCoreRebuild>();
     for (index, run) in runs.runs.iter().enumerate() {
         let Ok((default_camera_view, anti_alias)) = render_views.get(run.camera) else {
             continue;
@@ -306,16 +365,22 @@ pub(crate) fn queue_retained_core(
         let Some(phase) = phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
+        let full_rebuild = full_rebuilds.0.contains(&run.camera);
         let pipeline = pipelines.specialize(
             &pipeline_cache,
             &pipeline,
-            UiPipelineKey {
+            RetainedCorePipelineKey {
                 target_format: view.target_format,
                 anti_alias: matches!(anti_alias, None | Some(UiAntiAlias::On)),
+                full_rebuild,
             },
         );
         phase.add_transient(TransparentUi {
-            draw_function,
+            draw_function: if full_rebuild {
+                rebuild_draw
+            } else {
+                masked_draw
+            },
             pipeline,
             entity: (run.render_entity, run.main_entity),
             sort_key: FloatOrd(run.z_order),
@@ -346,6 +411,7 @@ pub(crate) fn prepare_retained_core(
     }
 
     core.batches.clear();
+    core.prepared_work.clear();
     if runs.has_deferred {
         core.instances.clear();
         let surfaces = state.lock();
@@ -370,6 +436,9 @@ pub(crate) fn prepare_retained_core(
             let end = u32::try_from(core.instances.len())
                 .expect("retained UI instance count exceeds u32");
             if start != end {
+                let work = core.prepared_work.entry(run.camera).or_default();
+                work.0 += u64::from(run.items);
+                work.1 += u64::from(end - start);
                 core.batches.insert(
                     run.render_entity,
                     CoreBatch {
@@ -388,6 +457,9 @@ pub(crate) fn prepare_retained_core(
                 u32::try_from(run.instances.start).expect("retained UI instance count exceeds u32");
             let end =
                 u32::try_from(run.instances.end).expect("retained UI instance count exceeds u32");
+            let work = core.prepared_work.entry(run.camera).or_default();
+            work.0 += u64::from(run.items);
+            work.1 += u64::from(end - start);
             core.batches.insert(
                 run.render_entity,
                 CoreBatch {
@@ -425,7 +497,7 @@ pub(crate) fn prepare_retained_core(
 }
 
 pub(crate) fn prepare_persistent_instance(draw: &RetainedDraw) -> Option<GpuUiInstance> {
-    let RetainedDrawItem::Node(node) = draw.item else {
+    let RetainedDrawItem::Node(node) = &draw.item else {
         return None;
     };
     let atlas_extent = if draw.image == AssetId::default() {
@@ -436,7 +508,7 @@ pub(crate) fn prepare_persistent_instance(draw: &RetainedDraw) -> Option<GpuUiIn
             .map(|scaling| image_extent * scaling)
             .unwrap_or(node.rect.max)
     };
-    Some(prepare_node_instance(draw, atlas_extent))
+    Some(prepare_node_instance(draw, node, atlas_extent))
 }
 
 fn prepare_instance(
@@ -451,7 +523,7 @@ fn prepare_instance(
         .atlas_scaling
         .map(|scaling| image.size_2d().as_vec2() * scaling)
         .unwrap_or(node.rect.max);
-    Some(prepare_node_instance(draw, atlas_extent))
+    Some(prepare_node_instance(draw, &node, atlas_extent))
 }
 
 fn prepare_instances(
@@ -461,6 +533,11 @@ fn prepare_instances(
     instances: &mut RawBufferVec<GpuUiInstance>,
 ) {
     match &draw.item {
+        RetainedDrawItem::Border(border) => {
+            for node in border.grouped_nodes().into_iter().flatten() {
+                instances.push(prepare_node_instance(draw, &node, bevy::math::Vec2::ONE));
+            }
+        }
         RetainedDrawItem::Node(_) => {
             if let Some(mut instance) = prepare_instance(draw, gpu_images) {
                 if let Some(flags) = border_flags {
@@ -481,7 +558,7 @@ fn prepare_instances(
                 ));
             }
         }
-        _ => unreachable!("persistent core runs contain only nodes and glyphs"),
+        _ => unreachable!("persistent core runs contain only borders, nodes, and glyphs"),
     }
 }
 
@@ -517,10 +594,11 @@ pub(crate) fn prepare_glyph_instance(
     }
 }
 
-fn prepare_node_instance(draw: &RetainedDraw, atlas_extent: bevy::math::Vec2) -> GpuUiInstance {
-    let RetainedDrawItem::Node(node) = draw.item else {
-        unreachable!("persistent core preparation only accepts ordinary nodes")
-    };
+pub(crate) fn prepare_node_instance(
+    draw: &RetainedDraw,
+    node: &crate::scene::RetainedNodeItem,
+    atlas_extent: bevy::math::Vec2,
+) -> GpuUiInstance {
     let textured = draw.image != AssetId::default();
     let mut uv_min = node.rect.min / atlas_extent;
     let mut uv_max = node.rect.max / atlas_extent;
@@ -568,6 +646,13 @@ pub(crate) type DrawRetainedCore = (
     SetItemPipeline,
     SetRetainedCoreViewBindGroup<0>,
     SetRetainedCoreImageBindGroup<2>,
+    DrawRetainedCoreInstances,
+);
+
+pub(crate) type DrawRetainedCoreRebuild = (
+    SetItemPipeline,
+    SetRetainedCoreViewBindGroup<0>,
+    SetRetainedCoreImageBindGroup<1>,
     DrawRetainedCoreInstances,
 );
 
@@ -651,6 +736,7 @@ pub(crate) fn register_retained_core(app: &mut SubApp) {
         .init_resource::<RetainedCoreRuns>()
         .init_gpu_resource::<SpecializedRenderPipelines<RetainedCorePipeline>>()
         .add_render_command::<TransparentUi, DrawRetainedCore>()
+        .add_render_command::<TransparentUi, DrawRetainedCoreRebuild>()
         .add_systems(
             bevy::render::RenderStartup,
             init_retained_core_pipeline.after(init_ui_pipeline),

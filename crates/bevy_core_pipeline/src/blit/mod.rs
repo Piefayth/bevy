@@ -35,6 +35,7 @@ impl Plugin for BlitPlugin {
 #[derive(Resource)]
 pub struct BlitPipeline {
     pub layout: BindGroupLayoutDescriptor,
+    pub overlay_layout: BindGroupLayoutDescriptor,
     pub sampler: Sampler,
     pub fullscreen_shader: FullscreenShader,
     pub fragment_shader: Handle<Shader>,
@@ -56,11 +57,23 @@ pub fn init_blit_pipeline(
             ),
         ),
     );
+    let overlay_layout = BindGroupLayoutDescriptor::new(
+        "blit_overlay_bind_group_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                sampler(SamplerBindingType::NonFiltering),
+            ),
+        ),
+    );
 
     let sampler = render_device.create_sampler(&SamplerDescriptor::default());
 
     commands.insert_resource(BlitPipeline {
         layout,
+        overlay_layout,
         sampler,
         fullscreen_shader: fullscreen_shader.clone(),
         fragment_shader: load_embedded_asset!(asset_server.as_ref(), "blit.wgsl"),
@@ -80,6 +93,20 @@ impl BlitPipeline {
             &BindGroupEntries::sequential((src_texture, &self.sampler)),
         )
     }
+
+    pub fn create_overlay_bind_group(
+        &self,
+        render_device: &RenderDevice,
+        src_texture: &TextureView,
+        overlay_texture: &TextureView,
+        pipeline_cache: &PipelineCache,
+    ) -> BindGroup {
+        render_device.create_bind_group(
+            None,
+            &pipeline_cache.get_bind_group_layout(&self.overlay_layout),
+            &BindGroupEntries::sequential((src_texture, overlay_texture, &self.sampler)),
+        )
+    }
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
@@ -87,6 +114,8 @@ pub struct BlitPipelineKey {
     pub target_format: TextureFormat,
     pub blend_state: Option<BlendState>,
     pub samples: u32,
+    /// Composite a premultiplied-alpha texture over the source in the same final sample.
+    pub premultiplied_overlay: bool,
     /// Color space of the source texture. When `Some(Srgb)` or `Some(Oklab)`, the blit converts
     /// to linear RGB before writing to the output target.
     pub source_space: Option<CompositingSpace>,
@@ -102,10 +131,17 @@ impl SpecializedRenderPipeline for BlitPipeline {
             Some(CompositingSpace::Oklab) => shader_defs.push("OKLAB_TO_LINEAR".into()),
             Some(CompositingSpace::Linear) | None => {}
         }
+        if key.premultiplied_overlay {
+            shader_defs.push("PREMULTIPLIED_OVERLAY".into());
+        }
 
         RenderPipelineDescriptor {
             label: Some("blit pipeline".into()),
-            layout: vec![self.layout.clone()],
+            layout: vec![if key.premultiplied_overlay {
+                self.overlay_layout.clone()
+            } else {
+                self.layout.clone()
+            }],
             vertex: self.fullscreen_shader.to_vertex_state(),
             fragment: Some(FragmentState {
                 shader: self.fragment_shader.clone(),

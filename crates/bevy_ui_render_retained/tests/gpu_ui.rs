@@ -1313,7 +1313,11 @@ fn assert_layout_motion(output: RenderOutput) {
     assert_eq!(after.items_replayed, before.items_replayed + 2);
     let paint_before = output.paint_before_mutation.unwrap();
     let paint_after = output.paint_after_mutation.unwrap();
-    assert_eq!(paint_after.records_staged, paint_before.records_staged + 2);
+    assert_eq!(paint_after.candidates, paint_before.candidates + 1);
+    assert_eq!(
+        paint_after.records_changed,
+        paint_before.records_changed + 1
+    );
 
     let old_center = ((13 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
     let new_center = ((13 * WIDTH + 35) as usize) * BYTES_PER_PIXEL;
@@ -3237,6 +3241,38 @@ fn quiet_text_pixels_match_stock_without_another_repair() {
 }
 
 #[test]
+fn text_width_change_that_preserves_glyph_pixels_does_no_render_work() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35)),
+            |world, text| {
+                world.entity_mut(text).get_mut::<Node>().unwrap().width = px(57);
+            },
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_text_leaf(world, camera, Color::srgb_u8(220, 90, 35)),
+            |world, text| {
+                world.entity_mut(text).get_mut::<Node>().unwrap().width = px(57);
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        assert_eq!(
+            retained.after_mutation.unwrap().repairs,
+            retained.before_mutation.unwrap().repairs
+        );
+        assert_eq!(
+            retained.paint_after_mutation,
+            retained.paint_before_mutation
+        );
+    });
+}
+
+#[test]
 fn quiet_text_shadow_matches_stock_without_main_glyph_paint() {
     with_gpu_lock(|| {
         let shadow = TextShadow {
@@ -3723,7 +3759,7 @@ fn one_border_edge_change_repairs_only_its_antialiased_corner_reach() {
         let after = retained.after_mutation.unwrap();
         assert_eq!(after.repairs, before.repairs + 1);
         assert_eq!(after.repair_pixels, before.repair_pixels + 140);
-        assert_eq!(after.items_replayed, before.items_replayed + 3);
+        assert_eq!(after.items_replayed, before.items_replayed + 2);
         assert_eq!(after.quads_replayed, before.quads_replayed + 3);
     });
 }
@@ -4515,9 +4551,6 @@ fn fully_damaged_nodes_report_each_logical_item_and_quad() {
         assert_eq!(after.repair_pixels, before.repair_pixels + 200);
         assert_eq!(after.items_replayed, before.items_replayed + 2);
         assert_eq!(after.quads_replayed, before.quads_replayed + 2);
-        let paint_before = retained.paint_before_mutation.unwrap();
-        let paint_after = retained.paint_after_mutation.unwrap();
-        assert_eq!(paint_after.records_staged, paint_before.records_staged + 2);
     });
 }
 
@@ -4741,8 +4774,8 @@ fn one_placement_transaction_moves_every_paint_family_without_reextracting_style
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.paint_before_mutation.unwrap();
         let after = retained.paint_after_mutation.unwrap();
-        assert_eq!(after.candidates, before.candidates + 7);
-        assert_eq!(after.records_changed, before.records_changed + 7);
+        assert_eq!(after.candidates, before.candidates + 4);
+        assert_eq!(after.records_changed, before.records_changed + 4);
     });
 }
 
@@ -4913,6 +4946,61 @@ fn spawn_clip_scene(world: &mut World, camera: Entity, clipped: bool) -> Entity 
         ChildOf(clip_parent),
     ));
     clip_parent
+}
+
+fn spawn_clipped_effects(world: &mut World, camera: Entity) -> Entity {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let clip_parent = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(8),
+                top: px(8),
+                width: px(10),
+                height: px(10),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            ChildOf(root),
+        ))
+        .id();
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: px(20),
+                height: px(10),
+                ..default()
+            },
+            linear_gradient(
+                Color::srgb_u8(220, 45, 28),
+                Color::srgb_u8(30, 190, 90),
+                Color::srgb_u8(35, 80, 220),
+            ),
+            BoxShadow::new(Color::BLACK, px(4), px(0), px(2), px(0)),
+            ChildOf(clip_parent),
+        ))
+        .id()
+}
+
+#[test]
+fn retained_effect_instances_obey_ancestor_clips() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            spawn_clipped_effects,
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            spawn_clipped_effects,
+            |_, _| {},
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+    });
 }
 
 #[test]

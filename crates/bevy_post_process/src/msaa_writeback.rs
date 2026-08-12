@@ -125,6 +125,7 @@ fn prepare_msaa_writeback_pipelines(
                 target_format: view_target.main_texture_format(),
                 samples: msaa.samples(),
                 blend_state: None,
+                premultiplied_overlay: false,
                 source_space: None,
             };
 

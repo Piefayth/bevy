@@ -4,7 +4,9 @@ const PI: f32 = 3.14159265358979323846;
 const SAMPLES: i32 = #SHADOW_SAMPLES;
 
 @group(0) @binding(0) var<uniform> view: View;
+#ifndef FULL_REBUILD
 @group(1) @binding(0) var damage_mask: texture_2d<f32>;
+#endif
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -13,6 +15,7 @@ struct VertexOutput {
     @location(2) @interpolate(flat) size: vec2<f32>,
     @location(3) @interpolate(flat) radius: vec4<f32>,
     @location(4) @interpolate(flat) blur: f32,
+    @location(5) @interpolate(flat) clip: vec4<f32>,
 }
 
 fn gaussian(x: f32, sigma: f32) -> f32 {
@@ -70,6 +73,7 @@ fn vertex(
     @location(4) radius: vec4<f32>,
     @location(5) blur: f32,
     @location(6) bounds: vec2<f32>,
+    @location(7) clip: vec4<f32>,
 ) -> VertexOutput {
     let indices = array(0u, 2u, 3u, 0u, 1u, 2u);
     let corners = array(
@@ -90,14 +94,20 @@ fn vertex(
     out.size = size;
     out.radius = radius;
     out.blur = blur;
+    out.clip = clip;
     return out;
 }
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    if any(in.position.xy < in.clip.xy) || any(in.position.xy >= in.clip.zw) {
+        discard;
+    }
+#ifndef FULL_REBUILD
     if textureLoad(damage_mask, vec2<i32>(in.position.xy), 0).r < 0.5 {
         discard;
     }
+#endif
     let blur = max(in.blur, 0.01);
     let coverage = rounded_shadow(in.point, blur, in.radius, in.size);
     return vec4(in.color.rgb, in.color.a * coverage);

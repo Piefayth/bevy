@@ -12,7 +12,7 @@ use bevy::{
     math::{Rect, UVec3},
     platform::collections::{HashMap, HashSet},
     render::{
-        render_asset::RenderAssets,
+        render_asset::{ExtractedAssets, RenderAssets},
         render_resource::{DefaultImageSamplerDescriptor, TextureDimension, TextureUsages},
         texture::GpuImage,
         Extract,
@@ -162,11 +162,32 @@ pub(crate) struct SampledImageState {
     image_readers: HashMap<AssetId<Image>, HashSet<ImageReader>>,
     metadata: HashMap<AssetId<Image>, MetadataState>,
     samples: HashMap<ImageSample, SampleState>,
-    pending: HashSet<AssetId<Image>>,
+    pending: HashMap<AssetId<Image>, PendingImage>,
     nominated: HashSet<ImageReader>,
     active_render_targets: HashSet<AssetId<Image>>,
     rendered_revisions: HashMap<AssetId<Image>, u64>,
     next_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingImage {
+    ReaderIntroduction,
+    AwaitingAssetEvent,
+    AwaitingGpu,
+}
+
+fn advance_pending_image(
+    pending: PendingImage,
+    asset_event_observed: bool,
+    gpu_ready: bool,
+) -> Option<PendingImage> {
+    match pending {
+        PendingImage::AwaitingAssetEvent if !asset_event_observed => Some(pending),
+        PendingImage::ReaderIntroduction | PendingImage::AwaitingAssetEvent => {
+            (!gpu_ready).then_some(PendingImage::AwaitingGpu)
+        }
+        PendingImage::AwaitingGpu => (!gpu_ready).then_some(pending),
+    }
 }
 
 /// The exact sampled-image dependency graph shared by every paint family.
@@ -270,7 +291,9 @@ impl SampledImageState {
 
     pub(crate) fn mark_pending(&mut self, image: AssetId<Image>, asset: Option<&Image>) {
         if asset.is_some_and(|asset| asset.asset_usage.contains(RenderAssetUsages::RENDER_WORLD)) {
-            self.pending.insert(image);
+            self.pending
+                .entry(image)
+                .or_insert(PendingImage::ReaderIntroduction);
         } else {
             self.pending.remove(&image);
         }
@@ -327,7 +350,7 @@ impl SampledImageState {
         }
 
         if pending && relevant_change {
-            self.pending.insert(image);
+            self.pending.insert(image, PendingImage::AwaitingAssetEvent);
         } else if !pending {
             self.pending.remove(&image);
         }
@@ -400,13 +423,40 @@ impl SampledImageState {
             .collect()
     }
 
-    pub(crate) fn is_pending(&self, image: AssetId<Image>) -> bool {
-        self.pending.contains(&image)
+    pub(crate) fn revision(
+        &self,
+        image: AssetId<Image>,
+        sample: ImageSample,
+    ) -> SmallVec<[u64; 4]> {
+        smallvec::smallvec![
+            self.metadata.get(&image).map_or(0, |state| state.revision),
+            self.rendered_revisions.get(&image).copied().unwrap_or(0),
+            self.samples.get(&sample).map_or(0, |state| state.revision),
+        ]
     }
 
-    pub(crate) fn resolve_ready(&mut self, gpu_images: &RenderAssets<GpuImage>) {
-        self.pending.retain(|image| {
-            self.image_readers.contains_key(image) && gpu_images.get(*image).is_none()
+    pub(crate) fn is_pending(&self, image: AssetId<Image>) -> bool {
+        self.pending.contains_key(&image)
+    }
+
+    pub(crate) fn resolve_ready(
+        &mut self,
+        gpu_images: &RenderAssets<GpuImage>,
+        extracted_images: &ExtractedAssets<GpuImage>,
+    ) {
+        self.pending.retain(|image, pending| {
+            if !self.image_readers.contains_key(image) {
+                return false;
+            }
+            let asset_event_observed =
+                extracted_images.modified.contains(image) || extracted_images.added.contains(image);
+            let gpu_ready = gpu_images.get(*image).is_some();
+            let Some(next) = advance_pending_image(*pending, asset_event_observed, gpu_ready)
+            else {
+                return false;
+            };
+            *pending = next;
+            true
         });
     }
 
@@ -508,9 +558,10 @@ fn sample_intersects(sample: ImageSample, write: ImageWriteRegion) -> bool {
 pub(crate) fn resolve_ready_sampled_images(
     retained: Res<RetainedSampledImages>,
     gpu_images: Res<RenderAssets<GpuImage>>,
+    extracted_images: Res<ExtractedAssets<GpuImage>>,
 ) {
     let mut retained = retained.lock();
-    retained.resolve_ready(&gpu_images);
+    retained.resolve_ready(&gpu_images, &extracted_images);
 }
 
 fn remove_reverse_reader(
@@ -657,6 +708,34 @@ mod tests {
             bevy::render::render_resource::TextureFormat::Rgba8Unorm,
             RenderAssetUsages::default(),
         )
+    }
+
+    #[test]
+    fn changed_image_waits_for_its_matching_render_asset_event() {
+        assert_eq!(
+            advance_pending_image(PendingImage::AwaitingAssetEvent, false, true),
+            Some(PendingImage::AwaitingAssetEvent)
+        );
+        assert_eq!(
+            advance_pending_image(PendingImage::AwaitingAssetEvent, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn deferred_image_stays_pending_until_the_gpu_asset_exists() {
+        assert_eq!(
+            advance_pending_image(PendingImage::AwaitingAssetEvent, true, false),
+            Some(PendingImage::AwaitingGpu)
+        );
+        assert_eq!(
+            advance_pending_image(PendingImage::AwaitingGpu, false, false),
+            Some(PendingImage::AwaitingGpu)
+        );
+        assert_eq!(
+            advance_pending_image(PendingImage::AwaitingGpu, false, true),
+            None
+        );
     }
 
     #[test]

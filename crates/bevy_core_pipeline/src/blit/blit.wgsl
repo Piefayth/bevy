@@ -7,11 +7,21 @@
 #endif
 
 @group(0) @binding(0) var in_texture: texture_2d<f32>;
+#ifdef PREMULTIPLIED_OVERLAY
+@group(0) @binding(1) var overlay_texture: texture_2d<f32>;
+@group(0) @binding(2) var in_sampler: sampler;
+#else
 @group(0) @binding(1) var in_sampler: sampler;
+#endif
 
 @fragment
 fn fs_main(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     var color = textureSample(in_texture, in_sampler, in.uv);
+#ifdef PREMULTIPLIED_OVERLAY
+    let overlay_size = vec2<f32>(textureDimensions(overlay_texture));
+    let overlay = textureLoad(overlay_texture, vec2<i32>(in.uv * overlay_size), 0);
+    color = overlay + color * (1.0 - overlay.a);
+#endif
 #ifdef SRGB_TO_LINEAR
     color = vec4(srgb_to_linear(color.rgb), color.a);
 #endif

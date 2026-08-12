@@ -82,6 +82,21 @@ impl PhysicalRect {
             },
         )
     }
+
+    pub(crate) fn rectangular_union(self, other: Self) -> Option<Self> {
+        let bounds = Self::from_min_max(
+            self.min_x.min(other.min_x),
+            self.min_y.min(other.min_y),
+            self.max_x.max(other.max_x),
+            self.max_y.max(other.max_y),
+        )?;
+        let intersection_area = self
+            .intersection(other)
+            .map_or(0, |intersection| intersection.area());
+        (u128::from(bounds.area())
+            == u128::from(self.area()) + u128::from(other.area()) - u128::from(intersection_area))
+        .then_some(bounds)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -337,6 +352,10 @@ impl RepairPlan {
         &self.spatial
     }
 
+    pub(crate) fn shares_regions_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.regions, &other.regions)
+    }
+
     pub(crate) const fn through_epoch(&self) -> u64 {
         self.through_epoch
     }
@@ -386,10 +405,17 @@ impl DamageJournal {
             .next_epoch
             .checked_add(1)
             .expect("retained UI damage epoch overflowed");
-        self.events.push(DamageEvent {
-            epoch: self.next_epoch,
-            rect,
-        });
+        if let Some(last) = self.events.last_mut()
+            && let Some(union) = last.rect.rectangular_union(rect)
+        {
+            last.epoch = self.next_epoch;
+            last.rect = union;
+        } else {
+            self.events.push(DamageEvent {
+                epoch: self.next_epoch,
+                rect,
+            });
+        }
         self.next_epoch
     }
 
@@ -462,7 +488,18 @@ impl DamageJournal {
             plan.journal_id, self.id,
             "a repair plan must be acknowledged by its originating damage journal"
         );
-        self.events.retain(|event| event.epoch > plan.through_epoch);
+        if self
+            .events
+            .last()
+            .is_some_and(|event| event.epoch <= plan.through_epoch)
+        {
+            self.events.clear();
+            return;
+        }
+        let acknowledged = self
+            .events
+            .partition_point(|event| event.epoch <= plan.through_epoch);
+        self.events.drain(..acknowledged);
     }
 
     /// Returns whether any damage remains owed.
@@ -676,6 +713,20 @@ mod tests {
             Some(rect(2, 1, 4, 3))
         );
         assert_eq!(rect(0, 0, 1, 1).intersection(rect(1, 0, 2, 1)), None);
+    }
+
+    #[test]
+    fn unchanged_damage_reuses_the_exact_repair_geometry() {
+        let mut journal = DamageJournal::default();
+        journal.record(rect(0, 0, 4, 3));
+        journal.record(rect(7, 2, 9, 6));
+
+        let first = journal.plan().unwrap();
+        let second = journal.plan().unwrap();
+
+        assert!(first.shares_regions_with(&second));
+        journal.record(rect(12, 0, 13, 1));
+        assert!(!first.shares_regions_with(&journal.plan().unwrap()));
     }
 
     #[test]

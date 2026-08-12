@@ -16,7 +16,9 @@ const BORDER_BOTTOM = 2048u;
 const BORDER_ANY = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
 
 @group(0) @binding(0) var<uniform> view: View;
+#ifndef FULL_REBUILD
 @group(1) @binding(0) var damage_mask: texture_2d<f32>;
+#endif
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -30,6 +32,7 @@ struct VertexOutput {
     @location(7) @interpolate(flat) start_color: vec4<f32>,
     @location(8) @interpolate(flat) lengths_hint: vec3<f32>,
     @location(9) @interpolate(flat) end_color: vec4<f32>,
+    @location(10) @interpolate(flat) clip: vec4<f32>,
 }
 
 @vertex
@@ -46,6 +49,7 @@ fn vertex(
     @location(8) start_color: vec4<f32>,
     @location(9) lengths_hint: vec3<f32>,
     @location(10) end_color: vec4<f32>,
+    @location(11) clip: vec4<f32>,
 ) -> VertexOutput {
     let indices = array(0u, 2u, 3u, 0u, 1u, 2u);
     let corners = array(
@@ -71,14 +75,20 @@ fn vertex(
     out.start_color = start_color;
     out.lengths_hint = lengths_hint;
     out.end_color = end_color;
+    out.clip = clip;
     return out;
 }
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    if any(in.position.xy < in.clip.xy) || any(in.position.xy >= in.clip.zw) {
+        discard;
+    }
+#ifndef FULL_REBUILD
     if textureLoad(damage_mask, vec2<i32>(in.position.xy), 0).r < 0.5 {
         discard;
     }
+#endif
     var distance: f32;
     if (in.flags & RADIAL) != 0u {
         distance = radial_distance(in.point, in.g_start, in.dir.x);

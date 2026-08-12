@@ -4,8 +4,8 @@ use crate::{
     boundary::retained_clip,
     sampled_image::{ImageReader, ImageSample, RetainedSampledImages, SampledImageState},
     scene::{
-        coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
-        RetainedNodeItem, RetainedUiScene, RetainedUiSurfaces,
+        coverage, PaintFamily, PaintId, PendingRetainedPaint, PendingViewportPaints,
+        ResourceFingerprint, RetainedDraw, RetainedDrawItem, RetainedNodeItem,
     },
 };
 use bevy::{
@@ -17,7 +17,7 @@ use bevy::{
         entity::Entity,
         lifecycle::RemovedComponents,
         query::{Added, Changed, Or, With},
-        system::{Commands, Query, Res, ResMut, SystemParam},
+        system::{Query, Res, ResMut, SystemParam},
     },
     image::Image,
     math::{Rect, Vec2},
@@ -97,8 +97,6 @@ pub(crate) struct RemovedViewportInputs<'w, 's> {
     reason = "node, source-camera, image, and lifecycle inputs independently nominate viewport changes"
 )]
 pub(crate) fn extract_retained_viewports(
-    mut commands: Commands,
-    state: Res<RetainedUiScene>,
     mut dependencies: ResMut<RetainedViewportDependencies>,
     sampled_images: Res<RetainedSampledImages>,
     default_sampler: Res<DefaultImageSamplerDescriptor>,
@@ -125,6 +123,7 @@ pub(crate) fn extract_retained_viewports(
     changed_sources: Extract<Query<Entity, Or<(Changed<RenderTarget>, Added<Camera>)>>>,
     camera_map: Extract<UiCameraMap>,
     mut removed: Extract<RemovedViewportInputs>,
+    mut pending: ResMut<PendingViewportPaints>,
 ) {
     let mut sampled_images = sampled_images.lock();
     let mut extra_candidates: HashSet<_> = sampled_images.take_viewports().into_iter().collect();
@@ -151,7 +150,6 @@ pub(crate) fn extract_retained_viewports(
     extra_candidates.extend(clip.read());
     extra_candidates.retain(|entity| !changed.contains(*entity));
 
-    let mut surfaces = state.lock();
     for entity in computed_node
         .read()
         .chain(node.read())
@@ -160,13 +158,7 @@ pub(crate) fn extract_retained_viewports(
         .chain(visibility.read())
         .chain(camera.read())
     {
-        remove_viewport(
-            &mut dependencies,
-            &mut sampled_images,
-            &mut surfaces,
-            &mut commands,
-            entity,
-        );
+        remove_viewport(&mut dependencies, &mut sampled_images, &mut pending, entity);
     }
     extra_candidates.retain(|entity| {
         if all.contains(*entity) {
@@ -175,8 +167,7 @@ pub(crate) fn extract_retained_viewports(
             remove_viewport(
                 &mut dependencies,
                 &mut sampled_images,
-                &mut surfaces,
-                &mut commands,
+                &mut pending,
                 *entity,
             );
             false
@@ -204,12 +195,12 @@ pub(crate) fn extract_retained_viewports(
         let id = viewport_id(entity);
         let reader = ImageReader::Viewport(entity);
         let Some(camera) = camera_mapper.map(target_camera) else {
-            surfaces.remove(&mut commands, id);
+            pending.remove(id);
             sampled_images.remove_reader(reader);
             continue;
         };
         let Some(source) = viewport.camera else {
-            surfaces.remove(&mut commands, id);
+            pending.remove(id);
             sampled_images.remove_reader(reader);
             continue;
         };
@@ -219,7 +210,7 @@ pub(crate) fn extract_retained_viewports(
             .and_then(|(_, target)| target.as_image())
             .map(Handle::id)
         else {
-            surfaces.remove(&mut commands, id);
+            pending.remove(id);
             sampled_images.remove_reader(reader);
             continue;
         };
@@ -239,11 +230,10 @@ pub(crate) fn extract_retained_viewports(
             sampled_images.remove_reader(reader);
             ResourceFingerprint::None
         };
-        surfaces.upsert(
-            &mut commands,
+        pending.upsert(PendingRetainedPaint {
             id,
             camera,
-            RetainedDraw {
+            draw: RetainedDraw {
                 render_entity: Entity::PLACEHOLDER,
                 camera,
                 main_entity: MainEntity::from(entity),
@@ -252,6 +242,7 @@ pub(crate) fn extract_retained_viewports(
                 clip,
                 image,
                 transform,
+                layout_translation: Vec2::ZERO,
                 local_translation: Vec2::ZERO,
                 item: RetainedDrawItem::Node(RetainedNodeItem {
                     color: bevy::color::LinearRgba::WHITE,
@@ -266,13 +257,13 @@ pub(crate) fn extract_retained_viewports(
                 }),
             },
             resource,
-            painted
+            coverage: painted
                 .then(|| coverage(node.size(), transform, clip))
                 .flatten()
                 .into_iter()
                 .collect(),
             painted,
-        );
+        });
     }
 }
 
@@ -287,11 +278,10 @@ fn viewport_id(entity: Entity) -> PaintId {
 fn remove_viewport(
     dependencies: &mut RetainedViewportDependencies,
     sampled_images: &mut SampledImageState,
-    surfaces: &mut RetainedUiSurfaces,
-    commands: &mut Commands,
+    pending: &mut PendingViewportPaints,
     entity: Entity,
 ) {
     dependencies.remove(entity);
     sampled_images.remove_reader(ImageReader::Viewport(entity));
-    surfaces.remove(commands, viewport_id(entity));
+    pending.remove(viewport_id(entity));
 }

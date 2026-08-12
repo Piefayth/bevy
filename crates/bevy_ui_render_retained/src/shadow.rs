@@ -3,8 +3,8 @@
 use crate::{
     boundary::retained_clip,
     scene::{
-        coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedBoxShadowItem, RetainedDraw,
-        RetainedDrawItem, RetainedUiScene, RetainedUiSurfaces,
+        coverage, PaintFamily, PaintId, PendingRetainedPaint, PendingShadowPaints,
+        ResourceFingerprint, RetainedBoxShadowItem, RetainedDraw, RetainedDrawItem,
     },
 };
 use bevy::{
@@ -13,10 +13,10 @@ use bevy::{
     camera::visibility::InheritedVisibility,
     color::Alpha,
     ecs::{
-        entity::Entity,
+        entity::{Entity, EntityHashMap, EntityHashSet},
         lifecycle::RemovedComponents,
         query::{Changed, With},
-        system::{Commands, Query, Res, ResMut, SystemParam},
+        system::{Query, ResMut, SystemParam},
     },
     image::Image,
     math::{Affine2, Vec2},
@@ -27,15 +27,14 @@ use bevy::{
     },
     ui_render::{box_shadow::resolve_box_shadow, stack_z_offsets, BoxShadowSamples, UiCameraMap},
 };
-use std::collections::{HashMap, HashSet};
-
+use smallvec::SmallVec;
 #[derive(bevy::prelude::Resource, Default)]
 pub(crate) struct RetainedShadowDependencies {
-    entities: HashMap<Entity, HashSet<PaintId>>,
+    entities: EntityHashMap<SmallVec<[PaintId; 4]>>,
 }
 
 impl RetainedShadowDependencies {
-    fn set(&mut self, entity: Entity, paints: HashSet<PaintId>) {
+    fn set(&mut self, entity: Entity, paints: SmallVec<[PaintId; 4]>) {
         if paints.is_empty() {
             self.entities.remove(&entity);
         } else {
@@ -43,7 +42,7 @@ impl RetainedShadowDependencies {
         }
     }
 
-    fn remove(&mut self, entity: Entity) -> HashSet<PaintId> {
+    fn remove(&mut self, entity: Entity) -> SmallVec<[PaintId; 4]> {
         self.entities.remove(&entity).unwrap_or_default()
     }
 }
@@ -77,8 +76,6 @@ pub(crate) struct RemovedShadowInputs<'w, 's> {
 }
 
 pub(crate) fn extract_retained_shadows(
-    mut commands: Commands,
-    state: Res<RetainedUiScene>,
     mut dependencies: ResMut<RetainedShadowDependencies>,
     changed: Extract<
         Query<
@@ -103,8 +100,9 @@ pub(crate) fn extract_retained_shadows(
     samples: Extract<Query<&'static BoxShadowSamples>>,
     changed_samples: Extract<Query<Entity, Changed<BoxShadowSamples>>>,
     mut removed: Extract<RemovedShadowInputs>,
+    mut pending: ResMut<PendingShadowPaints>,
 ) {
-    let mut extra_candidates = HashSet::new();
+    let mut extra_candidates = EntityHashSet::default();
     let RemovedShadowInputs {
         shadow,
         clip,
@@ -120,7 +118,7 @@ pub(crate) fn extract_retained_shadows(
     extra_candidates.extend(shadow.read());
     extra_candidates.extend(clip.read());
     extra_candidates.extend(target.read());
-    let changed_cameras: HashSet<_> = changed_samples
+    let changed_cameras: EntityHashSet = changed_samples
         .iter()
         .chain(removed_samples.read())
         .collect();
@@ -134,7 +132,6 @@ pub(crate) fn extract_retained_shadows(
     }
     extra_candidates.retain(|entity| !changed.contains(*entity));
 
-    let mut surfaces = state.lock();
     for entity in computed_node
         .read()
         .chain(node.read())
@@ -143,18 +140,23 @@ pub(crate) fn extract_retained_shadows(
         .chain(visibility.read())
         .chain(camera.read())
     {
-        remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
+        for id in dependencies.remove(entity) {
+            pending.remove(id);
+        }
     }
     extra_candidates.retain(|entity| {
         if all.contains(*entity) {
             true
         } else {
-            remove_entity(&mut dependencies, &mut surfaces, &mut commands, *entity);
+            for id in dependencies.remove(*entity) {
+                pending.remove(id);
+            }
             false
         }
     });
 
     let mut camera_mapper = camera_map.get_mapper();
+    pending.reserve(changed.iter().size_hint().0);
     for (
         entity,
         source_node,
@@ -173,7 +175,9 @@ pub(crate) fn extract_retained_shadows(
             .filter_map(|entity| all.get(entity).ok()),
     ) {
         let Some(camera) = camera_mapper.map(target_camera) else {
-            remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
+            for id in dependencies.remove(entity) {
+                pending.remove(id);
+            }
             continue;
         };
         let shadow_samples = target_camera
@@ -188,7 +192,7 @@ pub(crate) fn extract_retained_shadows(
             && !node.size().cmple(Vec2::ZERO).any();
         let clip = retained_clip(entity, node, transform, clip, owner);
         let node_transform = transform.affine();
-        let mut paints = HashSet::new();
+        let mut paints = SmallVec::new();
         for (ordinal, logical) in shadows.iter().enumerate() {
             let Some(shadow) = resolve_box_shadow(
                 logical,
@@ -211,11 +215,10 @@ pub(crate) fn extract_retained_shadows(
                 .flatten()
                 .into_iter()
                 .collect::<crate::PaintCoverage>();
-            surfaces.upsert(
-                &mut commands,
+            pending.upsert(PendingRetainedPaint {
                 id,
                 camera,
-                RetainedDraw {
+                draw: RetainedDraw {
                     render_entity: Entity::PLACEHOLDER,
                     camera,
                     main_entity: MainEntity::from(entity),
@@ -224,6 +227,7 @@ pub(crate) fn extract_retained_shadows(
                     clip,
                     image: AssetId::<Image>::default(),
                     transform,
+                    layout_translation: Vec2::ZERO,
                     local_translation: shadow.offset,
                     item: RetainedDrawItem::BoxShadow(RetainedBoxShadowItem::new(
                         stack.0,
@@ -231,31 +235,20 @@ pub(crate) fn extract_retained_shadows(
                         shadow_samples,
                     )),
                 },
-                ResourceFingerprint::None,
+                resource: ResourceFingerprint::None,
                 coverage,
                 painted,
-            );
+            });
             if painted {
-                paints.insert(id);
+                paints.push(id);
             }
         }
 
         for old in dependencies.remove(entity) {
             if !paints.contains(&old) {
-                surfaces.remove(&mut commands, old);
+                pending.remove(old);
             }
         }
         dependencies.set(entity, paints);
-    }
-}
-
-fn remove_entity(
-    dependencies: &mut RetainedShadowDependencies,
-    surfaces: &mut RetainedUiSurfaces,
-    commands: &mut Commands,
-    entity: Entity,
-) {
-    for id in dependencies.remove(entity) {
-        surfaces.remove(commands, id);
     }
 }

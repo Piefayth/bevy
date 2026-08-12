@@ -4,8 +4,9 @@ use crate::{
     boundary::retained_clip,
     sampled_image::{ImageReader, ImageSample, RetainedSampledImages},
     scene::{
-        coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
-        RetainedNodeItem, RetainedTextureSliceItem, RetainedUiScene,
+        coverage, PaintFamily, PaintId, PendingImagePaints, PendingRetainedPaint,
+        ResourceFingerprint, RetainedDraw, RetainedDrawItem, RetainedNodeItem,
+        RetainedTextureSliceItem, RetainedUiScene,
     },
 };
 use bevy::{
@@ -14,7 +15,7 @@ use bevy::{
     camera::visibility::InheritedVisibility,
     color::Alpha,
     ecs::{
-        entity::Entity,
+        entity::{Entity, EntityHashMap, EntityHashSet},
         lifecycle::RemovedComponents,
         message::MessageReader,
         query::{Changed, Or, With},
@@ -22,6 +23,7 @@ use bevy::{
     },
     image::{Image, TextureAtlasLayout, TRANSPARENT_IMAGE_HANDLE},
     math::{Affine2, Rect, Vec2},
+    platform::collections::HashMap,
     render::{render_resource::DefaultImageSamplerDescriptor, sync_world::MainEntity, Extract},
     sprite::{BorderRect, SpriteImageMode},
     ui::{
@@ -31,20 +33,20 @@ use bevy::{
     },
     ui_render::{stack_z_offsets, NodeType, UiCameraMap},
 };
-use std::collections::{HashMap, HashSet};
-
 #[derive(Clone)]
 struct ImageDependencies {
     atlas: Option<AssetId<TextureAtlasLayout>>,
     sample: ImageSample,
+    source_rect: Option<Rect>,
+    resource: ResourceFingerprint,
     node: ImageNode,
     camera: Entity,
 }
 
 #[derive(bevy::prelude::Resource, Default)]
 pub(crate) struct RetainedImageDependencies {
-    entities: HashMap<Entity, ImageDependencies>,
-    atlas_readers: HashMap<AssetId<TextureAtlasLayout>, HashSet<Entity>>,
+    entities: EntityHashMap<ImageDependencies>,
+    atlas_readers: HashMap<AssetId<TextureAtlasLayout>, EntityHashSet>,
 }
 
 impl RetainedImageDependencies {
@@ -66,25 +68,62 @@ impl RetainedImageDependencies {
         }
     }
 
-    fn set_entity(&mut self, entity: Entity, dependencies: ImageDependencies) -> bool {
-        if self
-            .entities
-            .get(&entity)
-            .is_some_and(|old| old.atlas == dependencies.atlas && old.sample == dependencies.sample)
+    fn cached_source(
+        &self,
+        entity: Entity,
+        node: &ImageNode,
+    ) -> Option<(
+        Option<AssetId<TextureAtlasLayout>>,
+        Option<Rect>,
+        ImageSample,
+        ResourceFingerprint,
+    )> {
+        let old = self.entities.get(&entity)?;
+        same_image_source(&old.node, node)
+            .then(|| (old.atlas, old.source_rect, old.sample, old.resource.clone()))
+    }
+
+    fn set_entity(
+        &mut self,
+        entity: Entity,
+        atlas: Option<AssetId<TextureAtlasLayout>>,
+        sample: ImageSample,
+        source_rect: Option<Rect>,
+        resource: ResourceFingerprint,
+        node: &ImageNode,
+        camera: Entity,
+    ) -> bool {
+        if let Some(old) = self.entities.get_mut(&entity)
+            && old.atlas == atlas
+            && old.sample == sample
         {
-            self.entities.insert(entity, dependencies);
+            if old.camera != camera || !same_image_source(&old.node, node) {
+                old.node = node.clone();
+                old.camera = camera;
+            }
+            old.source_rect = source_rect;
+            old.resource = resource;
             return false;
         }
         self.remove_entity(entity);
-        let atlas = dependencies.atlas;
-        self.entities.insert(entity, dependencies);
+        self.entities.insert(
+            entity,
+            ImageDependencies {
+                atlas,
+                sample,
+                source_rect,
+                resource,
+                node: node.clone(),
+                camera,
+            },
+        );
         if let Some(atlas) = atlas {
             self.atlas_readers.entry(atlas).or_default().insert(entity);
         }
         true
     }
 
-    fn atlas_changed(&self, id: AssetId<TextureAtlasLayout>, candidates: &mut HashSet<Entity>) {
+    fn atlas_changed(&self, id: AssetId<TextureAtlasLayout>, candidates: &mut EntityHashSet) {
         if let Some(readers) = self.atlas_readers.get(&id) {
             candidates.extend(readers);
         }
@@ -102,7 +141,7 @@ fn same_image_source(left: &ImageNode, right: &ImageNode) -> bool {
 }
 
 fn remove_reader<A: bevy::asset::Asset>(
-    readers: &mut HashMap<AssetId<A>, HashSet<Entity>>,
+    readers: &mut HashMap<AssetId<A>, EntityHashSet>,
     asset: AssetId<A>,
     entity: Entity,
 ) {
@@ -160,25 +199,29 @@ pub(crate) fn extract_retained_images(
             (
                 With<ImageNode>,
                 Or<(
-                    Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
                     Changed<ImageNodeSize>,
-                    Changed<Node>,
                     Changed<ComputedUiRenderTargetInfo>,
                 )>,
             ),
         >,
     >,
+    layout_changed: Extract<
+        Query<ImageQueryItem<'static>, (With<ImageNode>, Changed<ComputedNode>)>,
+    >,
     image_changed: Extract<Query<Entity, Changed<ImageNode>>>,
     all: Extract<Query<ImageQueryItem<'static>, With<ImageNode>>>,
     camera_map: Extract<UiCameraMap>,
     mut removed: Extract<RemovedImageInputs>,
+    mut pending: ResMut<PendingImagePaints>,
 ) {
     let mut sampled_images = sampled_images.lock();
-    let mut extra_candidates: HashSet<_> = sampled_images.take_nodes().into_iter().collect();
+    let sampled_candidates: EntityHashSet = sampled_images.take_nodes().into_iter().collect();
+    let mut extra_candidates = sampled_candidates.clone();
+    let mut atlas_candidates = EntityHashSet::default();
     for event in atlas_events.read() {
         let id = match *event {
             AssetEvent::Added { id } | AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
@@ -186,8 +229,9 @@ pub(crate) fn extract_retained_images(
             }
             AssetEvent::Unused { .. } | AssetEvent::LoadedWithDependencies { .. } => continue,
         };
-        dependencies.atlas_changed(id, &mut extra_candidates);
+        dependencies.atlas_changed(id, &mut atlas_candidates);
     }
+    extra_candidates.extend(&atlas_candidates);
 
     let RemovedImageInputs {
         image,
@@ -235,7 +279,51 @@ pub(crate) fn extract_retained_images(
         }
     }
 
+    for (entity, node, _, transform, visibility, clip, owner, _, image, image_size) in
+        &layout_changed
+    {
+        if structural_changed.contains(entity) {
+            continue;
+        }
+        let visual_box = match image.visual_box {
+            VisualBox::ContentBox => node.content_box(),
+            VisualBox::PaddingBox => node.padding_box(),
+            VisualBox::BorderBox => node.border_box(),
+        };
+        let size = if matches!(image.image_mode, NodeImageMode::Auto) {
+            let source = image_size.size().as_vec2();
+            if source.cmple(Vec2::ZERO).any() {
+                visual_box.size()
+            } else {
+                source * (visual_box.size() / source).min_element()
+            }
+        } else {
+            visual_box.size()
+        };
+        let clip = retained_clip(entity, node, transform, clip, owner);
+        let painted = visibility.get()
+            && !image.color.is_fully_transparent()
+            && image.image.id() != TRANSPARENT_IMAGE_HANDLE.id()
+            && !node.is_empty()
+            && !visual_box.size().cmple(Vec2::ZERO).any();
+        if !surfaces.relayout_image(
+            &mut commands,
+            entity,
+            size,
+            visual_box.center(),
+            transform.affine(),
+            clip,
+            node.border_radius,
+            node.inverse_scale_factor,
+            painted,
+        ) {
+            extra_candidates.insert(entity);
+        }
+    }
+
+    drop(surfaces);
     let mut camera_mapper = camera_map.get_mapper();
+    pending.reserve(structural_changed.iter().size_hint().0);
     for (
         entity,
         node,
@@ -253,13 +341,42 @@ pub(crate) fn extract_retained_images(
             .filter_map(|entity| all.get(entity).ok()),
     ) {
         let image_asset = image.image.id();
-        let atlas_asset = image.texture_atlas.as_ref().map(|atlas| atlas.layout.id());
         let Some(camera) = camera_mapper.map(target_camera) else {
             dependencies.remove_entity(entity);
             sampled_images.remove_reader(ImageReader::Node(entity));
-            surfaces.remove(&mut commands, image_id(entity));
+            state.lock().remove(&mut commands, image_id(entity));
             continue;
         };
+        let cached_source = (!atlas_candidates.contains(&entity))
+            .then(|| dependencies.cached_source(entity, image))
+            .flatten();
+        let reader_changed = cached_source.is_none();
+        let (atlas_asset, source_rect, sample, cached_resource) = cached_source.map_or_else(
+            || {
+                let atlas_asset = image.texture_atlas.as_ref().map(|atlas| atlas.layout.id());
+                let atlas_rect = image
+                    .texture_atlas
+                    .as_ref()
+                    .and_then(|atlas| atlas.texture_rect(&texture_atlases))
+                    .map(|rect| rect.as_rect());
+                let source_rect = match (atlas_rect, image.rect) {
+                    (None, None) => None,
+                    (None, Some(image_rect)) => Some(image_rect),
+                    (Some(atlas_rect), None) => Some(atlas_rect),
+                    (Some(atlas_rect), Some(mut image_rect)) => {
+                        image_rect.min += atlas_rect.min;
+                        image_rect.max += atlas_rect.min;
+                        Some(image_rect)
+                    }
+                };
+                let sample = source_rect.map_or_else(
+                    || ImageSample::all(image_asset),
+                    |rect| ImageSample::rect(image_asset, rect),
+                );
+                (atlas_asset, source_rect, sample, None)
+            },
+            |(atlas, source_rect, sample, resource)| (atlas, source_rect, sample, Some(resource)),
+        );
         let visual_box = match image.visual_box {
             VisualBox::ContentBox => node.content_box(),
             VisualBox::PaddingBox => node.padding_box(),
@@ -274,21 +391,6 @@ pub(crate) fn extract_retained_images(
             }
         } else {
             visual_box.size()
-        };
-        let atlas_rect = image
-            .texture_atlas
-            .as_ref()
-            .and_then(|atlas| atlas.texture_rect(&texture_atlases))
-            .map(|rect| rect.as_rect());
-        let source_rect = match (atlas_rect, image.rect) {
-            (None, None) => None,
-            (None, Some(image_rect)) => Some(image_rect),
-            (Some(atlas_rect), None) => Some(atlas_rect),
-            (Some(atlas_rect), Some(mut image_rect)) => {
-                image_rect.min += atlas_rect.min;
-                image_rect.max += atlas_rect.min;
-                Some(image_rect)
-            }
         };
         let item = match &image.image_mode {
             NodeImageMode::Sliced(slicer) => {
@@ -353,10 +455,6 @@ pub(crate) fn extract_retained_images(
                 })
             }
         };
-        let sample = source_rect.map_or_else(
-            || ImageSample::all(image_asset),
-            |rect| ImageSample::rect(image_asset, rect),
-        );
         let clip = retained_clip(entity, node, transform, clip, owner);
         let transform = transform.affine() * Affine2::from_translation(visual_box.center());
         let painted = visibility.get()
@@ -365,15 +463,7 @@ pub(crate) fn extract_retained_images(
             && !node.is_empty()
             && !visual_box.size().cmple(Vec2::ZERO).any();
         let resources = if painted {
-            if dependencies.set_entity(
-                entity,
-                ImageDependencies {
-                    atlas: atlas_asset,
-                    sample,
-                    node: image.clone(),
-                    camera,
-                },
-            ) {
+            if reader_changed {
                 sampled_images.replace_reader(
                     ImageReader::Node(entity),
                     [sample],
@@ -382,17 +472,30 @@ pub(crate) fn extract_retained_images(
                 );
                 sampled_images.mark_pending(image_asset, images.get(image_asset));
             }
-            ResourceFingerprint::Revisions(sampled_images.revisions(image_asset, [sample]))
+            let resource = if reader_changed || sampled_candidates.contains(&entity) {
+                ResourceFingerprint::Revisions(sampled_images.revision(image_asset, sample))
+            } else {
+                cached_resource.expect("unchanged image sources retain their resource revision")
+            };
+            dependencies.set_entity(
+                entity,
+                atlas_asset,
+                sample,
+                source_rect,
+                resource.clone(),
+                image,
+                camera,
+            );
+            resource
         } else {
             dependencies.remove_entity(entity);
             sampled_images.remove_reader(ImageReader::Node(entity));
             ResourceFingerprint::None
         };
-        surfaces.upsert(
-            &mut commands,
-            image_id(entity),
+        pending.upsert(PendingRetainedPaint {
+            id: image_id(entity),
             camera,
-            RetainedDraw {
+            draw: RetainedDraw {
                 render_entity: Entity::PLACEHOLDER,
                 camera,
                 main_entity: MainEntity::from(entity),
@@ -401,17 +504,18 @@ pub(crate) fn extract_retained_images(
                 clip,
                 image: image_asset,
                 transform,
+                layout_translation: Vec2::ZERO,
                 local_translation: visual_box.center(),
                 item,
             },
-            resources,
-            painted
+            resource: resources,
+            coverage: painted
                 .then(|| coverage(size, transform, clip))
                 .flatten()
                 .into_iter()
                 .collect(),
             painted,
-        );
+        });
     }
 }
 

@@ -219,6 +219,8 @@ impl Config {
 struct FrameTiming {
     frames: u32,
     milliseconds: Vec<f64>,
+    main_start: Option<std::time::Instant>,
+    main_milliseconds: Vec<f64>,
 }
 
 #[derive(Resource)]
@@ -261,7 +263,9 @@ fn main() {
         .insert_resource(WinitSettings::continuous())
         .insert_resource(config.clone())
         .init_resource::<FrameTiming>()
-        .add_systems(Startup, setup);
+        .add_systems(Startup, setup)
+        .add_systems(First, start_main_time)
+        .add_systems(Last, finish_main_time);
 
     if config.renderer == Renderer::Retained {
         app.add_plugins((UiRenderInfrastructurePlugin, RetainedUiRenderPlugin));
@@ -687,7 +691,7 @@ fn report_render_work(
         info!(
             "retained paint={:?} layer={:?}",
             paint.snapshot(),
-            layer.snapshot()
+            layer.snapshot(),
         );
     }
 }
@@ -699,6 +703,23 @@ fn record_frame_time(config: Res<Config>, time: Res<Time<Real>>, mut timing: Res
         if milliseconds > 0.0 {
             timing.milliseconds.push(milliseconds);
         }
+    }
+}
+
+fn start_main_time(mut timing: ResMut<FrameTiming>) {
+    timing.main_start = Some(std::time::Instant::now());
+}
+
+fn finish_main_time(config: Res<Config>, mut timing: ResMut<FrameTiming>) {
+    let elapsed = timing
+        .main_start
+        .take()
+        .expect("First must run before Last")
+        .elapsed();
+    if timing.frames >= config.warmup_frames {
+        timing
+            .main_milliseconds
+            .push(elapsed.as_secs_f64() * 1_000.0);
     }
 }
 
@@ -740,6 +761,12 @@ fn report_frame_times(timing: &FrameTiming) {
         percentile(&sorted, 0.95),
         percentile(&sorted, 0.99),
         sorted[sorted.len() - 1],
+    );
+    let main_mean =
+        timing.main_milliseconds.iter().sum::<f64>() / timing.main_milliseconds.len() as f64;
+    println!(
+        "main-time: samples={} mean={main_mean:.3}ms",
+        timing.main_milliseconds.len()
     );
 }
 

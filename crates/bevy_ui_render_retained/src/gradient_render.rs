@@ -1,6 +1,6 @@
 //! Damage-clipped instanced drawing for retained gradients.
 
-use crate::scene::RetainedGradientItem;
+use crate::scene::{RetainedFullRebuilds, RetainedGradientItem};
 use bevy::{
     app::SubApp,
     asset::{load_embedded_asset, AssetServer, Handle},
@@ -43,7 +43,7 @@ const CONIC: u32 = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuGradientInstance {
+pub(crate) struct GpuGradientInstance {
     transform: [f32; 4],
     translation: [f32; 2],
     size: [f32; 2],
@@ -55,6 +55,7 @@ struct GpuGradientInstance {
     start_color: [f32; 4],
     lengths_hint: [f32; 3],
     end_color: [f32; 4],
+    clip: [f32; 4],
 }
 
 struct GradientRun {
@@ -83,95 +84,11 @@ impl RetainedGradientRuns {
         &mut self,
         current: &mut Option<usize>,
         draw: &crate::scene::RetainedDraw,
-        item: &RetainedGradientItem,
+        color_space: InterpolationColorSpace,
+        prepared: &[GpuGradientInstance],
     ) {
-        let rect = item.rect();
-        let size = rect.size();
-        let corners = [
-            Vec2::new(-0.5, -0.5) * size,
-            Vec2::new(0.5, -0.5) * size,
-            Vec2::new(0.5, 0.5) * size,
-            Vec2::new(-0.5, 0.5) * size,
-        ];
-        let (g_start, direction, gradient_flags) = match item.resolved() {
-            bevy::ui_render::gradient::ResolvedGradient::Linear { angle } => {
-                let corner = ((angle - core::f32::consts::FRAC_PI_2)
-                    .rem_euclid(core::f32::consts::TAU)
-                    / core::f32::consts::FRAC_PI_2) as usize;
-                let (sin, cos) = sin_cos(angle);
-                (corners[corner].to_array(), [sin, -cos], 0)
-            }
-            bevy::ui_render::gradient::ResolvedGradient::Conic { center, start } => {
-                (center.to_array(), [start, 0.0], CONIC)
-            }
-            bevy::ui_render::gradient::ResolvedGradient::Radial { center, size } => (
-                center.to_array(),
-                [if size.y != 0.0 { size.x / size.y } else { 1.0 }, 0.0],
-                RADIAL,
-            ),
-        };
-        let mut flags = gradient_flags;
-        if let bevy::ui_render::NodeType::Border(border_flags) = item.node_type() {
-            flags |= border_flags;
-        }
-        let transform = draw.transform.to_cols_array();
-        let border = item.border();
-        let radius: [f32; 4] = item.border_radius().into();
-        let base = GpuGradientInstance {
-            transform: [transform[0], transform[1], transform[2], transform[3]],
-            translation: [transform[4], transform[5]],
-            size: size.to_array(),
-            flags,
-            radius,
-            border: [
-                border.min_inset.x,
-                border.min_inset.y,
-                border.max_inset.x,
-                border.max_inset.y,
-            ],
-            g_start,
-            direction,
-            start_color: [0.0; 4],
-            lengths_hint: [0.0; 3],
-            end_color: [0.0; 4],
-        };
-
         let start = self.instances.len();
-        let mut stops = item.stops();
-        let stop_count = stops.len();
-        let Some(mut start_stop) = stops.next() else {
-            return;
-        };
-        let mut segment_count = 0;
-        for (index, end_stop) in stops.enumerate() {
-            if start_stop.1 == end_stop.1 {
-                if index + 2 == stop_count {
-                    if segment_count > 0 {
-                        start_stop.0 = LinearRgba::NONE;
-                    }
-                } else {
-                    start_stop = end_stop;
-                    continue;
-                }
-            }
-            let mut segment_flags = flags;
-            if start_stop.1 > 0.0 && (index == 0 || segment_count == 0) {
-                segment_flags |= FILL_START;
-            }
-            if index + 2 == stop_count {
-                segment_flags |= FILL_END;
-            }
-            let segment = GpuGradientInstance {
-                flags: segment_flags,
-                start_color: convert_color(start_stop.0, item.color_space()),
-                lengths_hint: [start_stop.1, end_stop.1, start_stop.2],
-                end_color: convert_color(end_stop.0, item.color_space()),
-                ..base
-            };
-            self.instances.push(segment);
-            segment_count += 1;
-            start_stop = end_stop;
-        }
+        self.instances.extend_from_slice(prepared);
         let end = self.instances.len();
         if start == end {
             return;
@@ -180,7 +97,7 @@ impl RetainedGradientRuns {
         if let Some(index) = *current {
             let run = &mut self.runs[index];
             if run.camera == draw.camera
-                && run.color_space == item.color_space()
+                && run.color_space == color_space
                 && run.z_order.to_bits() == draw.z_order.to_bits()
             {
                 run.instances.end = end;
@@ -196,12 +113,124 @@ impl RetainedGradientRuns {
             main_entity: draw.main_entity,
             camera: draw.camera,
             z_order: draw.z_order,
-            color_space: item.color_space(),
+            color_space,
             instances: start..end,
             items: 1,
         });
         *current = Some(self.runs.len() - 1);
     }
+}
+
+pub(crate) fn prepare_gradient_instances(
+    draw: &crate::scene::RetainedDraw,
+    item: &RetainedGradientItem,
+    instances: &mut Vec<GpuGradientInstance>,
+) {
+    let rect = item.rect();
+    let size = rect.size();
+    let corners = [
+        Vec2::new(-0.5, -0.5) * size,
+        Vec2::new(0.5, -0.5) * size,
+        Vec2::new(0.5, 0.5) * size,
+        Vec2::new(-0.5, 0.5) * size,
+    ];
+    let (g_start, direction, gradient_flags) = match item.resolved() {
+        bevy::ui_render::gradient::ResolvedGradient::Linear { angle } => {
+            let corner = ((angle - core::f32::consts::FRAC_PI_2).rem_euclid(core::f32::consts::TAU)
+                / core::f32::consts::FRAC_PI_2) as usize;
+            let (sin, cos) = sin_cos(angle);
+            (corners[corner].to_array(), [sin, -cos], 0)
+        }
+        bevy::ui_render::gradient::ResolvedGradient::Conic { center, start } => {
+            (center.to_array(), [start, 0.0], CONIC)
+        }
+        bevy::ui_render::gradient::ResolvedGradient::Radial { center, size } => (
+            center.to_array(),
+            [if size.y != 0.0 { size.x / size.y } else { 1.0 }, 0.0],
+            RADIAL,
+        ),
+    };
+    let mut flags = gradient_flags;
+    if let bevy::ui_render::NodeType::Border(border_flags) = item.node_type() {
+        flags |= border_flags;
+    }
+    let transform = draw.transform.to_cols_array();
+    let border = item.border();
+    let radius: [f32; 4] = item.border_radius().into();
+    let base = GpuGradientInstance {
+        transform: [transform[0], transform[1], transform[2], transform[3]],
+        translation: [transform[4], transform[5]],
+        size: size.to_array(),
+        flags,
+        radius,
+        border: [
+            border.min_inset.x,
+            border.min_inset.y,
+            border.max_inset.x,
+            border.max_inset.y,
+        ],
+        g_start,
+        direction,
+        start_color: [0.0; 4],
+        lengths_hint: [0.0; 3],
+        end_color: [0.0; 4],
+        clip: clip_rect(draw.clip),
+    };
+
+    let mut stops = item.stops();
+    let stop_count = stops.len();
+    let Some(mut start_stop) = stops.next() else {
+        return;
+    };
+    let mut segment_count = 0;
+    for (index, end_stop) in stops.enumerate() {
+        if start_stop.1 == end_stop.1 {
+            if index + 2 == stop_count {
+                if segment_count > 0 {
+                    start_stop.0 = LinearRgba::NONE;
+                }
+            } else {
+                start_stop = end_stop;
+                continue;
+            }
+        }
+        let mut segment_flags = flags;
+        if start_stop.1 > 0.0 && (index == 0 || segment_count == 0) {
+            segment_flags |= FILL_START;
+        }
+        if index + 2 == stop_count {
+            segment_flags |= FILL_END;
+        }
+        let segment = GpuGradientInstance {
+            flags: segment_flags,
+            start_color: convert_color(start_stop.0, item.color_space()),
+            lengths_hint: [start_stop.1, end_stop.1, start_stop.2],
+            end_color: convert_color(end_stop.0, item.color_space()),
+            ..base
+        };
+        instances.push(segment);
+        segment_count += 1;
+        start_stop = end_stop;
+    }
+}
+
+impl GpuGradientInstance {
+    pub(crate) fn set_placement(
+        &mut self,
+        transform: bevy::math::Affine2,
+        clip: Option<bevy::math::Rect>,
+    ) {
+        let transform = transform.to_cols_array();
+        self.transform = [transform[0], transform[1], transform[2], transform[3]];
+        self.translation = [transform[4], transform[5]];
+        self.clip = clip_rect(clip);
+    }
+}
+
+fn clip_rect(clip: Option<bevy::math::Rect>) -> [f32; 4] {
+    clip.map_or([-f32::MAX, -f32::MAX, f32::MAX, f32::MAX], |clip| {
+        [clip.min.x, clip.min.y, clip.max.x, clip.max.y]
+    })
 }
 
 fn convert_color(color: LinearRgba, space: InterpolationColorSpace) -> [f32; 4] {
@@ -255,6 +284,7 @@ pub(crate) struct RetainedGradients {
     instances: RawBufferVec<GpuGradientInstance>,
     batches: HashMap<Entity, GradientBatch>,
     view_bind_group: Option<BindGroup>,
+    prepared_work: HashMap<Entity, (u64, u64)>,
 }
 
 impl Default for RetainedGradients {
@@ -263,6 +293,7 @@ impl Default for RetainedGradients {
             instances: RawBufferVec::new(BufferUsages::VERTEX),
             batches: HashMap::default(),
             view_bind_group: None,
+            prepared_work: HashMap::default(),
         }
     }
 }
@@ -272,8 +303,22 @@ impl RetainedGradients {
         self.batches.get(&entity).map(|batch| batch.range.clone())
     }
 
-    pub(crate) fn item_count(&self, entity: Entity) -> Option<u32> {
-        self.batches.get(&entity).map(|batch| batch.items)
+    pub(crate) fn counts(&self, entity: Entity) -> Option<(u32, usize)> {
+        self.batches
+            .get(&entity)
+            .map(|batch| (batch.items, batch.range.len()))
+    }
+
+    pub(crate) fn prepared_work(&self, camera: Entity) -> (u64, u64) {
+        self.prepared_work.get(&camera).copied().unwrap_or_default()
+    }
+
+    pub(crate) fn direct_ready(&self, entity: Entity) -> bool {
+        self.batches
+            .get(&entity)
+            .is_some_and(|batch| !batch.range.is_empty())
+            && self.instances.buffer().is_some()
+            && self.view_bind_group.is_some()
     }
 }
 
@@ -289,6 +334,7 @@ pub(crate) struct GradientPipelineKey {
     target_format: bevy::render::render_resource::TextureFormat,
     color_space: InterpolationColorSpace,
     anti_alias: bool,
+    full_rebuild: bool,
 }
 
 impl SpecializedRenderPipeline for GradientPipeline {
@@ -309,6 +355,7 @@ impl SpecializedRenderPipeline for GradientPipeline {
                 VertexFormat::Float32x4,
                 VertexFormat::Float32x3,
                 VertexFormat::Float32x4,
+                VertexFormat::Float32x4,
             ],
         );
         let color_space = match key.color_space {
@@ -325,6 +372,9 @@ impl SpecializedRenderPipeline for GradientPipeline {
         let mut shader_defs = vec![color_space.into()];
         if key.anti_alias {
             shader_defs.push("ANTI_ALIAS".into());
+        }
+        if key.full_rebuild {
+            shader_defs.push("FULL_REBUILD".into());
         }
         RenderPipelineDescriptor {
             vertex: VertexState {
@@ -343,7 +393,11 @@ impl SpecializedRenderPipeline for GradientPipeline {
                 })],
                 ..Default::default()
             }),
-            layout: vec![self.view_layout.clone(), self.mask_layout.clone()],
+            layout: if key.full_rebuild {
+                vec![self.view_layout.clone()]
+            } else {
+                vec![self.view_layout.clone(), self.mask_layout.clone()]
+            },
             label: Some("retained_ui_gradient_pipeline".into()),
             ..Default::default()
         }
@@ -370,6 +424,7 @@ pub(crate) fn queue(
     camera_views: bevy::ecs::system::Query<&ExtractedView>,
     cache: Res<PipelineCache>,
     draws: Res<DrawFunctions<TransparentUi>>,
+    full_rebuilds: Res<RetainedFullRebuilds>,
 ) {
     let draw_function = draws.read().id::<DrawRetainedGradients>();
     for (index, run) in runs.runs.iter().enumerate() {
@@ -391,6 +446,7 @@ pub(crate) fn queue(
                     target_format: view.target_format,
                     color_space: run.color_space,
                     anti_alias: matches!(anti_alias, None | Some(UiAntiAlias::On)),
+                    full_rebuild: full_rebuilds.0.contains(&run.camera),
                 },
             ),
             entity: (run.render_entity, run.main_entity),
@@ -404,7 +460,7 @@ pub(crate) fn queue(
 }
 
 pub(crate) fn prepare(
-    runs: Res<RetainedGradientRuns>,
+    mut runs: ResMut<RetainedGradientRuns>,
     mut gradients: ResMut<RetainedGradients>,
     uniforms: Res<ViewUniforms>,
     pipeline: Res<GradientPipeline>,
@@ -414,16 +470,21 @@ pub(crate) fn prepare(
 ) {
     gradients.instances.clear();
     gradients.batches.clear();
+    gradients.prepared_work.clear();
+    core::mem::swap(gradients.instances.values_mut(), &mut runs.instances);
     for run in &runs.runs {
-        let start = gradients.instances.len() as u32;
-        for &instance in &runs.instances[run.instances.clone()] {
-            gradients.instances.push(instance);
-        }
-        let end = gradients.instances.len() as u32;
+        let quads =
+            u64::try_from(run.instances.len()).expect("retained gradient count exceeds u64");
+        let work = gradients.prepared_work.entry(run.camera).or_default();
+        work.0 += u64::from(run.items);
+        work.1 += quads;
         gradients.batches.insert(
             run.render_entity,
             GradientBatch {
-                range: start..end,
+                range: u32::try_from(run.instances.start)
+                    .expect("retained gradient count exceeds u32")
+                    ..u32::try_from(run.instances.end)
+                        .expect("retained gradient count exceeds u32"),
                 items: run.items,
             },
         );

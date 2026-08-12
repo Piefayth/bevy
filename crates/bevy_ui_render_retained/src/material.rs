@@ -599,6 +599,7 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
                 clip,
                 image: AssetId::<Image>::default(),
                 transform,
+                layout_translation: Vec2::ZERO,
                 local_translation: Vec2::ZERO,
                 item: RetainedDrawItem::Material(RetainedMaterialItem::new(
                     handle.id(),

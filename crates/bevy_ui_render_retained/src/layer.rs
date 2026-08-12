@@ -1,14 +1,14 @@
 //! Persistent UI layer and composition.
 
-use crate::background::extract_retained_backgrounds;
-use crate::border::extract_retained_borders;
+use crate::background::{extract_retained_backgrounds, PendingRetainedBackgrounds};
+use crate::border::{extract_retained_borders, RetainedBorderDependencies};
 use crate::boundary::{
     extract_boundaries, invalidate_volatile_paint_targets, prepare_boundary_views,
     propagate_boundary_damage, BoundaryViews,
 };
 use crate::core::{
     prepare_retained_core, queue_retained_core, register_retained_core, DrawRetainedCore,
-    RetainedCore,
+    DrawRetainedCoreRebuild, RetainedCore,
 };
 use crate::gradient::{extract_retained_gradients, RetainedGradientDependencies};
 use crate::gradient_render::{
@@ -22,9 +22,10 @@ use crate::sampled_image::{
     RetainedUiImageWrites,
 };
 use crate::scene::{
-    cleanup_retained_ui, extract_boundary_ownership, extract_retained_placements,
-    replay_retained_ui, RetainedItems, RetainedMaterialReplays, RetainedRepairPlans,
-    RetainedUiPaintCounters, RetainedUiScene,
+    apply_retained_paints, cleanup_retained_ui, extract_boundary_ownership,
+    extract_retained_placements, replay_retained_ui, PendingGradientPaints, PendingImagePaints,
+    PendingShadowPaints, PendingViewportPaints, RetainedFullRebuilds, RetainedItems,
+    RetainedMaterialReplays, RetainedRepairPlans, RetainedUiPaintCounters, RetainedUiScene,
 };
 use crate::shadow::{extract_retained_shadows, RetainedShadowDependencies};
 use crate::shadow_render::{
@@ -37,17 +38,16 @@ use crate::{PhysicalRect, RepairPlan};
 use alloc::collections::VecDeque;
 use bevy::{
     asset::{embedded_asset, load_embedded_asset, AssetServer},
-    camera::{CameraOutputMode, ClearColor, ClearColorConfig, CompositingSpace},
     core_pipeline::{
-        blit::{BlitPipeline, BlitPipelineKey},
-        upscaling::upscaling,
-        Core2d, Core2dSystems, Core3d, Core3dSystems, FullscreenShader,
+        blit::BlitPipeline,
+        upscaling::{upscaling, ViewOutputOverlays},
+        Core2d, Core2dSystems, Core3d, Core3dSystems,
     },
     ecs::{
         entity::Entity,
         query::With,
         schedule::{IntoScheduleConfigs, ScheduleCleanupPolicy},
-        system::{Commands, Local, Query, Res, ResMut},
+        system::{Commands, Local, Query, Res, ResMut, SystemParamItem},
     },
     log::error,
     math::{FloatOrd, UVec2, Vec2},
@@ -55,24 +55,24 @@ use bevy::{
     prelude::{App, Plugin, Resource, World},
     render::{
         camera::ExtractedCamera,
-        diagnostic::RecordDiagnostics,
         render_asset::RenderAssets,
         render_phase::{
-            DrawFunctionId, DrawFunctions, PhaseItem, PhaseItemExtraIndex, ViewSortedRenderPhases,
+            AddRenderCommand, DrawFunctionId, DrawFunctions, PhaseItem, PhaseItemExtraIndex,
+            RenderCommand, RenderCommandResult, TrackedRenderPass, ViewSortedRenderPhases,
         },
         render_resource::{
             binding_types::{sampler, texture_2d},
-            BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
-            BlendState, BufferUsages, CachedRenderPipelineId, ColorTargetState, ColorWrites,
-            Extent3d, FragmentState, LoadOp, Operations, PipelineCache, RawBufferVec,
+            BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries, BlendState,
+            BufferUsages, CachedRenderPipelineId, ColorTargetState, ColorWrites, Extent3d,
+            FragmentState, LoadOp, Operations, PipelineCache, RawBufferVec,
             RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor,
             SamplerBindingType, ShaderStages, StoreOp, Texture, TextureDescriptor,
             TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
-            TextureViewDescriptor, TextureViewId, VertexAttribute, VertexState, VertexStepMode,
+            TextureViewDescriptor, VertexAttribute, VertexState, VertexStepMode,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
-        texture::{FallbackImageZero, GpuImage},
-        view::{ExtractedView, RetainedViewEntity, ViewTarget},
+        texture::GpuImage,
+        view::{ExtractedView, RetainedViewEntity},
         ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
     },
     ui_render::{
@@ -116,6 +116,11 @@ impl Plugin for RetainedUiRenderPlugin {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
+        render_app
+            .world_mut()
+            .resource_mut::<ViewOutputOverlays>()
+            .enable();
+        render_app.add_render_command::<TransparentUi, DrawRetainedBoundary>();
         register_retained_core(render_app);
         register_retained_gradients(render_app);
         register_retained_shadows(render_app);
@@ -138,6 +143,7 @@ impl Plugin for RetainedUiRenderPlugin {
             .init_resource::<RetainedUiLayerCounters>()
             .init_resource::<RetainedUiScene>()
             .init_resource::<RetainedGradientDependencies>()
+            .init_resource::<RetainedBorderDependencies>()
             .init_resource::<RetainedImageDependencies>()
             .init_resource::<RetainedMaterialReplays>()
             .init_resource::<RetainedPendingMaterials>()
@@ -147,7 +153,13 @@ impl Plugin for RetainedUiRenderPlugin {
             .init_resource::<RetainedTextDependencies>()
             .init_resource::<RetainedViewportDependencies>()
             .init_resource::<RetainedItems>()
+            .init_resource::<PendingRetainedBackgrounds>()
+            .init_resource::<PendingGradientPaints>()
+            .init_resource::<PendingImagePaints>()
+            .init_resource::<PendingShadowPaints>()
+            .init_resource::<PendingViewportPaints>()
             .init_resource::<RetainedRepairPlans>()
+            .init_resource::<RetainedFullRebuilds>()
             .init_resource::<RetainedUiPaintCounters>()
             .init_resource::<LayerRects>()
             .init_resource::<BoundaryBatches>()
@@ -164,14 +176,11 @@ impl Plugin for RetainedUiRenderPlugin {
                 extract_retained_viewports
                     .in_set(RenderUiSystems::ExtractViewportNodes)
                     .before(extract_retained_images)
-                    .before(extract_retained_text)
-                    .before(replay_retained_ui),
+                    .before(extract_retained_text),
             )
             .add_systems(
                 ExtractSchedule,
-                extract_retained_shadows
-                    .in_set(RenderUiSystems::ExtractBoxShadows)
-                    .before(replay_retained_ui),
+                extract_retained_shadows.in_set(RenderUiSystems::ExtractBoxShadows),
             )
             .add_systems(
                 ExtractSchedule,
@@ -179,9 +188,7 @@ impl Plugin for RetainedUiRenderPlugin {
             )
             .add_systems(
                 ExtractSchedule,
-                extract_retained_gradients
-                    .in_set(RenderUiSystems::ExtractGradient)
-                    .before(replay_retained_ui),
+                extract_retained_gradients.in_set(RenderUiSystems::ExtractGradient),
             )
             .add_systems(
                 ExtractSchedule,
@@ -206,6 +213,7 @@ impl Plugin for RetainedUiRenderPlugin {
                     .before(extract_retained_placements)
                     .before(RenderUiSystems::ExtractBoxShadows)
                     .before(RenderUiSystems::ExtractBackgrounds)
+                    .before(RenderUiSystems::ExtractBorders)
                     .before(extract_retained_viewports)
                     .before(extract_retained_gradients),
             )
@@ -214,6 +222,7 @@ impl Plugin for RetainedUiRenderPlugin {
                 extract_retained_placements
                     .before(RenderUiSystems::ExtractBoxShadows)
                     .before(RenderUiSystems::ExtractBackgrounds)
+                    .before(RenderUiSystems::ExtractBorders)
                     .before(extract_retained_viewports)
                     .before(extract_retained_gradients),
             )
@@ -221,9 +230,10 @@ impl Plugin for RetainedUiRenderPlugin {
                 ExtractSchedule,
                 invalidate_volatile_paint_targets
                     .after(RenderUiSystems::ExtractDebug)
+                    .after(RenderUiSystems::ExtractBackgrounds)
+                    .after(extract_boundaries)
                     .before(propagate_boundary_damage)
-                    .before(prepare_boundary_views)
-                    .before(replay_retained_ui),
+                    .before(prepare_boundary_views),
             )
             .add_systems(
                 ExtractSchedule,
@@ -231,34 +241,46 @@ impl Plugin for RetainedUiRenderPlugin {
                     .after(RenderUiSystems::ExtractDebug)
                     .after(extract_retained_gradients)
                     .after(extract_retained_viewports)
-                    .after(propagate_boundary_damage)
-                    .before(replay_retained_ui),
+                    .after(propagate_boundary_damage),
             )
             .add_systems(
                 ExtractSchedule,
                 propagate_boundary_damage
                     .after(RenderUiSystems::ExtractDebug)
                     .after(extract_retained_gradients)
+                    .after(extract_retained_viewports),
+            )
+            .add_systems(
+                ExtractSchedule,
+                apply_retained_paints
+                    .after(RenderUiSystems::ExtractBoxShadows)
+                    .after(RenderUiSystems::ExtractBackgrounds)
+                    .after(RenderUiSystems::ExtractImages)
+                    .after(RenderUiSystems::ExtractBorders)
+                    .after(RenderUiSystems::ExtractText)
+                    .after(RenderUiSystems::ExtractDebug)
+                    .after(extract_retained_gradients)
                     .after(extract_retained_viewports)
+                    .before(propagate_boundary_damage)
+                    .before(prepare_boundary_views)
                     .before(replay_retained_ui),
             )
             .add_systems(
                 ExtractSchedule,
-                replay_retained_ui.after(RenderUiSystems::ExtractDebug),
+                replay_retained_ui
+                    .after(prepare_boundary_views)
+                    .after(propagate_boundary_damage),
             )
             .add_systems(
                 Render,
                 (
                     cleanup_retained_ui,
+                    resolve_ready_sampled_images,
                     cleanup_layer_surfaces,
                     clear_layer_rects,
                 )
                     .chain()
                     .in_set(RenderSystems::PrepareResources),
-            )
-            .add_systems(
-                Render,
-                resolve_ready_sampled_images.in_set(RenderSystems::PrepareResources),
             )
             .add_systems(Render, queue_retained_core.in_set(RenderSystems::Queue))
             .add_systems(Render, queue_boundaries.in_set(RenderSystems::Queue))
@@ -284,29 +306,21 @@ impl Plugin for RetainedUiRenderPlugin {
                 Render,
                 prepare_retained_shadows.in_set(RenderSystems::PrepareBindGroups),
             )
-            .add_systems(
-                RenderStartup,
-                (clear_final_pipelines, init_retained_ui_pipelines).chain(),
-            )
-            .add_systems(
-                Render,
-                prepare_final_pipelines
-                    .in_set(RenderSystems::Prepare)
-                    .ambiguous_with_all(),
-            );
-
-        let removed_2d = render_app
-            .remove_systems_in_set(Core2d, upscaling, ScheduleCleanupPolicy::RemoveSystemsOnly)
-            .expect("Core2dPlugin must be added before RetainedUiRenderPlugin");
-        assert_eq!(removed_2d, 1, "Core2d must contain one final writer");
-        let removed_3d = render_app
-            .remove_systems_in_set(Core3d, upscaling, ScheduleCleanupPolicy::RemoveSystemsOnly)
-            .expect("Core3dPlugin must be added before RetainedUiRenderPlugin");
-        assert_eq!(removed_3d, 1, "Core3d must contain one final writer");
+            .add_systems(RenderStartup, init_retained_ui_pipelines);
 
         render_app
-            .add_systems(Core2d, retained_ui_pass.after(Core2dSystems::PostProcess))
-            .add_systems(Core3d, retained_ui_pass.after(Core3dSystems::PostProcess));
+            .add_systems(
+                Core2d,
+                retained_ui_pass
+                    .after(Core2dSystems::PostProcess)
+                    .before(upscaling),
+            )
+            .add_systems(
+                Core3d,
+                retained_ui_pass
+                    .after(Core3dSystems::PostProcess)
+                    .before(upscaling),
+            );
     }
 }
 
@@ -365,9 +379,7 @@ struct RetainedUiPipelines {
     final_layout: BindGroupLayoutDescriptor,
     mask_layout: BindGroupLayoutDescriptor,
     shader: bevy::asset::Handle<bevy::shader::Shader>,
-    vertex: VertexState,
     rect_vertex: VertexState,
-    final_pipelines: Mutex<HashMap<(BlitPipelineKey, bool), CachedRenderPipelineId>>,
     wipe_pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
     copy_pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
     mask_pipeline: Mutex<Option<CachedRenderPipelineId>>,
@@ -375,43 +387,6 @@ struct RetainedUiPipelines {
 }
 
 impl RetainedUiPipelines {
-    fn final_pipeline(
-        &self,
-        key: BlitPipelineKey,
-        fused: bool,
-        pipeline_cache: &PipelineCache,
-    ) -> CachedRenderPipelineId {
-        *self
-            .final_pipelines
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry((key, fused))
-            .or_insert_with(|| {
-                let mut shader_defs = Vec::new();
-                match key.source_space {
-                    Some(CompositingSpace::Srgb) => shader_defs.push("SRGB_TO_LINEAR".into()),
-                    Some(CompositingSpace::Oklab) => shader_defs.push("OKLAB_TO_LINEAR".into()),
-                    Some(CompositingSpace::Linear) | None => {}
-                }
-                pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-                    label: Some("retained_ui_final_blit_pipeline".into()),
-                    layout: vec![self.final_layout.clone()],
-                    vertex: self.vertex.clone(),
-                    fragment: Some(FragmentState {
-                        shader: self.shader.clone(),
-                        shader_defs,
-                        entry_point: Some(if fused { "final_blit" } else { "plain_blit" }.into()),
-                        targets: vec![Some(ColorTargetState {
-                            format: key.target_format,
-                            blend: key.blend_state,
-                            write_mask: ColorWrites::ALL,
-                        })],
-                    }),
-                    ..Default::default()
-                })
-            })
-    }
-
     fn wipe_pipeline(
         &self,
         format: TextureFormat,
@@ -543,11 +518,7 @@ impl RetainedUiPipelines {
     }
 }
 
-fn init_retained_ui_pipelines(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    fullscreen_shader: Res<FullscreenShader>,
-) {
+fn init_retained_ui_pipelines(mut commands: Commands, asset_server: Res<AssetServer>) {
     let shader = load_embedded_asset!(asset_server.as_ref(), "composite.wgsl");
     commands.insert_resource(RetainedUiPipelines {
         final_layout: BindGroupLayoutDescriptor::new(
@@ -563,7 +534,6 @@ fn init_retained_ui_pipelines(
         ),
         mask_layout: crate::mask::layout(),
         shader: shader.clone(),
-        vertex: fullscreen_shader.to_vertex_state(),
         rect_vertex: VertexState {
             shader,
             shader_defs: Vec::new(),
@@ -578,7 +548,6 @@ fn init_retained_ui_pipelines(
                 }],
             }],
         },
-        final_pipelines: Mutex::new(HashMap::new()),
         wipe_pipelines: Mutex::new(HashMap::new()),
         copy_pipelines: Mutex::new(HashMap::new()),
         mask_pipeline: Mutex::new(None),
@@ -628,7 +597,7 @@ fn queue_boundaries(
     render_views: Query<&UiCameraView, With<ExtractedView>>,
     camera_views: Query<&ExtractedView>,
 ) {
-    let draw_function = draw_functions.read().id::<DrawRetainedCore>();
+    let draw_function = draw_functions.read().id::<DrawRetainedBoundary>();
     let draws = items
         .boundaries
         .lock()
@@ -654,6 +623,24 @@ fn queue_boundaries(
             extra_index: PhaseItemExtraIndex::None,
             indexed: false,
         });
+    }
+}
+
+struct DrawRetainedBoundary;
+
+impl<P: PhaseItem> RenderCommand<P> for DrawRetainedBoundary {
+    type Param = ();
+    type ViewQuery = ();
+    type ItemQuery = ();
+
+    fn render<'w>(
+        _item: &P,
+        _view: (),
+        _entity: Option<()>,
+        _param: SystemParamItem<'w, '_, Self::Param>,
+        _pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        RenderCommandResult::Failure("retained boundaries require their source surface binding")
     }
 }
 
@@ -731,62 +718,6 @@ fn clear_layer_rects(layer_rects: Res<LayerRects>) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clear();
-}
-
-#[derive(bevy::prelude::Component)]
-struct RetainedFinalPipeline {
-    plain: CachedRenderPipelineId,
-    fused: CachedRenderPipelineId,
-    key: BlitPipelineKey,
-}
-
-fn clear_final_pipelines(
-    mut commands: Commands,
-    views: Query<Entity, With<RetainedFinalPipeline>>,
-) {
-    for entity in &views {
-        commands.entity(entity).remove::<RetainedFinalPipeline>();
-    }
-}
-
-fn prepare_final_pipelines(
-    mut commands: Commands,
-    mut pipeline_cache: ResMut<PipelineCache>,
-    pipeline: Res<RetainedUiPipelines>,
-    views: Query<(
-        Entity,
-        &ViewTarget,
-        Option<&ExtractedCamera>,
-        Option<&RetainedFinalPipeline>,
-    )>,
-) {
-    for (entity, view_target, camera, prepared) in &views {
-        let blend_state = camera.and_then(|camera| match camera.output_mode {
-            CameraOutputMode::Skip => None,
-            CameraOutputMode::Write { blend_state, .. } => blend_state.or_else(|| {
-                (camera.sorted_camera_index_for_target > 0).then_some(BlendState::ALPHA_BLENDING)
-            }),
-        });
-        let Some(target_format) = view_target.out_texture_view_format() else {
-            continue;
-        };
-        let key = BlitPipelineKey {
-            target_format,
-            blend_state,
-            samples: 1,
-            source_space: view_target.compositing_space,
-        };
-        if prepared.is_some_and(|prepared| prepared.key == key) {
-            continue;
-        }
-        let plain = pipeline.final_pipeline(key, false, &pipeline_cache);
-        let fused = pipeline.final_pipeline(key, true, &pipeline_cache);
-        pipeline_cache.block_on_render_pipeline(plain);
-        pipeline_cache.block_on_render_pipeline(fused);
-        commands
-            .entity(entity)
-            .insert(RetainedFinalPipeline { plain, fused, key });
-    }
 }
 
 struct LayerSlot {
@@ -937,89 +868,91 @@ fn cleanup_layer_surfaces(
         .fetch_sub(removed_bytes, Ordering::Relaxed);
 }
 
-fn phase_is_ready(
+fn phase_is_repair_ready(
     phase: &bevy::render::render_phase::SortedRenderPhase<TransparentUi>,
     pipeline_cache: &PipelineCache,
     world: &World,
     draw_functions: RetainedDrawFunctionIds,
 ) -> bool {
-    if phase.items.is_empty() {
-        return false;
-    }
     let items = world
         .resource::<RetainedItems>()
         .items
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let boundaries = world.resource::<BoundaryBatches>();
     let sampled_images = world.resource::<RetainedSampledImages>().lock();
     let gpu_images = world.resource::<RenderAssets<GpuImage>>();
-    let image_unavailable = |entity| {
+    let core = world.resource::<RetainedCore>();
+    let gradients = world.resource::<RetainedGradients>();
+    let shadows = world.resource::<RetainedShadows>();
+    let batch_may_be_omitted = |entity| {
+        let Some(metadata) = items.get(&entity) else {
+            return false;
+        };
         let mut unavailable = false;
-        if let Some(metadata) = items.get(&entity) {
-            for image in &metadata.sampled_images {
-                if gpu_images.get(*image).is_some() {
-                    continue;
-                }
-                if sampled_images.is_pending(*image) {
-                    return None;
-                }
-                unavailable = true;
-            }
-        }
-        Some(unavailable)
-    };
-    for index in 0..phase.items.len() {
-        let item = phase.items.get_index(index).unwrap().1;
-        if boundaries.batches.contains_key(&item.entity()) {
-            if pipeline_cache.get_render_pipeline(item.pipeline).is_none() {
-                return false;
-            }
-            continue;
-        }
-        if item.draw_function == draw_functions.core {
-            if item_batch_range(world, item, draw_functions).is_none() {
-                let Some(unavailable_image) = image_unavailable(item.entity()) else {
-                    return false;
-                };
-                if unavailable_image {
-                    continue;
-                }
-                return false;
-            }
-            if pipeline_cache.get_render_pipeline(item.pipeline).is_none() {
-                return false;
-            }
-            continue;
-        }
-        if item_batch_range(world, item, draw_functions).is_none() {
-            let Some(unavailable_image) = image_unavailable(item.entity()) else {
-                return false;
-            };
-            if unavailable_image {
+        for &image in &metadata.sampled_images {
+            if gpu_images.get(image).is_some() {
                 continue;
             }
-            return false;
+            if sampled_images.is_pending(image) {
+                return false;
+            }
+            unavailable = true;
         }
-        if pipeline_cache.get_render_pipeline(item.pipeline).is_none() {
-            return false;
-        }
-    }
-    true
+        unavailable
+    };
+
+    (0..phase.items.len()).all(|index| {
+        let item = phase.items.get_index(index).unwrap().1;
+        let boundary = item.draw_function == draw_functions.boundary;
+        let core_image = draw_functions
+            .is_core(item.draw_function)
+            .then(|| core.image(item.entity()))
+            .flatten();
+        let prepared = if boundary {
+            world
+                .resource::<BoundaryBatches>()
+                .batches
+                .contains_key(&item.entity())
+        } else if draw_functions.is_core(item.draw_function) {
+            core.direct_ready(item.entity())
+                && core_image.is_none_or(|image| !sampled_images.is_pending(image))
+        } else if item.draw_function == draw_functions.retained_gradient {
+            gradients.direct_ready(item.entity())
+        } else if item.draw_function == draw_functions.retained_shadow {
+            shadows.direct_ready(item.entity())
+        } else {
+            item_batch_range(world, item, draw_functions).is_some()
+        };
+        let omitted = core_image.map_or_else(
+            || batch_may_be_omitted(item.entity()),
+            |image| gpu_images.get(image).is_none() && !sampled_images.is_pending(image),
+        );
+        (prepared || omitted) && pipeline_cache.get_render_pipeline(item.pipeline).is_some()
+    })
 }
 
 #[derive(Clone, Copy)]
 struct RetainedDrawFunctionIds {
+    boundary: DrawFunctionId,
     core: DrawFunctionId,
+    core_rebuild: DrawFunctionId,
     retained_gradient: DrawFunctionId,
     retained_shadow: DrawFunctionId,
     texture_slice: DrawFunctionId,
 }
 
+impl RetainedDrawFunctionIds {
+    fn is_core(self, draw: DrawFunctionId) -> bool {
+        draw == self.core || draw == self.core_rebuild
+    }
+}
+
 fn retained_draw_function_ids(world: &World) -> RetainedDrawFunctionIds {
     let draw_functions = world.resource::<DrawFunctions<TransparentUi>>().read();
     RetainedDrawFunctionIds {
+        boundary: draw_functions.id::<DrawRetainedBoundary>(),
         core: draw_functions.id::<DrawRetainedCore>(),
+        core_rebuild: draw_functions.id::<DrawRetainedCoreRebuild>(),
         retained_gradient: draw_functions.id::<DrawRetainedGradients>(),
         retained_shadow: draw_functions.id::<DrawRetainedShadows>(),
         texture_slice: draw_functions.id::<DrawUiTextureSliceItem>(),
@@ -1037,7 +970,7 @@ fn item_batch_range(
         .get(&item.entity())
     {
         Some(batch.range.clone())
-    } else if item.draw_function == draw_functions.core {
+    } else if draw_functions.is_core(item.draw_function) {
         world.resource::<RetainedCore>().batch_range(item.entity())
     } else if item.draw_function == draw_functions.retained_shadow {
         world
@@ -1058,70 +991,71 @@ fn item_batch_range(
     }
 }
 
-fn prepared_quad_count(
+fn prepared_counts(
     world: &World,
     item: &TransparentUi,
     draw_functions: RetainedDrawFunctionIds,
-) -> u64 {
+) -> (u64, u64) {
     if world
         .resource::<BoundaryBatches>()
         .batches
         .contains_key(&item.entity())
     {
-        return 1;
+        return (1, 1);
     }
-    if item.draw_function == draw_functions.core {
+    if draw_functions.is_core(item.draw_function) {
         return world
             .resource::<RetainedCore>()
-            .batch_range(item.entity())
-            .map(|range| u64::try_from(range.len()).expect("prepared UI quad count exceeds u64"))
+            .counts(item.entity())
+            .map(|(items, quads)| {
+                (
+                    u64::from(items),
+                    u64::try_from(quads).expect("prepared UI quad count exceeds u64"),
+                )
+            })
             .unwrap_or_default();
     }
     if item.draw_function == draw_functions.retained_shadow {
         return world
             .resource::<RetainedShadows>()
-            .batch_range(item.entity())
-            .map(|range| u64::try_from(range.len()).expect("prepared shadow count exceeds u64"))
+            .counts(item.entity())
+            .map(|(items, quads)| {
+                (
+                    u64::from(items),
+                    u64::try_from(quads).expect("prepared shadow count exceeds u64"),
+                )
+            })
             .unwrap_or_default();
     }
     if item.draw_function == draw_functions.retained_gradient {
         return world
             .resource::<RetainedGradients>()
-            .batch_range(item.entity())
-            .map(|range| u64::try_from(range.len()).expect("prepared gradient count exceeds u64"))
+            .counts(item.entity())
+            .map(|(items, quads)| {
+                (
+                    u64::from(items),
+                    u64::try_from(quads).expect("prepared gradient count exceeds u64"),
+                )
+            })
             .unwrap_or_default();
     }
     let indices = item_batch_range(world, item, draw_functions)
         .map(|range| range.len())
         .unwrap_or_default();
-    u64::try_from(indices / 6).expect("prepared UI quad count exceeds u64")
+    (
+        u64::from(indices != 0),
+        u64::try_from(indices / 6).expect("prepared UI quad count exceeds u64"),
+    )
 }
 
-fn prepared_item_count(
-    world: &World,
-    item: &TransparentUi,
-    draw_functions: RetainedDrawFunctionIds,
-) -> u64 {
-    let count = if world
-        .resource::<BoundaryBatches>()
-        .batches
-        .contains_key(&item.entity())
-    {
-        Some(1)
-    } else if item.draw_function == draw_functions.core {
-        world.resource::<RetainedCore>().item_count(item.entity())
-    } else if item.draw_function == draw_functions.retained_shadow {
-        world
-            .resource::<RetainedShadows>()
-            .item_count(item.entity())
-    } else if item.draw_function == draw_functions.retained_gradient {
-        world
-            .resource::<RetainedGradients>()
-            .item_count(item.entity())
-    } else {
-        Some(1)
-    };
-    u64::from(count.unwrap_or_default())
+fn prepared_masked_counts(world: &World, camera: Entity) -> (u64, u64) {
+    [
+        world.resource::<RetainedCore>().prepared_work(camera),
+        world.resource::<RetainedGradients>().prepared_work(camera),
+        world.resource::<RetainedShadows>().prepared_work(camera),
+    ]
+    .into_iter()
+    .fold((0, 0), |sum, work| (sum.0 + work.0, sum.1 + work.1))
 }
 
 fn target_rect(size: UVec2) -> PhysicalRect {
@@ -1218,97 +1152,6 @@ fn phase_has_drawable_items(
     })
 }
 
-#[derive(Default)]
-struct FinalBindGroupCache {
-    cached: Option<(TextureViewId, TextureViewId, BindGroup)>,
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the final writer preserves Bevy's independent camera output inputs"
-)]
-fn final_blit(
-    target: &ViewTarget,
-    camera: &ExtractedCamera,
-    prepared: &RetainedFinalPipeline,
-    ui_view: &TextureView,
-    has_ui: bool,
-    pipeline: &RetainedUiPipelines,
-    pipeline_cache: &PipelineCache,
-    blit_pipeline: &BlitPipeline,
-    global_clear_color: &ClearColor,
-    cache: &mut FinalBindGroupCache,
-    ctx: &mut RenderContext,
-) -> bool {
-    let clear_config = match camera.output_mode {
-        CameraOutputMode::Write { clear_color, .. } => clear_color,
-        CameraOutputMode::Skip => return false,
-    };
-    let clear_color = match clear_config {
-        ClearColorConfig::Default => Some(global_clear_color.0),
-        ClearColorConfig::Custom(color) => Some(color),
-        ClearColorConfig::None => None,
-    };
-    let main_view = target.main_texture_view();
-    let bind_group = match &mut cache.cached {
-        Some((main_id, ui_id, bind_group))
-            if *main_id == main_view.id() && *ui_id == ui_view.id() =>
-        {
-            bind_group
-        }
-        cached => {
-            let bind_group = ctx.render_device().create_bind_group(
-                "retained_ui_final_blit_bind_group",
-                &pipeline_cache.get_bind_group_layout(&pipeline.final_layout),
-                &BindGroupEntries::sequential((ui_view, main_view, &blit_pipeline.sampler)),
-            );
-            let (_, _, bind_group) = cached.insert((main_view.id(), ui_view.id(), bind_group));
-            bind_group
-        }
-    };
-    let Some(attachment) = target.out_texture_color_attachment(clear_color.map(Into::into)) else {
-        return false;
-    };
-    let pass_descriptor = RenderPassDescriptor {
-        label: Some("retained_ui_final_blit"),
-        color_attachments: &[Some(attachment)],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    };
-    let pipeline_id = if has_ui {
-        prepared.fused
-    } else {
-        prepared.plain
-    };
-    let Some(render_pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
-        #[cfg(target_os = "macos")]
-        ctx.command_encoder().begin_render_pass(&pass_descriptor);
-        return false;
-    };
-
-    let diagnostics = ctx.diagnostic_recorder();
-    let diagnostics = diagnostics.as_deref();
-    let time_span = diagnostics.time_span(ctx.command_encoder(), "retained_ui_final_blit");
-    {
-        let mut pass = ctx.command_encoder().begin_render_pass(&pass_descriptor);
-        if let Some(viewport) = &camera.viewport {
-            pass.set_scissor_rect(
-                viewport.physical_position.x,
-                viewport.physical_position.y,
-                viewport.physical_size.x,
-                viewport.physical_size.y,
-            );
-        }
-        pass.set_pipeline(render_pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.draw(0..3, 0..1);
-    }
-    time_span.end(ctx.command_encoder());
-    true
-}
-
 #[derive(Clone, Copy)]
 struct SurfaceRequest {
     view_entity: Entity,
@@ -1331,6 +1174,42 @@ struct RepairResources<'a> {
     boundary_views: &'a BoundaryViews,
 }
 
+fn surface_for_request<'a>(
+    request: SurfaceRequest,
+    counters: &RetainedUiLayerCounters,
+    surfaces: &'a mut HashMap<RetainedViewEntity, LayerSurface>,
+    device: &RenderDevice,
+) -> &'a mut LayerSurface {
+    let surface = surfaces
+        .entry(request.retained_view_entity)
+        .or_insert_with(|| {
+            counters.surfaces_created.fetch_add(1, Ordering::Relaxed);
+            let surface = LayerSurface::new(device, request.size, request.format);
+            counters
+                .surface_bytes
+                .fetch_add(surface.payload_bytes(), Ordering::Relaxed);
+            surface
+        });
+    if surface.matches(request.size, request.format) {
+        return surface;
+    }
+
+    let previous_bytes = surface.payload_bytes();
+    *surface = LayerSurface::new(device, request.size, request.format);
+    counters.surfaces_created.fetch_add(1, Ordering::Relaxed);
+    let current_bytes = surface.payload_bytes();
+    if current_bytes >= previous_bytes {
+        counters
+            .surface_bytes
+            .fetch_add(current_bytes - previous_bytes, Ordering::Relaxed);
+    } else {
+        counters
+            .surface_bytes
+            .fetch_sub(previous_bytes - current_bytes, Ordering::Relaxed);
+    }
+    surface
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one atomic repair keeps preflight, mask, replay, and commit visibly contiguous"
@@ -1344,7 +1223,6 @@ fn repair_surface(
 ) {
     let phase = resources.phases.get(&request.retained_view_entity);
     let draw_functions = retained_draw_function_ids(world);
-    let phase_has_items = phase.is_some_and(|phase| !phase.items.is_empty());
     let scene = world.resource::<RetainedUiScene>();
     let boundary_batches = world.resource::<BoundaryBatches>();
     let existing_matches = surfaces
@@ -1371,70 +1249,44 @@ fn repair_surface(
     let material_pending = world
         .resource::<RetainedPendingMaterials>()
         .contains(request.paint_entity);
-    let boundary_sources: HashMap<_, _> = phase
-        .into_iter()
-        .flat_map(|phase| {
-            (0..phase.items.len()).map(|index| phase.items.get_index(index).unwrap().1)
-        })
-        .filter_map(|item| {
-            let batch = boundary_batches.batches.get(&item.entity())?;
-            let view = resources.boundary_views.views.get(&batch.surface)?;
-            let source = surfaces.get(&view.retained_view_entity)?;
-            source.slots[source.active]
-                .initialized
-                .then(|| (item.entity(), source.slots[source.active].view.clone()))
-        })
-        .collect();
-    let boundaries_ready = phase.into_iter().all(|phase| {
-        (0..phase.items.len()).all(|index| {
-            let item = phase.items.get_index(index).unwrap().1;
-            !boundary_batches.batches.contains_key(&item.entity())
-                || boundary_sources.contains_key(&item.entity())
-        })
-    });
+    let has_visible_records = scene.has_visible_records(request.paint_entity, request.bounds);
+    let boundary_sources: HashMap<_, _> = if boundary_batches.batches.is_empty() {
+        HashMap::default()
+    } else {
+        phase
+            .into_iter()
+            .flat_map(|phase| {
+                (0..phase.items.len()).map(|index| phase.items.get_index(index).unwrap().1)
+            })
+            .filter_map(|item| {
+                let batch = boundary_batches.batches.get(&item.entity())?;
+                let view = resources.boundary_views.views.get(&batch.surface)?;
+                let source = surfaces.get(&view.retained_view_entity)?;
+                source.slots[source.active]
+                    .initialized
+                    .then(|| (item.entity(), source.slots[source.active].view.clone()))
+            })
+            .collect()
+    };
+    let boundaries_ready = boundary_batches.batches.is_empty()
+        || phase.into_iter().all(|phase| {
+            (0..phase.items.len()).all(|index| {
+                let item = phase.items.get_index(index).unwrap().1;
+                !boundary_batches.batches.contains_key(&item.entity())
+                    || boundary_sources.contains_key(&item.entity())
+            })
+        });
     let repair_ready = boundaries_ready
         && !material_pending
-        && if phase_has_items {
+        && if has_visible_records {
             phase.is_some_and(|phase| {
-                phase_is_ready(phase, resources.pipeline_cache, world, draw_functions)
+                !phase.items.is_empty()
+                    && phase_is_repair_ready(phase, resources.pipeline_cache, world, draw_functions)
             })
         } else {
             true
         };
-    let surface = surfaces
-        .entry(request.retained_view_entity)
-        .or_insert_with(|| {
-            resources
-                .counters
-                .surfaces_created
-                .fetch_add(1, Ordering::Relaxed);
-            let surface = LayerSurface::new(ctx.render_device(), request.size, request.format);
-            resources
-                .counters
-                .surface_bytes
-                .fetch_add(surface.payload_bytes(), Ordering::Relaxed);
-            surface
-        });
-    if !surface.matches(request.size, request.format) {
-        let previous_bytes = surface.payload_bytes();
-        *surface = LayerSurface::new(ctx.render_device(), request.size, request.format);
-        resources
-            .counters
-            .surfaces_created
-            .fetch_add(1, Ordering::Relaxed);
-        let current_bytes = surface.payload_bytes();
-        if current_bytes >= previous_bytes {
-            resources
-                .counters
-                .surface_bytes
-                .fetch_add(current_bytes - previous_bytes, Ordering::Relaxed);
-        } else {
-            resources
-                .counters
-                .surface_bytes
-                .fetch_sub(previous_bytes - current_bytes, Ordering::Relaxed);
-        }
-    }
+    let surface = surface_for_request(request, resources.counters, surfaces, ctx.render_device());
 
     let repair_pipelines = repair_ready
         .then(|| {
@@ -1586,6 +1438,7 @@ fn repair_surface(
     pass.draw(0..6, damage_range);
 
     if let Some(phase) = phase.filter(|phase| !phase.items.is_empty()) {
+        (replayed, replayed_quads) = prepared_masked_counts(world, request.paint_entity);
         let mut full_run_start = None;
         for index in 0..=phase.items.len() {
             let phase_item =
@@ -1613,11 +1466,6 @@ fn repair_surface(
                 let run = start..index;
                 pass.set_scissor_rect(0, 0, request.size.x, request.size.y);
                 pass.set_bind_group(1, &mask_bind_group, &[]);
-                for index in run.clone() {
-                    let item = phase.items.get_index(index).unwrap().1;
-                    replayed += prepared_item_count(world, item, draw_functions);
-                    replayed_quads += prepared_quad_count(world, item, draw_functions);
-                }
                 if let Err(err) = phase.render_range(&mut pass, world, request.view_entity, run) {
                     result = Err(err);
                     break;
@@ -1643,7 +1491,7 @@ fn repair_surface(
                     (local.max_y() - local.min_y()) as u32,
                 );
                 replayed += 1;
-                replayed_quads += prepared_quad_count(world, item, draw_functions);
+                replayed_quads += prepared_counts(world, item, draw_functions).1;
                 if let Some(batch) = boundary_batches.batches.get(&item.entity()) {
                     let pipeline = resources
                         .pipeline_cache
@@ -1699,65 +1547,123 @@ fn repair_surface(
     }
 }
 
+fn rebuild_surface(
+    world: &World,
+    request: SurfaceRequest,
+    resources: &RepairResources<'_>,
+    surfaces: &mut HashMap<RetainedViewEntity, LayerSurface>,
+    ctx: &mut RenderContext,
+) -> bool {
+    let Some(repair_plan) = resources.repair_plans.0.get(&request.paint_entity).cloned() else {
+        return false;
+    };
+    if world
+        .resource::<RetainedPendingMaterials>()
+        .contains(request.paint_entity)
+    {
+        return false;
+    }
+    let Some(phase) = resources.phases.get(&request.retained_view_entity) else {
+        return false;
+    };
+    let draw_functions = retained_draw_function_ids(world);
+    let scene = world.resource::<RetainedUiScene>();
+    if scene.has_visible_records(request.paint_entity, request.bounds)
+        && (phase.items.is_empty()
+            || !phase_is_repair_ready(phase, resources.pipeline_cache, world, draw_functions))
+    {
+        return false;
+    }
+    let surface = surface_for_request(request, resources.counters, surfaces, ctx.render_device());
+    let pending = 1 - surface.active;
+    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("retained_ui_full_rebuild"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: &surface.slots[pending].view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations {
+                load: LoadOp::Clear(Default::default()),
+                store: StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    let result = phase.render(&mut pass, world, request.view_entity);
+    drop(pass);
+    if let Err(err) = result {
+        surface.slots[pending].initialized = false;
+        surface.slots[pending].generation = 0;
+        error!("retained UI full rebuild was deferred: {err:?}");
+        return false;
+    }
+
+    let (mut items, mut quads) = prepared_masked_counts(world, request.paint_entity);
+    for index in 0..phase.items.len() {
+        let item = phase.items.get_index(index).unwrap().1;
+        if draw_functions.is_core(item.draw_function)
+            || item.draw_function == draw_functions.retained_shadow
+            || item.draw_function == draw_functions.retained_gradient
+        {
+            continue;
+        }
+        let counts = prepared_counts(world, item, draw_functions);
+        items += counts.0;
+        quads += counts.1;
+    }
+    let full = PhysicalRect::from_min_max(0, 0, request.size.x as i32, request.size.y as i32)
+        .expect("retained UI surfaces are nonempty");
+    surface.commit(pending, vec![full], true);
+    resources.counters.repairs.fetch_add(1, Ordering::Relaxed);
+    resources
+        .counters
+        .repair_pixels
+        .fetch_add(full.area(), Ordering::Relaxed);
+    resources
+        .counters
+        .items_replayed
+        .fetch_add(items, Ordering::Relaxed);
+    resources
+        .counters
+        .quads_replayed
+        .fetch_add(quads, Ordering::Relaxed);
+    scene.acknowledge(request.paint_entity, &repair_plan);
+    true
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "render pass inputs are independent resources"
 )]
 fn retained_ui_pass(
     world: &World,
-    view: ViewQuery<(
-        &UiCameraView,
-        &ViewTarget,
-        &ExtractedCamera,
-        &RetainedFinalPipeline,
-    )>,
+    view: ViewQuery<(Entity, &UiCameraView, &ExtractedCamera)>,
     ui_view_query: Query<(&ExtractedView, &UiViewTarget)>,
     transparent_render_phases: Res<ViewSortedRenderPhases<TransparentUi>>,
     pipelines: Res<RetainedUiPipelines>,
     pipeline_cache: Res<PipelineCache>,
     blit_pipeline: Res<BlitPipeline>,
-    fallback: Res<FallbackImageZero>,
-    clear_color: Res<ClearColor>,
+    overlays: Res<ViewOutputOverlays>,
     surfaces: Res<LayerSurfaces>,
     counters: Res<RetainedUiLayerCounters>,
     render_queue: Res<RenderQueue>,
     layer_rects: Res<LayerRects>,
     repair_plans: Res<RetainedRepairPlans>,
-    mut final_cache: Local<FinalBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let (ui_camera_view, target, camera, final_pipeline) = view.into_inner();
+    let (main_view_entity, ui_camera_view, camera) = view.into_inner();
+    overlays.set(main_view_entity, None);
+    if matches!(camera.output_mode, bevy::camera::CameraOutputMode::Skip) {
+        return;
+    }
     let ui_view_entity = ui_camera_view.0;
     let Ok((extracted_view, ui_view_target)) = ui_view_query.get(ui_view_entity) else {
-        let _ = final_blit(
-            target,
-            camera,
-            final_pipeline,
-            &fallback.texture_view,
-            false,
-            &pipelines,
-            &pipeline_cache,
-            &blit_pipeline,
-            &clear_color,
-            &mut final_cache,
-            &mut ctx,
-        );
         return;
     };
     let Some(size) = camera.physical_viewport_size else {
-        let _ = final_blit(
-            target,
-            camera,
-            final_pipeline,
-            &fallback.texture_view,
-            false,
-            &pipelines,
-            &pipeline_cache,
-            &blit_pipeline,
-            &clear_color,
-            &mut final_cache,
-            &mut ctx,
-        );
         return;
     };
 
@@ -1801,58 +1707,32 @@ fn retained_ui_pass(
         }
     }
 
+    let request = SurfaceRequest {
+        view_entity: ui_view_entity,
+        retained_view_entity: extracted_view.retained_view_entity,
+        paint_entity: ui_view_target.0,
+        bounds: target_rect(size),
+        size,
+        format: extracted_view.target_format,
+    };
     let mut surfaces = surfaces.0.lock().unwrap_or_else(PoisonError::into_inner);
-    repair_surface(
-        world,
-        SurfaceRequest {
-            view_entity: ui_view_entity,
-            retained_view_entity: extracted_view.retained_view_entity,
-            paint_entity: ui_view_target.0,
-            bounds: target_rect(size),
-            size,
-            format: extracted_view.target_format,
-        },
-        &repair_resources,
-        &mut surfaces,
-        &mut ctx,
-    );
+    let full_rebuild = world
+        .resource::<RetainedFullRebuilds>()
+        .0
+        .contains(&request.paint_entity);
+    if full_rebuild {
+        rebuild_surface(world, request, &repair_resources, &mut surfaces, &mut ctx);
+    } else {
+        repair_surface(world, request, &repair_resources, &mut surfaces, &mut ctx);
+    }
     let Some(surface) = surfaces.get(&extracted_view.retained_view_entity) else {
-        drop(surfaces);
-        let _ = final_blit(
-            target,
-            camera,
-            final_pipeline,
-            &fallback.texture_view,
-            false,
-            &pipelines,
-            &pipeline_cache,
-            &blit_pipeline,
-            &clear_color,
-            &mut final_cache,
-            &mut ctx,
-        );
         return;
     };
-    let has_content = surface.has_content;
-    let ui_view = if has_content {
-        &surface.slots[surface.active].view
-    } else {
-        &fallback.texture_view
-    };
-    let final_blit_encoded = final_blit(
-        target,
-        camera,
-        final_pipeline,
-        ui_view,
-        has_content,
-        &pipelines,
-        &pipeline_cache,
-        &blit_pipeline,
-        &clear_color,
-        &mut final_cache,
-        &mut ctx,
-    );
-    if has_content && final_blit_encoded {
+    if surface.has_content {
+        overlays.set(
+            main_view_entity,
+            Some(surface.slots[surface.active].view.clone()),
+        );
         counters.composites.fetch_add(1, Ordering::Relaxed);
         counters
             .ui_sample_pixels

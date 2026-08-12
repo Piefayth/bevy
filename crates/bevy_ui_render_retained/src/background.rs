@@ -3,8 +3,8 @@
 use crate::{
     boundary::retained_clip,
     scene::{
-        coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
-        RetainedNodeItem, RetainedUiScene,
+        coverage, PaintFamily, PaintId, PendingRetainedPaint, ResourceFingerprint, RetainedDraw,
+        RetainedDrawItem, RetainedNodeItem,
     },
 };
 use bevy::{
@@ -15,10 +15,11 @@ use bevy::{
         entity::Entity,
         lifecycle::RemovedComponents,
         query::{Changed, Or, With},
-        system::{Commands, Query, Res, SystemParam},
+        system::{Query, ResMut, SystemParam},
     },
     image::Image,
     math::{Rect, Vec2},
+    render::sync_world::MainEntity,
     render::Extract,
     sprite::BorderRect,
     ui::{
@@ -28,6 +29,63 @@ use bevy::{
     ui_render::{stack_z_offsets, NodeType, UiCameraMap},
 };
 
+struct PendingBackground {
+    id: PaintId,
+    camera: Entity,
+    main_entity: MainEntity,
+    z_order: f32,
+    clip: Option<Rect>,
+    transform: bevy::math::Affine2,
+    item: RetainedNodeItem,
+    painted: bool,
+}
+
+#[derive(bevy::prelude::Resource, Default)]
+pub(crate) struct PendingRetainedBackgrounds {
+    upserts: Vec<PendingBackground>,
+    removals: Vec<PaintId>,
+}
+
+impl PendingBackground {
+    fn into_retained(self) -> PendingRetainedPaint {
+        let coverage = self
+            .painted
+            .then(|| coverage(self.item.rect.size(), self.transform, self.clip))
+            .flatten()
+            .into_iter()
+            .collect();
+        PendingRetainedPaint {
+            id: self.id,
+            camera: self.camera,
+            draw: RetainedDraw {
+                render_entity: Entity::PLACEHOLDER,
+                camera: self.camera,
+                main_entity: self.main_entity,
+                z_order: self.z_order,
+                paint_order: 0,
+                clip: self.clip,
+                image: bevy::asset::AssetId::<Image>::default(),
+                transform: self.transform,
+                layout_translation: Vec2::ZERO,
+                local_translation: Vec2::ZERO,
+                item: RetainedDrawItem::Node(self.item),
+            },
+            resource: ResourceFingerprint::None,
+            coverage,
+            painted: self.painted,
+        }
+    }
+}
+
+impl PendingRetainedBackgrounds {
+    pub(crate) fn removals(&mut self) -> impl Iterator<Item = PaintId> + '_ {
+        self.removals.drain(..)
+    }
+
+    pub(crate) fn upserts(&mut self) -> impl Iterator<Item = PendingRetainedPaint> + '_ {
+        self.upserts.drain(..).map(PendingBackground::into_retained)
+    }
+}
 type BackgroundQueryItem<'a> = (
     Entity,
     &'a ComputedNode,
@@ -55,9 +113,7 @@ pub(crate) struct RemovedBackgroundInputs<'w, 's> {
 }
 
 pub(crate) fn extract_retained_backgrounds(
-    mut commands: Commands,
-    state: Res<RetainedUiScene>,
-    structural_changed: Extract<
+    changed: Extract<
         Query<
             BackgroundQueryItem<'static>,
             (
@@ -68,20 +124,18 @@ pub(crate) fn extract_retained_backgrounds(
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
-                    Changed<Node>,
                     Changed<ComputedUiRenderTargetInfo>,
+                    Changed<BackgroundColor>,
+                    Changed<OuterColor>,
                 )>,
             ),
         >,
     >,
-    changed_backgrounds: Extract<Query<(Entity, &BackgroundColor), Changed<BackgroundColor>>>,
-    changed_outers: Extract<Query<(Entity, &OuterColor), Changed<OuterColor>>>,
     all: Extract<Query<BackgroundQueryItem<'static>, With<BackgroundColor>>>,
     camera_map: Extract<UiCameraMap>,
     mut removed: Extract<RemovedBackgroundInputs>,
+    mut pending: ResMut<PendingRetainedBackgrounds>,
 ) {
-    let mut surfaces = state.lock();
-
     let RemovedBackgroundInputs {
         background,
         outer,
@@ -94,6 +148,12 @@ pub(crate) fn extract_retained_backgrounds(
         camera,
     } = &mut *removed;
 
+    let mut camera_mapper = camera_map.get_mapper();
+    let PendingRetainedBackgrounds {
+        upserts: staged,
+        removals,
+    } = &mut *pending;
+    staged.reserve(changed.iter().size_hint().0);
     for entity in background
         .read()
         .chain(computed_node.read())
@@ -103,43 +163,14 @@ pub(crate) fn extract_retained_backgrounds(
         .chain(visibility.read())
         .chain(camera.read())
     {
-        surfaces.remove(&mut commands, background_id(entity, 0));
-        surfaces.remove(&mut commands, background_id(entity, 1));
+        removals.push(background_id(entity, 0));
+        removals.push(background_id(entity, 1));
     }
-
     for entity in outer.read() {
-        surfaces.remove(&mut commands, background_id(entity, 1));
+        removals.push(background_id(entity, 1));
     }
 
-    let mut extra_candidates = bevy::platform::collections::HashSet::<Entity>::default();
-    for (entity, background) in changed_backgrounds.iter() {
-        if structural_changed.contains(entity) {
-            continue;
-        }
-        let id = background_id(entity, 0);
-        if background.is_fully_transparent() {
-            surfaces.remove(&mut commands, id);
-        } else if !surfaces.retint_owned_node(id, background.0.into()) {
-            extra_candidates.insert(entity);
-        }
-    }
-    for (entity, outer) in changed_outers.iter() {
-        if structural_changed.contains(entity) {
-            continue;
-        }
-        let id = background_id(entity, 1);
-        if outer.is_fully_transparent() {
-            surfaces.remove(&mut commands, id);
-        } else if !surfaces.retint_owned_node(id, outer.0.into()) {
-            extra_candidates.insert(entity);
-        }
-    }
-
-    let mut camera_mapper = camera_map.get_mapper();
-    extra_candidates.extend(
-        clip.read()
-            .filter(|entity| !structural_changed.contains(*entity)),
-    );
+    staged.reserve(changed.iter().size_hint().0);
     for (
         entity,
         node,
@@ -151,16 +182,16 @@ pub(crate) fn extract_retained_backgrounds(
         target_camera,
         background,
         outer,
-    ) in structural_changed.iter().chain(
-        extra_candidates
-            .into_iter()
+    ) in changed.iter().chain(
+        clip.read()
+            .filter(|entity| !changed.contains(*entity))
             .filter_map(|entity| all.get(entity).ok()),
     ) {
         let fill_id = background_id(entity, 0);
         let outer_id = background_id(entity, 1);
         let Some(camera) = camera_mapper.map(target_camera) else {
-            surfaces.remove(&mut commands, fill_id);
-            surfaces.remove(&mut commands, outer_id);
+            removals.push(fill_id);
+            removals.push(outer_id);
             continue;
         };
         let clip = retained_clip(entity, node, transform, clip, owner);
@@ -181,57 +212,62 @@ pub(crate) fn extract_retained_backgrounds(
             border_radius: node.border_radius(),
             node_type: NodeType::Rect,
         };
-        let base = RetainedDraw {
-            render_entity: Entity::PLACEHOLDER,
-            camera,
-            main_entity: entity.into(),
-            z_order,
-            paint_order: 0,
-            clip,
-            image: bevy::asset::AssetId::<Image>::default(),
-            transform,
-            local_translation: Vec2::ZERO,
-            item: RetainedDrawItem::Node(base_item),
-        };
         let fill_painted = visible && !background.is_fully_transparent();
-        surfaces.upsert(
-            &mut commands,
-            fill_id,
-            camera,
-            base.clone(),
-            ResourceFingerprint::None,
-            fill_painted
-                .then(|| coverage(node.size, transform, clip))
-                .flatten()
-                .into_iter()
-                .collect(),
-            fill_painted,
-        );
-
-        if let Some(outer) = outer {
-            let outer_painted = visible && !outer.is_fully_transparent();
-            surfaces.upsert(
-                &mut commands,
+        let outer_painted = outer.is_some_and(|outer| visible && !outer.is_fully_transparent());
+        let outer_item = outer.map(|outer| RetainedNodeItem {
+            color: outer.0.into(),
+            border: BorderRect::ZERO,
+            node_type: NodeType::Inverted,
+            ..base_item
+        });
+        if let Some(outer_item) = outer_item {
+            staged.push(background_change(
                 outer_id,
                 camera,
-                RetainedDraw {
-                    item: RetainedDrawItem::Node(RetainedNodeItem {
-                        color: outer.0.into(),
-                        border: BorderRect::ZERO,
-                        node_type: NodeType::Inverted,
-                        ..base_item
-                    }),
-                    ..base
-                },
-                ResourceFingerprint::None,
-                outer_painted
-                    .then(|| coverage(node.size, transform, clip))
-                    .flatten()
-                    .into_iter()
-                    .collect(),
+                entity.into(),
+                z_order,
+                clip,
+                transform,
+                outer_item,
                 outer_painted,
-            );
+            ));
         }
+        staged.push(background_change(
+            fill_id,
+            camera,
+            entity.into(),
+            z_order,
+            clip,
+            transform,
+            base_item,
+            fill_painted,
+        ));
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a background change contains one canonical retained draw"
+)]
+fn background_change(
+    id: PaintId,
+    camera: Entity,
+    main_entity: MainEntity,
+    z_order: f32,
+    clip: Option<Rect>,
+    transform: bevy::math::Affine2,
+    item: RetainedNodeItem,
+    painted: bool,
+) -> PendingBackground {
+    PendingBackground {
+        id,
+        camera,
+        main_entity,
+        z_order,
+        clip,
+        transform,
+        item,
+        painted,
     }
 }
 

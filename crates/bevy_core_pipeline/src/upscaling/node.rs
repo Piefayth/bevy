@@ -1,4 +1,7 @@
-use crate::{blit::BlitPipeline, upscaling::ViewUpscalingPipeline};
+use crate::{
+    blit::BlitPipeline,
+    upscaling::{ViewOutputOverlays, ViewUpscalingPipeline},
+};
 use bevy_camera::{CameraOutputMode, ClearColor, ClearColorConfig};
 use bevy_ecs::prelude::*;
 use bevy_render::{
@@ -11,22 +14,25 @@ use bevy_render::{
 
 #[derive(Default)]
 pub struct UpscalingBindGroupCache {
-    cached: Option<(TextureViewId, BindGroup)>,
+    plain: Option<(TextureViewId, BindGroup)>,
+    overlay: Option<(TextureViewId, TextureViewId, BindGroup)>,
 }
 
 pub fn upscaling(
     view: ViewQuery<(
+        Entity,
         &ViewTarget,
         &ViewUpscalingPipeline,
         Option<&ExtractedCamera>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     blit_pipeline: Res<BlitPipeline>,
+    overlays: Res<ViewOutputOverlays>,
     clear_color_global: Res<ClearColor>,
     mut cache: Local<UpscalingBindGroupCache>,
     mut ctx: RenderContext,
 ) {
-    let (target, upscaling_target, camera) = view.into_inner();
+    let (view_entity, target, upscaling_target, camera) = view.into_inner();
 
     let clear_color = if let Some(camera) = camera {
         match camera.output_mode {
@@ -46,19 +52,43 @@ pub fn upscaling(
     // texture to be upscaled to the output texture
     let main_texture_view = target.main_texture_view();
 
-    let bind_group = match &mut cache.cached {
-        Some((id, bind_group)) if main_texture_view.id() == *id => bind_group,
-        cached => {
-            let bind_group = blit_pipeline.create_bind_group(
-                ctx.render_device(),
-                main_texture_view,
-                &pipeline_cache,
-            );
-
-            let (_, bind_group) = cached.insert((main_texture_view.id(), bind_group));
-            bind_group
-        }
-    };
+    let overlay = overlays.get(view_entity);
+    let (pipeline_id, bind_group) =
+        if let (Some(overlay), Some(pipeline_id)) = (overlay.as_ref(), upscaling_target.overlay) {
+            let bind_group = match &mut cache.overlay {
+                Some((main_id, overlay_id, bind_group))
+                    if main_texture_view.id() == *main_id && overlay.id() == *overlay_id =>
+                {
+                    bind_group
+                }
+                cached => {
+                    let bind_group = blit_pipeline.create_overlay_bind_group(
+                        ctx.render_device(),
+                        main_texture_view,
+                        overlay,
+                        &pipeline_cache,
+                    );
+                    let (_, _, bind_group) =
+                        cached.insert((main_texture_view.id(), overlay.id(), bind_group));
+                    bind_group
+                }
+            };
+            (pipeline_id, bind_group)
+        } else {
+            let bind_group = match &mut cache.plain {
+                Some((id, bind_group)) if main_texture_view.id() == *id => bind_group,
+                cached => {
+                    let bind_group = blit_pipeline.create_bind_group(
+                        ctx.render_device(),
+                        main_texture_view,
+                        &pipeline_cache,
+                    );
+                    let (_, bind_group) = cached.insert((main_texture_view.id(), bind_group));
+                    bind_group
+                }
+            };
+            (upscaling_target.plain, bind_group)
+        };
 
     let Some(out_attachment) = target.out_texture_color_attachment(converted_clear_color) else {
         return;
@@ -73,7 +103,7 @@ pub fn upscaling(
         multiview_mask: None,
     };
 
-    let Some(pipeline) = pipeline_cache.get_render_pipeline(upscaling_target.0) else {
+    let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
         // we need to do some work on the swapchain to avoid pink screen uninit on macos
         #[cfg(target_os = "macos")]
         ctx.command_encoder().begin_render_pass(&pass_descriptor);

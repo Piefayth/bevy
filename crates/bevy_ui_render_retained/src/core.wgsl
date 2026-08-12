@@ -14,9 +14,16 @@ const CLIPPED = 1u;
 const GLYPH = 2u;
 
 @group(0) @binding(0) var<uniform> view: View;
+#ifndef FULL_REBUILD
 @group(1) @binding(0) var damage_mask: texture_2d<f32>;
+#endif
+#ifdef FULL_REBUILD
+@group(1) @binding(0) var sprite_texture: texture_2d<f32>;
+@group(1) @binding(1) var sprite_sampler: sampler;
+#else
 @group(2) @binding(0) var sprite_texture: texture_2d<f32>;
 @group(2) @binding(1) var sprite_sampler: sampler;
+#endif
 
 struct VertexOutput {
     @location(0) uv: vec2<f32>,
@@ -101,9 +108,11 @@ fn vertex(
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+#ifndef FULL_REBUILD
     if textureLoad(damage_mask, vec2<i32>(in.position.xy), 0).r < 0.5 {
         discard;
     }
+#endif
     let texture_color = textureSample(sprite_texture, sprite_sampler, in.uv);
     let color = select(in.color, in.color * texture_color, (in.flags & TEXTURED) != 0u);
     if (in.flags & BORDER_ANY) != 0u {

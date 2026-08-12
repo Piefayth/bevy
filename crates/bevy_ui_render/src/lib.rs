@@ -303,10 +303,10 @@ impl Plugin for UiRenderInfrastructurePlugin {
             .allow_ambiguous_resource::<ViewSortedRenderPhases<TransparentUi>>()
             .add_render_command::<TransparentUi, DrawUi>()
             .add_render_command::<TransparentUi, DrawUiItem>()
+            .configure_sets(ExtractSchedule, RenderUiSystems::ExtractCameraViews)
             .configure_sets(
                 ExtractSchedule,
                 (
-                    RenderUiSystems::ExtractCameraViews,
                     RenderUiSystems::ExtractBoxShadows,
                     RenderUiSystems::ExtractBackgrounds,
                     RenderUiSystems::ExtractImages,
@@ -317,6 +317,16 @@ impl Plugin for UiRenderInfrastructurePlugin {
                     RenderUiSystems::ExtractText,
                     RenderUiSystems::ExtractCursor,
                     RenderUiSystems::ExtractDebug,
+                )
+                    .after(RenderUiSystems::ExtractCameraViews),
+            )
+            .configure_sets(
+                ExtractSchedule,
+                (
+                    RenderUiSystems::ExtractTextBackgrounds,
+                    RenderUiSystems::ExtractTextShadows,
+                    RenderUiSystems::ExtractText,
+                    RenderUiSystems::ExtractCursor,
                 )
                     .chain(),
             )

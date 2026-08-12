@@ -156,20 +156,147 @@ pub struct WorkCounters {
     pub damage_events: u64,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct PaintState {
+    damage: DamageJournal,
+    counters: WorkCounters,
+    listed_dirty: bool,
+    listed_touched: bool,
+}
+
+impl PaintState {
+    pub(crate) fn list_dirty(&mut self) -> bool {
+        !core::mem::replace(&mut self.listed_dirty, true)
+    }
+
+    pub(crate) fn list_touched(&mut self) -> bool {
+        !core::mem::replace(&mut self.listed_touched, true)
+    }
+
+    pub(crate) fn clear_dirty_listing(&mut self) {
+        self.listed_dirty = false;
+    }
+
+    pub(crate) fn clear_touched_listing(&mut self) {
+        self.listed_touched = false;
+    }
+
+    pub(crate) fn upsert<V: PartialEq>(
+        &mut self,
+        previous: Option<&PaintRecord<V>>,
+        record: &PaintRecord<V>,
+    ) -> UpdateOutcome {
+        self.counters.candidates += 1;
+        let Some(previous) = previous else {
+            record_damage(
+                &mut self.damage,
+                &mut self.counters,
+                record.coverage.as_slice(),
+            );
+            self.counters.records_changed += 1;
+            return UpdateOutcome::Inserted;
+        };
+        self.counters.records_compared += 1;
+        let coverage_changed = previous.coverage != record.coverage;
+        if !coverage_changed && previous.value == record.value {
+            return UpdateOutcome::Unchanged;
+        }
+        self.record_changed(&previous.coverage, &record.coverage, coverage_changed)
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        previous: &PaintCoverage,
+        coverage: &PaintCoverage,
+    ) -> UpdateOutcome {
+        self.counters.candidates += 1;
+        self.counters.records_compared += 1;
+        self.record_changed(previous, coverage, previous != coverage)
+    }
+
+    pub(crate) fn update_exact(
+        &mut self,
+        previous: &PaintCoverage,
+        coverage: &PaintCoverage,
+        damage: &PaintCoverage,
+    ) -> UpdateOutcome {
+        self.counters.candidates += 1;
+        self.counters.records_compared += 1;
+        record_damage(&mut self.damage, &mut self.counters, damage.as_slice());
+        self.counters.records_changed += 1;
+        UpdateOutcome::Changed {
+            coverage_changed: previous != coverage,
+        }
+    }
+
+    fn record_changed(
+        &mut self,
+        previous: &PaintCoverage,
+        coverage: &PaintCoverage,
+        coverage_changed: bool,
+    ) -> UpdateOutcome {
+        if coverage_changed {
+            record_changed_damage(
+                &mut self.damage,
+                &mut self.counters,
+                previous.as_slice(),
+                coverage.as_slice(),
+            );
+        } else {
+            record_damage(&mut self.damage, &mut self.counters, coverage.as_slice());
+        }
+        self.counters.records_changed += 1;
+        UpdateOutcome::Changed { coverage_changed }
+    }
+
+    pub(crate) fn unchanged(&mut self) -> UpdateOutcome {
+        self.counters.candidates += 1;
+        self.counters.records_compared += 1;
+        UpdateOutcome::Unchanged
+    }
+
+    pub(crate) fn remove(&mut self, coverage: &PaintCoverage) {
+        record_damage(&mut self.damage, &mut self.counters, coverage.as_slice());
+        self.counters.records_removed += 1;
+    }
+
+    pub(crate) fn repair_plan(&mut self) -> Option<RepairPlan> {
+        self.damage.plan()
+    }
+
+    pub(crate) fn acknowledge(&mut self, plan: &RepairPlan) {
+        self.damage.acknowledge(plan);
+    }
+
+    pub(crate) const fn latest_damage_epoch(&self) -> u64 {
+        self.damage.latest_epoch()
+    }
+
+    pub(crate) fn has_damage(&self) -> bool {
+        !self.damage.is_empty()
+    }
+
+    pub(crate) fn invalidate(&mut self, coverage: PhysicalRect) {
+        record_damage(&mut self.damage, &mut self.counters, &[coverage]);
+    }
+
+    pub(crate) fn take_counters(&mut self) -> WorkCounters {
+        core::mem::take(&mut self.counters)
+    }
+}
+
 /// Canonical paint state keyed by stable entity-and-family identity.
 #[derive(Debug)]
 pub struct RetainedPaint<K, V> {
     records: HashMap<K, PaintRecord<V>>,
-    damage: DamageJournal,
-    counters: WorkCounters,
+    state: PaintState,
 }
 
 impl<K, V> Default for RetainedPaint<K, V> {
     fn default() -> Self {
         Self {
             records: HashMap::new(),
-            damage: DamageJournal::default(),
-            counters: WorkCounters::default(),
+            state: PaintState::default(),
         }
     }
 }
@@ -177,105 +304,29 @@ impl<K, V> Default for RetainedPaint<K, V> {
 impl<K: Eq + Hash, V: PartialEq> RetainedPaint<K, V> {
     /// Inserts or replaces one candidate after comparing its canonical record.
     pub fn upsert(&mut self, id: K, record: PaintRecord<V>) -> UpdateOutcome {
-        let Self {
-            records,
-            damage,
-            counters,
-        } = self;
-        counters.candidates += 1;
-        match records.entry(id) {
+        match self.records.entry(id) {
             Entry::Occupied(mut entry) => {
-                counters.records_compared += 1;
-                let coverage_changed = entry.get().coverage != record.coverage;
-                if !coverage_changed && entry.get().value == record.value {
-                    return UpdateOutcome::Unchanged;
+                let outcome = self.state.upsert(Some(entry.get()), &record);
+                if outcome != UpdateOutcome::Unchanged {
+                    entry.insert(record);
                 }
-                if !coverage_changed {
-                    record_damage(damage, counters, record.coverage.as_slice());
-                } else {
-                    record_changed_damage(
-                        damage,
-                        counters,
-                        entry.get().coverage.as_slice(),
-                        record.coverage.as_slice(),
-                    );
-                }
-                entry.insert(record);
-                counters.records_changed += 1;
-                UpdateOutcome::Changed { coverage_changed }
+                outcome
             }
             Entry::Vacant(entry) => {
-                record_damage(damage, counters, record.coverage.as_slice());
+                let outcome = self.state.upsert(None, &record);
                 entry.insert(record);
-                counters.records_changed += 1;
-                UpdateOutcome::Inserted
+                outcome
             }
         }
-    }
-
-    pub(crate) fn update_in_place(
-        &mut self,
-        id: &K,
-        update: impl FnOnce(&mut V) -> bool,
-    ) -> Option<UpdateOutcome> {
-        self.counters.candidates += 1;
-        let entry = self.records.get_mut(id)?;
-        self.counters.records_compared += 1;
-        if !update(&mut entry.value) {
-            return Some(UpdateOutcome::Unchanged);
-        }
-        record_damage(
-            &mut self.damage,
-            &mut self.counters,
-            entry.coverage.as_slice(),
-        );
-        self.counters.records_changed += 1;
-        Some(UpdateOutcome::Changed {
-            coverage_changed: false,
-        })
-    }
-
-    pub(crate) fn update_with_coverage(
-        &mut self,
-        id: &K,
-        update: impl FnOnce(&mut V, &PaintCoverage) -> Option<PaintCoverage>,
-    ) -> Option<UpdateOutcome> {
-        self.counters.candidates += 1;
-        let entry = self.records.get_mut(id)?;
-        self.counters.records_compared += 1;
-        let Some(coverage) = update(&mut entry.value, &entry.coverage) else {
-            return Some(UpdateOutcome::Unchanged);
-        };
-        let coverage_changed = entry.coverage != coverage;
-        if coverage_changed {
-            record_changed_damage(
-                &mut self.damage,
-                &mut self.counters,
-                entry.coverage.as_slice(),
-                coverage.as_slice(),
-            );
-        } else {
-            record_damage(&mut self.damage, &mut self.counters, coverage.as_slice());
-        }
-        entry.coverage = coverage;
-        self.counters.records_changed += 1;
-        Some(UpdateOutcome::Changed { coverage_changed })
     }
 
     /// Removes one paint record and damages the pixels it occupied.
     pub fn remove(&mut self, id: &K) -> bool {
-        self.take(id).is_some()
-    }
-
-    pub(crate) fn take(&mut self, id: &K) -> Option<PaintRecord<V>> {
-        let entry = self.records.remove(id)?;
-        record_damage(
-            &mut self.damage,
-            &mut self.counters,
-            entry.coverage.as_slice(),
-        );
-        self.counters.records_removed += 1;
-        Some(entry)
+        let Some(entry) = self.records.remove(id) else {
+            return false;
+        };
+        self.state.remove(&entry.coverage);
+        true
     }
 
     /// Returns a canonical paint record.
@@ -290,30 +341,22 @@ impl<K: Eq + Hash, V: PartialEq> RetainedPaint<K, V> {
 
     /// Plans all currently owed physical-pixel repairs.
     pub fn repair_plan(&mut self) -> Option<RepairPlan> {
-        self.damage.plan()
+        self.state.repair_plan()
     }
 
     /// Acknowledges damage only after its complete repair was encoded.
     pub fn acknowledge(&mut self, plan: &RepairPlan) {
-        self.damage.acknowledge(plan);
-    }
-
-    pub(crate) const fn latest_damage_epoch(&self) -> u64 {
-        self.damage.latest_epoch()
-    }
-
-    pub(crate) fn has_damage(&self) -> bool {
-        !self.damage.is_empty()
+        self.state.acknowledge(plan);
     }
 
     /// Invalidates pixels because the surface holding otherwise unchanged records was lost.
     pub fn invalidate(&mut self, coverage: PhysicalRect) {
-        record_damage(&mut self.damage, &mut self.counters, &[coverage]);
+        self.state.invalidate(coverage);
     }
 
     /// Takes and resets deterministic work counters.
     pub fn take_counters(&mut self) -> WorkCounters {
-        core::mem::take(&mut self.counters)
+        self.state.take_counters()
     }
 }
 
@@ -335,28 +378,13 @@ fn record_changed_damage(
     new: &[PhysicalRect],
 ) {
     if let ([old], [new]) = (old, new)
-        && let Some(union) = rectangular_union(*old, *new)
+        && let Some(union) = old.rectangular_union(*new)
     {
         record_damage(damage, counters, &[union]);
         return;
     }
     record_damage(damage, counters, old);
     record_damage(damage, counters, new);
-}
-
-fn rectangular_union(a: PhysicalRect, b: PhysicalRect) -> Option<PhysicalRect> {
-    let bounds = PhysicalRect::from_min_max(
-        a.min_x().min(b.min_x()),
-        a.min_y().min(b.min_y()),
-        a.max_x().max(b.max_x()),
-        a.max_y().max(b.max_y()),
-    )?;
-    let intersection_area = a
-        .intersection(b)
-        .map_or(0, |intersection| intersection.area());
-    (u128::from(bounds.area())
-        == u128::from(a.area()) + u128::from(b.area()) - u128::from(intersection_area))
-    .then_some(bounds)
 }
 
 #[cfg(test)]
@@ -436,68 +464,6 @@ mod tests {
 
         let repair = paint.repair_plan().unwrap();
         assert_eq!(repair.regions(), &[rect(0, 0, 3, 2)]);
-        assert_eq!(
-            paint.take_counters(),
-            WorkCounters {
-                candidates: 1,
-                records_compared: 1,
-                records_changed: 1,
-                damage_events: 1,
-                ..Default::default()
-            }
-        );
-    }
-
-    #[test]
-    fn in_place_update_damages_only_when_the_value_changes() {
-        let mut paint = RetainedPaint::default();
-        paint.upsert(1, record(rect(0, 0, 3, 2), 7));
-        let initial = paint.repair_plan().unwrap();
-        paint.acknowledge(&initial);
-        paint.take_counters();
-
-        assert_eq!(
-            paint.update_in_place(&1, |value| {
-                *value = 8;
-                true
-            }),
-            Some(UpdateOutcome::Changed {
-                coverage_changed: false
-            })
-        );
-        let repair = paint.repair_plan().unwrap();
-        assert_eq!(repair.regions(), &[rect(0, 0, 3, 2)]);
-        paint.acknowledge(&repair);
-
-        assert_eq!(
-            paint.update_in_place(&1, |_| false),
-            Some(UpdateOutcome::Unchanged)
-        );
-        assert!(paint.repair_plan().is_none());
-    }
-
-    #[test]
-    fn geometry_update_records_exact_old_union_new_coverage() {
-        let mut paint = RetainedPaint::default();
-        paint.upsert(1, record(rect(0, 0, 2, 2), 7));
-        let initial = paint.repair_plan().unwrap();
-        paint.acknowledge(&initial);
-        paint.take_counters();
-
-        let outcome = paint
-            .update_with_coverage(&1, |value, _| {
-                *value = 8;
-                Some(rect(1, 0, 3, 2).into())
-            })
-            .unwrap();
-
-        assert_eq!(
-            outcome,
-            UpdateOutcome::Changed {
-                coverage_changed: true
-            }
-        );
-        assert_eq!(paint.repair_plan().unwrap().damaged_pixels(), 6);
         assert_eq!(
             paint.take_counters(),
             WorkCounters {

@@ -14,10 +14,10 @@ use bevy::{
     camera::visibility::InheritedVisibility,
     color::{Alpha, LinearRgba},
     ecs::{
-        entity::Entity,
+        entity::{Entity, EntityHashMap},
         lifecycle::RemovedComponents,
         query::{Changed, Has, Or, With},
-        system::{Commands, Query, Res, ResMut, SystemParam},
+        system::{Commands, ParamSet, Query, Res, ResMut, SystemParam},
     },
     image::Image,
     input_focus::InputFocus,
@@ -41,11 +41,114 @@ use smallvec::{smallvec, SmallVec};
 
 #[derive(Default)]
 struct TextRootDependencies {
-    sections: HashSet<Entity>,
-    paints: HashSet<PaintId>,
+    sections: SmallVec<[Entity; 2]>,
+    paints: SmallVec<[PaintId; 4]>,
     text_paints: SmallVec<[PaintId; 1]>,
+    layout: TextLayoutPaintFingerprint,
+    placement: TextPlacementFingerprint,
     camera: Option<Entity>,
     fast_color: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TextPlacementFingerprint {
+    transform: [u32; 6],
+    clip: Option<[u32; 4]>,
+}
+
+impl TextPlacementFingerprint {
+    fn new(transform: Affine2, clip: Option<Rect>) -> Self {
+        Self {
+            transform: transform.to_cols_array().map(f32::to_bits),
+            clip: clip.map(rect_bits),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TextLayoutPaintFingerprint {
+    glyphs: Box<[GlyphPaintFingerprint]>,
+    runs: Box<[RunPaintFingerprint]>,
+    cursor: Option<(bool, [u32; 4])>,
+    selection: Box<[[u32; 4]]>,
+    preedit: Box<[[u32; 4]]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GlyphPaintFingerprint {
+    position: [u32; 2],
+    texture: AssetId<Image>,
+    rect: [u32; 4],
+    section: usize,
+    alpha_mask: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunPaintFingerprint {
+    section: usize,
+    bounds: [u32; 4],
+    strikethrough_y: u32,
+    strikethrough_thickness: u32,
+    underline_y: u32,
+    underline_thickness: u32,
+}
+
+impl TextLayoutPaintFingerprint {
+    fn new(layout: &TextLayoutInfo) -> Self {
+        Self {
+            glyphs: layout
+                .glyphs
+                .iter()
+                .map(|glyph| GlyphPaintFingerprint {
+                    position: vec2_bits(glyph.position),
+                    texture: glyph.atlas_info.texture,
+                    rect: rect_bits(glyph.atlas_info.rect),
+                    section: glyph.section_index,
+                    alpha_mask: glyph.atlas_info.is_alpha_mask,
+                })
+                .collect(),
+            runs: layout
+                .run_geometry
+                .iter()
+                .map(|run| RunPaintFingerprint {
+                    section: run.section_index,
+                    bounds: rect_bits(run.bounds),
+                    strikethrough_y: run.strikethrough_y.to_bits(),
+                    strikethrough_thickness: run.strikethrough_thickness.to_bits(),
+                    underline_y: run.underline_y.to_bits(),
+                    underline_thickness: run.underline_thickness.to_bits(),
+                })
+                .collect(),
+            cursor: layout
+                .cursor
+                .map(|(visible, rect)| (visible, rect_bits(rect))),
+            selection: layout
+                .selection_rects
+                .iter()
+                .copied()
+                .map(rect_bits)
+                .collect(),
+            preedit: layout
+                .preedit_underline_rects
+                .iter()
+                .copied()
+                .map(rect_bits)
+                .collect(),
+        }
+    }
+}
+
+fn vec2_bits(value: Vec2) -> [u32; 2] {
+    value.to_array().map(f32::to_bits)
+}
+
+fn rect_bits(value: Rect) -> [u32; 4] {
+    [
+        value.min.x.to_bits(),
+        value.min.y.to_bits(),
+        value.max.x.to_bits(),
+        value.max.y.to_bits(),
+    ]
 }
 
 struct GlyphRun {
@@ -62,6 +165,7 @@ struct TextNodePaint {
     z_order: f32,
     paint_order: u32,
     transform: Affine2,
+    layout_translation: Vec2,
     local_translation: Vec2,
     color: LinearRgba,
     size: Vec2,
@@ -98,19 +202,19 @@ fn push_glyph_run(
 
 #[derive(bevy::prelude::Resource, Default)]
 pub(crate) struct RetainedTextDependencies {
-    roots: HashMap<Entity, TextRootDependencies>,
-    section_roots: HashMap<Entity, HashSet<Entity>>,
+    roots: EntityHashMap<TextRootDependencies>,
+    section_roots: EntityHashMap<HashSet<Entity>>,
     focused: Option<Entity>,
 }
 
 impl RetainedTextDependencies {
-    fn remove_root(&mut self, root: Entity) -> HashSet<PaintId> {
+    fn remove_root(&mut self, root: Entity) -> SmallVec<[PaintId; 4]> {
         self.detach_root(root)
     }
 
-    fn detach_root(&mut self, root: Entity) -> HashSet<PaintId> {
+    fn detach_root(&mut self, root: Entity) -> SmallVec<[PaintId; 4]> {
         let Some(old) = self.roots.remove(&root) else {
-            return HashSet::new();
+            return SmallVec::new();
         };
         for section in old.sections {
             remove_reader(&mut self.section_roots, section, root);
@@ -121,13 +225,28 @@ impl RetainedTextDependencies {
     fn set_root(
         &mut self,
         root: Entity,
-        sections: impl IntoIterator<Item = Entity>,
-        paints: HashSet<PaintId>,
+        sections: SmallVec<[Entity; 2]>,
+        paints: SmallVec<[PaintId; 4]>,
+        layout: TextLayoutPaintFingerprint,
+        placement: TextPlacementFingerprint,
         camera: Option<Entity>,
         fast_color: bool,
-    ) -> HashSet<PaintId> {
+    ) -> SmallVec<[PaintId; 4]> {
+        if let Some(existing) = self.roots.get_mut(&root)
+            && existing.sections == sections
+            && existing.paints == paints
+        {
+            existing.layout = layout;
+            existing.placement = placement;
+            existing.camera = camera;
+            existing.fast_color = fast_color;
+            return SmallVec::new();
+        }
         let old_paints = self.detach_root(root);
-        let mut dependencies = TextRootDependencies {
+        let dependencies = TextRootDependencies {
+            sections,
+            layout,
+            placement,
             text_paints: paints
                 .iter()
                 .filter(|id| id.family == PaintFamily::Text)
@@ -136,23 +255,16 @@ impl RetainedTextDependencies {
             paints,
             camera,
             fast_color,
-            ..Default::default()
         };
-        for section in sections {
-            if dependencies.sections.insert(section) {
-                self.section_roots.entry(section).or_default().insert(root);
-            }
+        for &section in &dependencies.sections {
+            self.section_roots.entry(section).or_default().insert(root);
         }
         self.roots.insert(root, dependencies);
         old_paints
     }
 }
 
-fn remove_reader<K: Eq + core::hash::Hash + Copy>(
-    readers: &mut HashMap<K, HashSet<Entity>>,
-    key: K,
-    entity: Entity,
-) {
+fn remove_reader(readers: &mut EntityHashMap<HashSet<Entity>>, key: Entity, entity: Entity) {
     let Some(entities) = readers.get_mut(&key) else {
         return;
     };
@@ -178,6 +290,17 @@ type TextQueryItem<'a> = (
     Option<&'a TextCursorStyle>,
     Option<&'a TextShadow>,
     Has<EditableText>,
+);
+
+type TextGeometryItem<'a> = (
+    Entity,
+    &'a Node,
+    &'a ComputedNode,
+    &'a UiGlobalTransform,
+    &'a InheritedVisibility,
+    Option<&'a CalculatedClip>,
+    &'a ComputedUiTargetCamera,
+    Option<&'a TextScroll>,
 );
 
 #[derive(SystemParam)]
@@ -221,22 +344,40 @@ pub(crate) fn extract_retained_text(
             (
                 Or<(With<Text>, With<EditableText>)>,
                 Or<(
-                    Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
-                    Changed<ComputedTextBlock>,
-                    Changed<TextLayoutInfo>,
                     Changed<TextScroll>,
                     Changed<TextCursorStyle>,
                     Changed<TextShadow>,
                     Changed<EditableText>,
-                    Changed<Node>,
                     Changed<ComputedUiRenderTargetInfo>,
                 )>,
             ),
         >,
+    >,
+    mut derived_changes: Extract<
+        ParamSet<(
+            Query<
+                TextGeometryItem<'static>,
+                (Or<(With<Text>, With<EditableText>)>, Changed<ComputedNode>),
+            >,
+            Query<
+                (Entity, &'static ComputedTextBlock),
+                (
+                    Or<(With<Text>, With<EditableText>)>,
+                    Changed<ComputedTextBlock>,
+                ),
+            >,
+            Query<
+                (Entity, &'static TextLayoutInfo),
+                (
+                    Or<(With<Text>, With<EditableText>)>,
+                    Changed<TextLayoutInfo>,
+                ),
+            >,
+        )>,
     >,
     all: Extract<Query<TextQueryItem<'static>, Or<(With<Text>, With<EditableText>)>>>,
     changed_sections: Extract<
@@ -268,6 +409,9 @@ pub(crate) fn extract_retained_text(
     mut removed: Extract<RemovedTextInputs>,
 ) {
     let mut sampled_images = sampled_images.lock();
+    let mut removed_paints = Vec::new();
+    let mut retints = Vec::new();
+    let mut repositions = Vec::new();
     let mut extra_candidates = sampled_images.take_text();
     let focused = input_focus.as_ref().and_then(|focus| focus.get());
     if dependencies.focused != focused {
@@ -315,7 +459,6 @@ pub(crate) fn extract_retained_text(
         }
     }
 
-    let mut surfaces = state.lock();
     for root in text
         .read()
         .chain(editable.read())
@@ -328,13 +471,8 @@ pub(crate) fn extract_retained_text(
         .chain(visibility.read())
         .chain(camera.read())
     {
-        remove_text_root(
-            &mut dependencies,
-            &mut sampled_images,
-            &mut surfaces,
-            &mut commands,
-            root,
-        );
+        sampled_images.remove_reader(ImageReader::Text(root));
+        removed_paints.extend(dependencies.remove_root(root));
     }
     extra_candidates.extend(clip.read());
     extra_candidates.extend(scroll.read());
@@ -350,11 +488,7 @@ pub(crate) fn extract_retained_text(
         {
             if root_dependencies.fast_color {
                 if root_dependencies.camera.is_some() {
-                    surfaces.retint_text(
-                        root_dependencies.text_paints.iter().copied(),
-                        section,
-                        color,
-                    );
+                    retints.push((root_dependencies.text_paints.clone(), section, color));
                 }
             } else {
                 extra_candidates.insert(section);
@@ -370,11 +504,7 @@ pub(crate) fn extract_retained_text(
                 };
                 if root_dependencies.fast_color {
                     if root_dependencies.camera.is_some() {
-                        surfaces.retint_text(
-                            root_dependencies.text_paints.iter().copied(),
-                            section,
-                            color,
-                        );
+                        retints.push((root_dependencies.text_paints.clone(), section, color));
                     }
                 } else {
                     extra_candidates.insert(root);
@@ -383,7 +513,96 @@ pub(crate) fn extract_retained_text(
         }
     }
 
+    for (root, computed) in &derived_changes.p1() {
+        if changed.contains(root) || extra_candidates.contains(&root) {
+            continue;
+        }
+        let mut sections: SmallVec<[Entity; 2]> = core::iter::once(root)
+            .chain(computed.entities().iter().map(|section| section.entity))
+            .collect();
+        sections.sort_unstable();
+        sections.dedup();
+        if dependencies
+            .roots
+            .get(&root)
+            .is_none_or(|dependencies| dependencies.sections != sections)
+        {
+            extra_candidates.insert(root);
+        }
+    }
+
+    for (root, layout) in &derived_changes.p2() {
+        if changed.contains(root) || extra_candidates.contains(&root) {
+            continue;
+        }
+        let fingerprint = TextLayoutPaintFingerprint::new(layout);
+        if dependencies
+            .roots
+            .get(&root)
+            .is_none_or(|dependencies| dependencies.layout != fingerprint)
+        {
+            extra_candidates.insert(root);
+        }
+    }
+
     let mut camera_mapper = camera_map.get_mapper();
+    for (root, _, node, global_transform, visibility, clip, target_camera, scroll) in
+        &derived_changes.p0()
+    {
+        if changed.contains(root) || extra_candidates.contains(&root) {
+            continue;
+        }
+        let camera = camera_mapper.map(target_camera);
+        let visible_camera = camera.filter(|_| visibility.get() && !node.is_empty());
+        let Some(root_dependencies) = dependencies.roots.get(&root) else {
+            extra_candidates.insert(root);
+            continue;
+        };
+        if root_dependencies.camera != visible_camera {
+            extra_candidates.insert(root);
+            continue;
+        }
+        let content_translation =
+            node.content_box().min - scroll.map_or(Vec2::ZERO, |scroll| scroll.0);
+        let owner = owners.get(root).ok();
+        let clip = resolved_text_clip(root, node, global_transform, clip, owner, scroll);
+        let placement = TextPlacementFingerprint::new(
+            global_transform.affine() * Affine2::from_translation(content_translation),
+            clip,
+        );
+        if root_dependencies.placement == placement {
+            continue;
+        }
+        repositions.push((
+            root.into(),
+            global_transform.affine(),
+            clip,
+            content_translation,
+        ));
+        dependencies
+            .roots
+            .get_mut(&root)
+            .expect("checked above")
+            .placement = placement;
+    }
+    if removed_paints.is_empty()
+        && retints.is_empty()
+        && repositions.is_empty()
+        && changed.is_empty()
+        && extra_candidates.is_empty()
+    {
+        return;
+    }
+    let mut surfaces = state.lock();
+    for id in removed_paints {
+        surfaces.remove(&mut commands, id);
+    }
+    for (paints, section, color) in retints {
+        surfaces.retint_text(paints, section, color);
+    }
+    for (root, transform, clip, content_translation) in repositions {
+        surfaces.reposition_layout(root, transform, clip, Some(content_translation));
+    }
     for (
         root,
         _,
@@ -409,23 +628,11 @@ pub(crate) fn extract_retained_text(
         let content_translation =
             node.content_box().min - scroll.map_or(Vec2::ZERO, |scroll| scroll.0);
         let transform = global_transform.affine() * Affine2::from_translation(content_translation);
-        let shadow_translation = shadow.map(|shadow| {
-            node.content_box().min + shadow.offset / node.inverse_scale_factor()
-                - scroll.map_or(Vec2::ZERO, |scroll| scroll.0)
-        });
+        let shadow_offset = shadow.map(|shadow| shadow.offset / node.inverse_scale_factor());
+        let shadow_translation = shadow_offset.map(|offset| content_translation + offset);
         let shadow_transform = shadow_translation
             .map(|translation| global_transform.affine() * Affine2::from_translation(translation));
-        let clip = retained_clip(root, node, global_transform, clip, owner);
-        let clip = if scroll.is_some() {
-            let content_box = node.content_box();
-            let text_clip = Rect::from_center_size(
-                global_transform.affine().translation + content_box.center(),
-                content_box.size(),
-            );
-            Some(clip.map_or(text_clip, |clip| clip.intersect(text_clip)))
-        } else {
-            clip
-        };
+        let clip = resolved_text_clip(root, node, global_transform, clip, owner, scroll);
         let camera = camera_mapper.map(target_camera);
         let visible = camera.is_some() && visibility.get() && !node.is_empty();
         let selected_text_color = cursor_style
@@ -564,7 +771,8 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT,
                     paint_order,
                     transform: transform * Affine2::from_translation(run.bounds.center()),
-                    local_translation: content_translation + run.bounds.center(),
+                    layout_translation: content_translation,
+                    local_translation: run.bounds.center(),
                     color: background.0.to_linear(),
                     size: run.bounds.size(),
                 });
@@ -583,7 +791,8 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT_STRIKETHROUGH,
                     paint_order: decoration_ordinal(paint_order, 0),
                     transform: transform * Affine2::from_translation(run.strikethrough_position()),
-                    local_translation: content_translation + run.strikethrough_position(),
+                    layout_translation: content_translation,
+                    local_translation: run.strikethrough_position(),
                     color: strikethrough_color,
                     size: run.strikethrough_size(),
                 });
@@ -602,7 +811,8 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT_STRIKETHROUGH,
                     paint_order: decoration_ordinal(paint_order, 1),
                     transform: transform * Affine2::from_translation(run.underline_position()),
-                    local_translation: content_translation + run.underline_position(),
+                    layout_translation: content_translation,
+                    local_translation: run.underline_position(),
                     color: underline_color,
                     size: run.underline_size(),
                 });
@@ -622,8 +832,8 @@ pub(crate) fn extract_retained_text(
                         paint_order: decoration_ordinal(paint_order, 0),
                         transform: shadow_transform
                             * Affine2::from_translation(run.strikethrough_position()),
-                        local_translation: shadow_translation.unwrap()
-                            + run.strikethrough_position(),
+                        layout_translation: content_translation,
+                        local_translation: shadow_offset.unwrap() + run.strikethrough_position(),
                         color: shadow_color,
                         size: run.strikethrough_size(),
                     });
@@ -639,7 +849,8 @@ pub(crate) fn extract_retained_text(
                         paint_order: decoration_ordinal(paint_order, 1),
                         transform: shadow_transform
                             * Affine2::from_translation(run.underline_position()),
-                        local_translation: shadow_translation.unwrap() + run.underline_position(),
+                        layout_translation: content_translation,
+                        local_translation: shadow_offset.unwrap() + run.underline_position(),
                         color: shadow_color,
                         size: run.underline_size(),
                     });
@@ -666,7 +877,8 @@ pub(crate) fn extract_retained_text(
                         paint_order: u32::try_from(index)
                             .expect("text selection count exceeds u32"),
                         transform: transform * Affine2::from_translation(selection.center()),
-                        local_translation: content_translation + selection.center(),
+                        layout_translation: content_translation,
+                        local_translation: selection.center(),
                         color: selection_color.to_linear(),
                         size: selection.size(),
                     });
@@ -685,7 +897,8 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT_CURSOR,
                     paint_order: 0,
                     transform: transform * Affine2::from_translation(cursor.center()),
-                    local_translation: content_translation + cursor.center(),
+                    layout_translation: content_translation,
+                    local_translation: cursor.center(),
                     color: cursor_style.color.to_linear(),
                     size: cursor.size(),
                 });
@@ -703,28 +916,38 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT_STRIKETHROUGH,
                     paint_order: u32::try_from(index).expect("preedit underline count exceeds u32"),
                     transform: transform * Affine2::from_translation(rect.center()),
-                    local_translation: content_translation + rect.center(),
+                    layout_translation: content_translation,
+                    local_translation: rect.center(),
                     color: text_color.0.to_linear(),
                     size: rect.size(),
                 });
             }
         }
 
-        let paint_ids: HashSet<_> = shadow_runs
+        let mut paint_ids: SmallVec<[PaintId; 4]> = shadow_runs
             .iter()
             .map(|run| glyph_run_id(run, PaintFamily::TextShadow))
             .chain(runs.iter().map(|run| glyph_run_id(run, PaintFamily::Text)))
             .chain(node_paints.iter().map(|paint| paint.id))
             .collect();
-        let old_paints = dependencies.set_root(
-            root,
-            core::iter::once(root).chain(
+        paint_ids.sort_unstable();
+        paint_ids.dedup();
+        let mut sections: SmallVec<[Entity; 2]> = core::iter::once(root)
+            .chain(
                 computed_block
                     .entities()
                     .iter()
                     .map(|section| section.entity),
-            ),
+            )
+            .collect();
+        sections.sort_unstable();
+        sections.dedup();
+        let old_paints = dependencies.set_root(
+            root,
+            sections,
             paint_ids.clone(),
+            TextLayoutPaintFingerprint::new(layout),
+            TextPlacementFingerprint::new(transform, clip),
             camera.filter(|_| visible),
             !editable && node_paints.is_empty(),
         );
@@ -762,7 +985,8 @@ pub(crate) fn extract_retained_text(
                 stack.0 as f32 + stack_z_offsets::TEXT,
                 clip,
                 shadow_transform.expect("a text shadow must have a shadow transform"),
-                shadow_translation.expect("a text shadow must have a local translation"),
+                content_translation,
+                shadow_offset.expect("a text shadow must have a local translation"),
                 PaintFamily::TextShadow,
                 shadow_runs,
             );
@@ -777,6 +1001,7 @@ pub(crate) fn extract_retained_text(
             clip,
             transform,
             content_translation,
+            Vec2::ZERO,
             PaintFamily::Text,
             runs,
         );
@@ -784,6 +1009,26 @@ pub(crate) fn extract_retained_text(
             upsert_text_node(&mut surfaces, &mut commands, root, camera, clip, paint);
         }
     }
+}
+
+fn resolved_text_clip(
+    root: Entity,
+    node: &ComputedNode,
+    transform: &UiGlobalTransform,
+    clip: Option<&CalculatedClip>,
+    owner: Option<&Inherited<ComputedUiPaintTarget>>,
+    scroll: Option<&TextScroll>,
+) -> Option<Rect> {
+    let clip = retained_clip(root, node, transform, clip, owner);
+    if scroll.is_none() {
+        return clip;
+    }
+    let content_box = node.content_box();
+    let text_clip = Rect::from_center_size(
+        transform.affine().translation + content_box.center(),
+        content_box.size(),
+    );
+    Some(clip.map_or(text_clip, |clip| clip.intersect(text_clip)))
 }
 
 fn upsert_text_node(
@@ -810,6 +1055,7 @@ fn upsert_text_node(
             clip,
             image: AssetId::<Image>::default(),
             transform: paint.transform,
+            layout_translation: paint.layout_translation,
             local_translation: paint.local_translation,
             item: RetainedDrawItem::Node(crate::scene::RetainedNodeItem {
                 color: paint.color,
@@ -851,6 +1097,7 @@ fn upsert_glyph_runs(
     z_order: f32,
     clip: Option<Rect>,
     transform: Affine2,
+    layout_translation: Vec2,
     local_translation: Vec2,
     family: PaintFamily,
     runs: SmallVec<[GlyphRun; 1]>,
@@ -882,6 +1129,7 @@ fn upsert_glyph_runs(
                 clip,
                 image: run.image,
                 transform,
+                layout_translation,
                 local_translation,
                 item: RetainedDrawItem::Glyphs(run.glyphs.into_vec().into_boxed_slice()),
             },
@@ -889,19 +1137,6 @@ fn upsert_glyph_runs(
             glyph_coverage,
             true,
         );
-    }
-}
-
-fn remove_text_root(
-    dependencies: &mut RetainedTextDependencies,
-    sampled_images: &mut SampledImageState,
-    surfaces: &mut RetainedUiSurfaces,
-    commands: &mut Commands,
-    root: Entity,
-) {
-    sampled_images.remove_reader(ImageReader::Text(root));
-    for id in dependencies.remove_root(root) {
-        surfaces.remove(commands, id);
     }
 }
 
