@@ -7,6 +7,7 @@ use crate::scene::{
 use bevy::{
     asset::AssetId,
     camera::visibility::InheritedVisibility,
+    color::Alpha,
     ecs::{
         entity::Entity,
         lifecycle::RemovedComponents,
@@ -82,7 +83,6 @@ pub(crate) fn extract_retained_shadows(
                 bevy::ecs::query::Or<(
                     Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
-                    Changed<UiGlobalTransform>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
@@ -199,12 +199,12 @@ pub(crate) fn extract_retained_shadows(
                 ordinal: u32::try_from(ordinal).expect("box shadow count exceeds u32"),
             };
             let transform = node_transform * Affine2::from_translation(shadow.offset);
-            let coverage = visible
+            let painted = visible && !shadow.color.is_fully_transparent();
+            let coverage = painted
                 .then(|| coverage(shadow.bounds, transform, clip))
                 .flatten()
                 .into_iter()
                 .collect::<crate::PaintCoverage>();
-            let painted = !coverage.is_empty();
             surfaces.upsert(
                 &mut commands,
                 id,
@@ -218,6 +218,7 @@ pub(crate) fn extract_retained_shadows(
                     clip,
                     image: AssetId::<Image>::default(),
                     transform,
+                    local_translation: shadow.offset,
                     item: RetainedDrawItem::BoxShadow(RetainedBoxShadowItem::new(
                         stack.0,
                         shadow,
@@ -226,6 +227,7 @@ pub(crate) fn extract_retained_shadows(
                 },
                 ResourceFingerprint::None,
                 coverage,
+                painted,
             );
             if painted {
                 paints.insert(id);

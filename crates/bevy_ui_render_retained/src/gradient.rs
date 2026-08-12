@@ -87,7 +87,6 @@ pub(crate) fn extract_retained_gradients(
                 Or<(
                     Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
-                    Changed<UiGlobalTransform>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
@@ -228,6 +227,7 @@ pub(crate) fn extract_retained_gradients(
                         clip,
                         image: AssetId::<Image>::default(),
                         transform,
+                        local_translation: Vec2::ZERO,
                         item: RetainedDrawItem::Gradient(RetainedGradientItem::new(
                             stack.0,
                             Rect::from_corners(Vec2::ZERO, node.size()),
@@ -241,6 +241,7 @@ pub(crate) fn extract_retained_gradients(
                     },
                     ResourceFingerprint::None,
                     coverage,
+                    painted,
                 );
                 if painted {
                     paint_ids.insert(id);

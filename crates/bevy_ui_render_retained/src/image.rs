@@ -157,7 +157,6 @@ pub(crate) fn extract_retained_images(
                 Or<(
                     Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
-                    Changed<UiGlobalTransform>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
@@ -389,6 +388,7 @@ pub(crate) fn extract_retained_images(
                 clip,
                 image: image_asset,
                 transform,
+                local_translation: visual_box.center(),
                 item,
             },
             resources,
@@ -397,6 +397,7 @@ pub(crate) fn extract_retained_images(
                 .flatten()
                 .into_iter()
                 .collect(),
+            painted,
         );
     }
 }

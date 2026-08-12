@@ -235,6 +235,33 @@ impl<K: Eq + Hash, V: PartialEq> RetainedPaint<K, V> {
         })
     }
 
+    pub(crate) fn update_with_coverage(
+        &mut self,
+        id: &K,
+        update: impl FnOnce(&mut V, &PaintCoverage) -> Option<PaintCoverage>,
+    ) -> Option<UpdateOutcome> {
+        self.counters.candidates += 1;
+        let entry = self.records.get_mut(id)?;
+        self.counters.records_compared += 1;
+        let Some(coverage) = update(&mut entry.value, &entry.coverage) else {
+            return Some(UpdateOutcome::Unchanged);
+        };
+        let coverage_changed = entry.coverage != coverage;
+        if coverage_changed {
+            record_changed_damage(
+                &mut self.damage,
+                &mut self.counters,
+                entry.coverage.as_slice(),
+                coverage.as_slice(),
+            );
+        } else {
+            record_damage(&mut self.damage, &mut self.counters, coverage.as_slice());
+        }
+        entry.coverage = coverage;
+        self.counters.records_changed += 1;
+        Some(UpdateOutcome::Changed { coverage_changed })
+    }
+
     /// Removes one paint record and damages the pixels it occupied.
     pub fn remove(&mut self, id: &K) -> bool {
         let Some(entry) = self.records.remove(id) else {
@@ -441,6 +468,40 @@ mod tests {
             Some(UpdateOutcome::Unchanged)
         );
         assert!(paint.repair_plan().is_none());
+    }
+
+    #[test]
+    fn geometry_update_records_exact_old_union_new_coverage() {
+        let mut paint = RetainedPaint::default();
+        paint.upsert(1, record(rect(0, 0, 2, 2), 7));
+        let initial = paint.repair_plan().unwrap();
+        paint.acknowledge(&initial);
+        paint.take_counters();
+
+        let outcome = paint
+            .update_with_coverage(&1, |value, _| {
+                *value = 8;
+                Some(rect(1, 0, 3, 2).into())
+            })
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UpdateOutcome::Changed {
+                coverage_changed: true
+            }
+        );
+        assert_eq!(paint.repair_plan().unwrap().damaged_pixels(), 6);
+        assert_eq!(
+            paint.take_counters(),
+            WorkCounters {
+                candidates: 1,
+                records_compared: 1,
+                records_changed: 1,
+                damage_events: 1,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

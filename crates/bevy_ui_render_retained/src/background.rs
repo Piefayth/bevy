@@ -60,7 +60,6 @@ pub(crate) fn extract_retained_backgrounds(
                 Or<(
                     Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
-                    Changed<UiGlobalTransform>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
@@ -177,6 +176,7 @@ pub(crate) fn extract_retained_backgrounds(
             clip,
             image: bevy::asset::AssetId::<Image>::default(),
             transform,
+            local_translation: Vec2::ZERO,
             item: RetainedDrawItem::Node(base_item),
         };
         let fill_painted = visible && !background.is_fully_transparent();
@@ -191,6 +191,7 @@ pub(crate) fn extract_retained_backgrounds(
                 .flatten()
                 .into_iter()
                 .collect(),
+            fill_painted,
         );
 
         if let Some(outer) = outer {
@@ -214,6 +215,7 @@ pub(crate) fn extract_retained_backgrounds(
                     .flatten()
                     .into_iter()
                     .collect(),
+                outer_painted,
             );
         }
     }

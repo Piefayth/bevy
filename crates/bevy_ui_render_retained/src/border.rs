@@ -24,7 +24,7 @@ use bevy::{
     },
     ui_render::{shader_flags, stack_z_offsets, NodeType, UiCameraMap},
 };
-const EDGE_FLAGS: [u32; 4] = [
+pub(crate) const EDGE_FLAGS: [u32; 4] = [
     shader_flags::BORDER_LEFT,
     shader_flags::BORDER_TOP,
     shader_flags::BORDER_RIGHT,
@@ -68,7 +68,6 @@ pub(crate) fn extract_retained_borders(
                 Or<(
                     Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
-                    Changed<UiGlobalTransform>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
@@ -254,6 +253,7 @@ fn upsert_edges(
                 clip,
                 image: AssetId::<Image>::default(),
                 transform,
+                local_translation: Vec2::ZERO,
                 item: RetainedDrawItem::Node(RetainedNodeItem {
                     color: colors[edge],
                     rect: Rect::from_corners(Vec2::ZERO, size),
@@ -272,6 +272,7 @@ fn upsert_edges(
                 .flatten()
                 .into_iter()
                 .collect(),
+            painted,
         );
     }
 }

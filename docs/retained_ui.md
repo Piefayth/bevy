@@ -754,6 +754,17 @@ whose physical bounds intersect it. A localized background proof moves a
 10-by-10 leaf across a larger background: exactly 200 pixels are repaired and
 the two necessary logical items are each replayed once through the exact mask.
 
+Placement is extracted once per changed `UiGlobalTransform`, before the paint
+families. Every retained draw stores its entity-local translation, so that one
+transaction updates all of the entity's canonical transforms, clips, prepared
+instances, and exact old/new coverage. Color, image, gradient, border, shadow,
+material, and text extractors no longer re-read their style data for a pure
+placement change. Storing the local offset directly, instead of recovering it
+with a matrix inverse, makes a zero-scale-to-visible transition exact. Painted
+records clipped to empty coverage stay canonical but out of the spatial/order
+index, allowing placement alone to reveal them again. GPU differentials cover
+mixed-family translation, fully clipped re-entry, and zero-scale recovery.
+
 The mutation audit found that `ComputedNode` alone is not a complete
 nomination source: Bevy intentionally writes resolved borders and corner radii
 through `bypass_change_detection()`. `Changed<Node>` and
@@ -1058,17 +1069,18 @@ measure the current persistent-instance and exact-mask implementation:
 |---|---:|---:|
 | grid mixed, quiet | 17.629 ms | 1.052 ms |
 | grid mixed, one paint change per frame | 18.429 ms | 1.281 ms |
+| grid mixed, one placement change per frame | 17.839 ms | 1.895 ms |
 | grid mixed, one layout change in a 100-node boundary | 18.107 ms | 1.278 ms |
 | overlap background, one paint change per frame | 3.259 ms | 1.836 ms |
 | overlap background, all paint changes per frame | 3.244 ms | 2.980 ms |
 | grid effects, all paint changes per frame | 46.019 ms | 42.109 ms |
 | grid mixed, all paint changes per frame | 17.875 ms | 19.336 ms |
-| grid background, all placement changes per frame | 3.283 ms | 5.028 ms |
-| grid mixed, all placement changes per frame | 17.671 ms | 33.191 ms |
+| grid background, all placement changes per frame | 3.298 ms | 5.113 ms |
+| grid mixed, all placement changes per frame | 18.001 ms | 23.692 ms |
 | grid background, all contained widths change per frame | 5.096 ms | 8.185 ms |
 | grid mixed, all contained widths change per frame | 98.769 ms | 114.767 ms |
 
-These are 60, 120, or 180 consecutive measured frames after a 60-frame warmup,
+These are 60--180 consecutive measured frames after a 60--80-frame warmup,
 not single events. The quiet and localized retained rows had no frame at or
 above 4 ms. The overlap/localized row is deliberately adversarial: one changed
 translucent node requires all 10,000 contributors beneath it to replay, yet the
@@ -1081,8 +1093,11 @@ retained renderer cannot make that proof free. Prepared ordinary geometry,
 gradients, and shadows are now retained, damage unions are cached, dense direct
 changes skip spatial refits, and ordinary replay is instanced, reducing the old
 16.756 ms all-background-paint result to near stock. Mixed all-paint remains
-about 1.5 ms slower locally, and global geometry changes remain slower because
-every affected family must update old/new coverage and rerasterize.
+about 1.5 ms slower in the canonical run. One exact placement transaction per
+entity reduced the mixed global-placement path from 33.191 ms to 23.692 ms, but
+global geometry remains slower than stock because all 25,000 records still
+change pixels on the monolithic retained surface and must update old/new
+coverage and rerasterize.
 
 The global-placement result identifies the next missing capability rather than
 a tuning problem. A node transform on one monolithic cached surface changes

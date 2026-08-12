@@ -3856,6 +3856,159 @@ fn ui_transform_motion_nominates_only_the_moved_leaf() {
     });
 }
 
+fn spawn_moving_effects(world: &mut World, camera: Entity, left: i32) -> Entity {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(left),
+                top: px(14),
+                width: px(18),
+                height: px(18),
+                border: UiRect::all(px(3)),
+                border_radius: BorderRadius::all(px(4)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba_u8(30, 80, 180, 180)),
+            BorderColor::all(Color::srgba_u8(245, 220, 80, 210)),
+            linear_gradient(
+                Color::srgba_u8(220, 45, 28, 180),
+                Color::srgba_u8(30, 190, 90, 140),
+                Color::srgba_u8(35, 80, 220, 180),
+            ),
+            BoxShadow::new(Color::srgba_u8(0, 0, 0, 160), px(2), px(1), px(3), px(1)),
+            ChildOf(root),
+        ))
+        .id()
+}
+
+#[test]
+fn one_placement_transaction_moves_every_paint_family_without_reextracting_style() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_moving_effects(world, camera, 25),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_moving_effects(world, camera, 5),
+            |world, entity| {
+                world
+                    .entity_mut(entity)
+                    .get_mut::<UiTransform>()
+                    .unwrap()
+                    .translation = Val2::px(20, 0);
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.paint_before_mutation.unwrap();
+        let after = retained.paint_after_mutation.unwrap();
+        assert_eq!(after.candidates, before.candidates + 7);
+        assert_eq!(after.records_changed, before.records_changed + 7);
+    });
+}
+
+fn spawn_fully_clipped_movable_leaf(world: &mut World, camera: Entity, left: i32) -> Entity {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let clip_parent = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(8),
+                top: px(8),
+                width: px(10),
+                height: px(10),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            ChildOf(root),
+        ))
+        .id();
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(left),
+                top: px(0),
+                width: px(10),
+                height: px(10),
+                ..default()
+            },
+            BackgroundColor(Color::srgb_u8(220, 45, 28)),
+            ChildOf(clip_parent),
+        ))
+        .id()
+}
+
+#[test]
+fn placement_can_reveal_a_fully_clipped_retained_record() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_fully_clipped_movable_leaf(world, camera, 0),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_fully_clipped_movable_leaf(world, camera, 20),
+            |world, entity| {
+                world
+                    .entity_mut(entity)
+                    .get_mut::<UiTransform>()
+                    .unwrap()
+                    .translation = Val2::px(-20, 0);
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+        let before = retained.paint_before_mutation.unwrap();
+        let after = retained.paint_after_mutation.unwrap();
+        assert_eq!(after.candidates, before.candidates + 1);
+        assert_eq!(after.records_changed, before.records_changed + 1);
+    });
+}
+
+#[test]
+fn placement_recovers_local_offsets_after_a_zero_scale() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_moving_effects(world, camera, 5),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let entity = spawn_moving_effects(world, camera, 5);
+                world
+                    .entity_mut(entity)
+                    .get_mut::<UiTransform>()
+                    .unwrap()
+                    .scale = Vec2::ZERO;
+                entity
+            },
+            |world, entity| {
+                world
+                    .entity_mut(entity)
+                    .get_mut::<UiTransform>()
+                    .unwrap()
+                    .scale = Vec2::ONE;
+            },
+        );
+
+        assert_pixels_eq(&retained.pixels, &stock.pixels);
+    });
+}
+
 #[test]
 fn inherited_visibility_removes_only_the_hidden_leaf_pixels() {
     with_gpu_lock(|| {

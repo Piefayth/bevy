@@ -404,7 +404,6 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
                 Or<(
                     Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
-                    Changed<UiGlobalTransform>,
                     Changed<MaterialNode<M>>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
@@ -597,6 +596,7 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
                 clip,
                 image: AssetId::<Image>::default(),
                 transform,
+                local_translation: Vec2::ZERO,
                 item: RetainedDrawItem::Material(RetainedMaterialItem::new(
                     handle.id(),
                     stack.0,
@@ -604,10 +604,12 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
                     node.border(),
                     node.border_radius(),
                     sampled_ids.into_boxed_slice(),
+                    snapshot.coverage == RetainedUiMaterialCoverage::Target,
                 )),
             },
             resource,
             coverage,
+            visible,
         );
     }
 }

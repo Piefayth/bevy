@@ -18,8 +18,8 @@ use crate::sampled_image::{
     RetainedUiImageWrites,
 };
 use crate::scene::{
-    cleanup_retained_ui, replay_retained_ui, RetainedItems, RetainedMaterialReplays,
-    RetainedRepairPlans, RetainedUiPaintCounters, RetainedUiScene,
+    cleanup_retained_ui, extract_retained_placements, replay_retained_ui, RetainedItems,
+    RetainedMaterialReplays, RetainedRepairPlans, RetainedUiPaintCounters, RetainedUiScene,
 };
 use crate::shadow::{extract_retained_shadows, RetainedShadowDependencies};
 use crate::shadow_render::{
@@ -183,6 +183,14 @@ impl Plugin for RetainedUiRenderPlugin {
                     .before(extract_retained_images)
                     .before(extract_retained_text)
                     .before(extract_retained_viewports),
+            )
+            .add_systems(
+                ExtractSchedule,
+                extract_retained_placements
+                    .before(RenderUiSystems::ExtractBoxShadows)
+                    .before(RenderUiSystems::ExtractBackgrounds)
+                    .before(extract_retained_viewports)
+                    .before(extract_retained_gradients),
             )
             .add_systems(
                 ExtractSchedule,

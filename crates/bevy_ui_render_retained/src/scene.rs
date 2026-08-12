@@ -1,6 +1,7 @@
 //! Retained UI paint records shared by every paint family.
 
 use crate::{
+    border::{edge_rect, EDGE_FLAGS},
     core::{
         prepare_glyph_instance, prepare_persistent_instance, GpuUiInstance, RetainedCoreRuns,
         RetainedCoreSource,
@@ -16,15 +17,19 @@ use bevy::{
     color::ColorToComponents,
     ecs::{
         entity::Entity,
-        query::With,
+        lifecycle::RemovedComponents,
+        query::{Changed, With},
         system::{Commands, Query, Res, ResMut},
     },
     image::Image,
     math::{Affine2, Rect, Vec2},
     platform::collections::{hash_map::Entry, HashMap, HashSet},
-    render::sync_world::MainEntity,
+    render::{sync_world::MainEntity, Extract},
     sprite::{BorderRect, SliceScaleMode, SpriteImageMode},
-    ui::ResolvedBorderRadius,
+    ui::{
+        widget::TextScroll, CalculatedClip, ComputedNode, Node, ResolvedBorderRadius,
+        UiGlobalTransform,
+    },
     ui_render::{
         box_shadow::ResolvedBoxShadow,
         gradient::ResolvedGradient,
@@ -76,6 +81,8 @@ pub(crate) struct RetainedDraw {
     pub(crate) clip: Option<Rect>,
     pub(crate) image: AssetId<Image>,
     pub(crate) transform: Affine2,
+    /// Kept separately so placement never needs to invert a potentially singular transform.
+    pub(crate) local_translation: Vec2,
     pub(crate) item: RetainedDrawItem,
 }
 
@@ -104,6 +111,7 @@ pub(crate) struct RetainedMaterialItem {
     border: [FloatBits; 4],
     border_radius: [FloatBits; 4],
     pub(crate) sampled_images: Box<[AssetId<Image>]>,
+    target_coverage: bool,
 }
 
 impl RetainedMaterialItem {
@@ -114,6 +122,7 @@ impl RetainedMaterialItem {
         border: BorderRect,
         border_radius: ResolvedBorderRadius,
         sampled_images: Box<[AssetId<Image>]>,
+        target_coverage: bool,
     ) -> Self {
         Self {
             material_type: TypeId::of::<M>(),
@@ -129,6 +138,7 @@ impl RetainedMaterialItem {
             .map(FloatBits::new),
             border_radius: <[f32; 4]>::from(border_radius).map(FloatBits::new),
             sampled_images,
+            target_coverage,
         }
     }
 
@@ -501,25 +511,31 @@ impl PartialEq for RetainedRecord {
 
 impl RetainedRecord {
     fn new(draw: RetainedDraw, resource: ResourceFingerprint) -> Self {
-        let prepared_core = match &draw.item {
-            RetainedDrawItem::Node(_) => prepare_persistent_instance(&draw).map(PreparedCore::One),
-            RetainedDrawItem::Glyphs(glyphs) => glyphs
-                .iter()
-                .map(|&glyph| {
-                    glyph
-                        .atlas_extent()
-                        .map(|extent| prepare_glyph_instance(&draw, glyph, extent))
-                })
-                .collect::<Option<Vec<_>>>()
-                .map(|instances| PreparedCore::Many(instances.into_boxed_slice())),
-            _ => None,
-        };
+        let prepared_core = prepare_core(&draw);
         Self {
             resource,
             render_entity: draw.render_entity,
             prepared_core,
             draw,
         }
+    }
+
+    fn reposition(
+        &mut self,
+        source_transform: Affine2,
+        clip: Option<Rect>,
+        previous_coverage: &PaintCoverage,
+    ) -> Option<PaintCoverage> {
+        let transform = source_transform * Affine2::from_translation(self.draw.local_translation);
+        if affine_bits(self.draw.transform) == affine_bits(transform)
+            && self.draw.clip.map(rect_fingerprint) == clip.map(rect_fingerprint)
+        {
+            return None;
+        }
+        self.draw.transform = transform;
+        self.draw.clip = clip;
+        self.prepared_core = prepare_core(&self.draw);
+        Some(draw_coverage(&self.draw, previous_coverage))
     }
 
     fn border_parts(&self) -> Option<(&RetainedNodeItem, u32)> {
@@ -586,14 +602,120 @@ impl RetainedRecord {
     }
 }
 
+fn prepare_core(draw: &RetainedDraw) -> Option<PreparedCore> {
+    match &draw.item {
+        RetainedDrawItem::Node(_) => prepare_persistent_instance(draw).map(PreparedCore::One),
+        RetainedDrawItem::Glyphs(glyphs) => glyphs
+            .iter()
+            .map(|&glyph| {
+                glyph
+                    .atlas_extent()
+                    .map(|extent| prepare_glyph_instance(draw, glyph, extent))
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|instances| PreparedCore::Many(instances.into_boxed_slice())),
+        _ => None,
+    }
+}
+
+fn draw_coverage(draw: &RetainedDraw, previous: &PaintCoverage) -> PaintCoverage {
+    match &draw.item {
+        RetainedDrawItem::BoxShadow(shadow) => coverage(shadow.bounds(), draw.transform, draw.clip)
+            .into_iter()
+            .collect(),
+        RetainedDrawItem::Gradient(gradient) => {
+            if gradient.node_type() == NodeType::Rect {
+                return coverage(gradient.rect().size(), draw.transform, draw.clip)
+                    .into_iter()
+                    .collect();
+            }
+            let border = gradient.border();
+            let widths = [
+                border.min_inset.x,
+                border.min_inset.y,
+                border.max_inset.x,
+                border.max_inset.y,
+            ];
+            let radii: [f32; 4] = gradient.border_radius().into();
+            widths
+                .into_iter()
+                .enumerate()
+                .filter(|(_, width)| *width > 0.0)
+                .filter_map(|(edge, width)| {
+                    coverage_rect(
+                        edge_rect(gradient.rect().size(), width, radii, edge),
+                        draw.transform,
+                        draw.clip,
+                    )
+                })
+                .collect()
+        }
+        RetainedDrawItem::Material(material) => {
+            if material.target_coverage {
+                previous.clone()
+            } else {
+                coverage(material.rect().size(), draw.transform, draw.clip)
+                    .into_iter()
+                    .collect()
+            }
+        }
+        RetainedDrawItem::Node(node) => {
+            let NodeType::Border(flags) = node.node_type else {
+                return coverage(node.rect.size(), draw.transform, draw.clip)
+                    .into_iter()
+                    .collect();
+            };
+            let widths = [
+                node.border.min_inset.x,
+                node.border.min_inset.y,
+                node.border.max_inset.x,
+                node.border.max_inset.y,
+            ];
+            let radii: [f32; 4] = node.border_radius.into();
+            widths
+                .into_iter()
+                .enumerate()
+                .filter(|(edge, width)| *width > 0.0 && flags & EDGE_FLAGS[*edge] != 0)
+                .filter_map(|(edge, width)| {
+                    coverage_rect(
+                        edge_rect(node.rect.size(), width, radii, edge),
+                        draw.transform,
+                        draw.clip,
+                    )
+                })
+                .collect()
+        }
+        RetainedDrawItem::Glyphs(glyphs) => glyphs
+            .iter()
+            .filter_map(|glyph| {
+                coverage(
+                    glyph.rect().size(),
+                    draw.transform * Affine2::from_translation(glyph.translation()),
+                    draw.clip,
+                )
+            })
+            .collect(),
+        RetainedDrawItem::TextureSlice(slice) => {
+            coverage(slice.rect.size(), draw.transform, draw.clip)
+                .into_iter()
+                .collect()
+        }
+    }
+}
+
+fn affine_bits(transform: Affine2) -> [FloatBits; 6] {
+    transform.to_cols_array().map(FloatBits::new)
+}
+
 fn retained_common_eq(left: &RetainedDraw, right: &RetainedDraw) -> bool {
     left.camera == right.camera
         && FloatBits::new(left.z_order) == FloatBits::new(right.z_order)
         && left.paint_order == right.paint_order
         && left.clip.map(rect_fingerprint) == right.clip.map(rect_fingerprint)
         && left.image == right.image
-        && left.transform.to_cols_array().map(FloatBits::new)
-            == right.transform.to_cols_array().map(FloatBits::new)
+        && affine_bits(left.transform) == affine_bits(right.transform)
+        && left.local_translation.to_array().map(FloatBits::new)
+            == right.local_translation.to_array().map(FloatBits::new)
 }
 
 fn retained_node_merge_eq(left: &RetainedNodeItem, right: &RetainedNodeItem) -> bool {
@@ -709,11 +831,13 @@ fn slice_scale_mode_fingerprint(mode: SliceScaleMode) -> SliceScaleModeFingerpri
 pub(crate) struct RetainedUiSurfaces {
     paint: HashMap<Entity, RetainedPaint<PaintId, RetainedRecord>>,
     owners: HashMap<PaintId, PaintOwner>,
+    by_main_entity: HashMap<MainEntity, SmallVec<[PaintId; 8]>>,
     order: HashMap<Entity, PaintOrder>,
 }
 
 struct PaintOwner {
     camera: Entity,
+    main_entity: MainEntity,
     render_entity: Entity,
     order: (FloatBits, u32),
     group: Option<usize>,
@@ -847,10 +971,58 @@ impl RetainedUiSurfaces {
         outcome.is_some()
     }
 
-    pub(crate) fn remove(&mut self, commands: &mut Commands, id: PaintId) {
-        let Some(owner) = self.owners.remove(&id) else {
+    fn reposition(&mut self, entity: MainEntity, transform: Affine2, clip: Option<Rect>) {
+        let Some(ids) = self.by_main_entity.get(&entity).cloned() else {
             return;
         };
+        let camera = self.owners[&ids[0]].camera;
+        let paint = self
+            .paint
+            .get_mut(&camera)
+            .expect("owned paint camera must exist");
+        let order = self.order.entry(camera).or_default();
+        for id in ids {
+            let owner = self
+                .owners
+                .get(&id)
+                .expect("main-entity index must contain an owned paint record");
+            debug_assert_eq!(owner.camera, camera);
+            let group = owner.group;
+            let mut visibility_changed = false;
+            let outcome = paint.update_with_coverage(&id, |record, previous| {
+                let coverage = record.reposition(transform, clip, previous)?;
+                visibility_changed = previous.is_empty() != coverage.is_empty();
+                Some(coverage)
+            });
+            let Some(outcome) =
+                outcome.filter(|outcome| *outcome != crate::UpdateOutcome::Unchanged)
+            else {
+                continue;
+            };
+            let epoch = paint.latest_damage_epoch();
+            order.note_direct(group, epoch);
+            if visibility_changed {
+                order.order_dirty = true;
+                order.spatial = None;
+            } else if outcome.coverage_changed() {
+                if let Some(group) = group
+                    && order.spatial.is_some()
+                    && !order.order_dirty
+                    && !order.group_dirty
+                {
+                    order.bounds_dirty.insert(group);
+                } else {
+                    order.spatial = None;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn remove(&mut self, commands: &mut Commands, id: PaintId) {
+        let Some(owner) = self.detach_owner(id) else {
+            return;
+        };
+
         let paint = self.paint.get_mut(&owner.camera).unwrap();
         paint.remove(&id);
         let index = self.order.entry(owner.camera).or_default();
@@ -861,6 +1033,17 @@ impl RetainedUiSurfaces {
         }
     }
 
+    fn detach_owner(&mut self, id: PaintId) -> Option<PaintOwner> {
+        let owner = self.owners.remove(&id)?;
+        if let Some(ids) = self.by_main_entity.get_mut(&owner.main_entity) {
+            ids.retain(|candidate| *candidate != id);
+            if ids.is_empty() {
+                self.by_main_entity.remove(&owner.main_entity);
+            }
+        }
+        Some(owner)
+    }
+
     pub(crate) fn upsert(
         &mut self,
         commands: &mut Commands,
@@ -869,21 +1052,25 @@ impl RetainedUiSurfaces {
         mut draw: RetainedDraw,
         resource: ResourceFingerprint,
         coverage: PaintCoverage,
+        painted: bool,
     ) {
-        if coverage.is_empty() {
+        if !painted {
             self.remove(commands, id);
             return;
         }
         let new_order = (FloatBits::new(draw.z_order), draw.paint_order);
-        let (old_camera, render_entity, old_order) = match self.owners.entry(id) {
+        let main_entity = draw.main_entity;
+        let (old_camera, render_entity, old_order, old_main_entity) = match self.owners.entry(id) {
             Entry::Occupied(mut owner) => {
                 let old_camera = owner.get().camera;
                 let previous = (
                     Some(old_camera),
                     owner.get().render_entity,
                     Some(owner.get().order),
+                    Some(owner.get().main_entity),
                 );
                 owner.get_mut().camera = camera;
+                owner.get_mut().main_entity = main_entity;
                 owner.get_mut().order = new_order;
                 if old_camera != camera || previous.2 != Some(new_order) {
                     owner.get_mut().group = None;
@@ -894,13 +1081,25 @@ impl RetainedUiSurfaces {
                 let render_entity = commands.spawn_empty().id();
                 owner.insert(PaintOwner {
                     camera,
+                    main_entity,
                     render_entity,
                     order: new_order,
                     group: None,
                 });
-                (None, render_entity, None)
+                (None, render_entity, None, None)
             }
         };
+        if old_main_entity != Some(main_entity) {
+            if let Some(old_main_entity) = old_main_entity
+                && let Some(ids) = self.by_main_entity.get_mut(&old_main_entity)
+            {
+                ids.retain(|candidate| *candidate != id);
+                if ids.is_empty() {
+                    self.by_main_entity.remove(&old_main_entity);
+                }
+            }
+            self.by_main_entity.entry(main_entity).or_default().push(id);
+        }
         draw.render_entity = render_entity;
 
         if let Some(old_camera) = old_camera
@@ -1096,26 +1295,58 @@ impl RetainedUiPaintCounters {
 pub(crate) fn cleanup_retained_ui(
     mut commands: Commands,
     state: Res<RetainedUiScene>,
-    live_render_entities: Query<Entity, With<MainEntity>>,
+    mut removed_main_entities: RemovedComponents<MainEntity>,
 ) {
-    let live: HashSet<_> = live_render_entities.iter().collect();
     let mut surfaces = state.lock();
-    let removed_cameras: Vec<_> = surfaces
-        .paint
-        .keys()
-        .copied()
-        .filter(|camera| !live.contains(camera))
+    let removed_cameras: Vec<_> = removed_main_entities
+        .read()
+        .filter(|camera| surfaces.paint.contains_key(camera))
         .collect();
     for camera in removed_cameras {
         if let Some(paint) = surfaces.paint.remove(&camera) {
-            for (_, record) in paint.iter() {
+            for (id, record) in paint.iter() {
                 if let Ok(mut entity) = commands.get_entity(record.value.render_entity) {
                     entity.despawn();
                 }
+                let owner = surfaces
+                    .detach_owner(*id)
+                    .expect("retained paint must have an owner");
+                debug_assert_eq!(owner.camera, camera);
             }
         }
-        surfaces.owners.retain(|_, owner| owner.camera != camera);
         surfaces.order.remove(&camera);
+    }
+}
+
+pub(crate) fn extract_retained_placements(
+    state: Res<RetainedUiScene>,
+    changed: Extract<
+        Query<
+            (
+                Entity,
+                &'static UiGlobalTransform,
+                Option<&'static CalculatedClip>,
+                &'static ComputedNode,
+                Option<&'static TextScroll>,
+            ),
+            (With<Node>, Changed<UiGlobalTransform>),
+        >,
+    >,
+) {
+    let mut surfaces = state.lock();
+    for (entity, transform, clip, node, scroll) in &changed {
+        let transform = transform.affine();
+        let clip = if scroll.is_some() {
+            let content_box = node.content_box();
+            let text_clip = Rect::from_center_size(
+                transform.translation + content_box.center(),
+                content_box.size(),
+            );
+            Some(clip.map_or(text_clip, |clip| clip.clip.intersect(text_clip)))
+        } else {
+            clip.map(|clip| clip.clip)
+        };
+        surfaces.reposition(entity.into(), transform, clip);
     }
 }
 
@@ -1180,6 +1411,7 @@ pub(crate) fn replay_retained_ui(
     let RetainedUiSurfaces {
         paint,
         owners,
+        by_main_entity: _,
         order,
     } = &mut *surfaces;
     for (&camera, paint) in paint.iter_mut() {
@@ -1190,7 +1422,12 @@ pub(crate) fn replay_retained_ui(
         let order = order.entry(camera).or_default();
         if order.order_dirty {
             order.ids.clear();
-            order.ids.extend(paint.iter().map(|(id, _)| *id));
+            order.ids.extend(
+                paint
+                    .iter()
+                    .filter(|(_, record)| !record.coverage.is_empty())
+                    .map(|(id, _)| *id),
+            );
             order.ids.sort_by(|left_id, right_id| {
                 let left = paint
                     .get(left_id)

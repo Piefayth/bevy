@@ -57,6 +57,7 @@ struct TextNodePaint {
     z_order: f32,
     paint_order: u32,
     transform: Affine2,
+    local_translation: Vec2,
     color: LinearRgba,
     size: Vec2,
 }
@@ -217,7 +218,6 @@ pub(crate) fn extract_retained_text(
                 Or<(
                     Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
-                    Changed<UiGlobalTransform>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
@@ -401,17 +401,15 @@ pub(crate) fn extract_retained_text(
             .into_iter()
             .filter_map(|root| all.get(root).ok()),
     ) {
-        let transform = global_transform.affine()
-            * Affine2::from_translation(
-                node.content_box().min - scroll.map_or(Vec2::ZERO, |scroll| scroll.0),
-            );
-        let shadow_transform = shadow.map(|shadow| {
-            global_transform.affine()
-                * Affine2::from_translation(
-                    node.content_box().min + shadow.offset / node.inverse_scale_factor()
-                        - scroll.map_or(Vec2::ZERO, |scroll| scroll.0),
-                )
+        let content_translation =
+            node.content_box().min - scroll.map_or(Vec2::ZERO, |scroll| scroll.0);
+        let transform = global_transform.affine() * Affine2::from_translation(content_translation);
+        let shadow_translation = shadow.map(|shadow| {
+            node.content_box().min + shadow.offset / node.inverse_scale_factor()
+                - scroll.map_or(Vec2::ZERO, |scroll| scroll.0)
         });
+        let shadow_transform = shadow_translation
+            .map(|translation| global_transform.affine() * Affine2::from_translation(translation));
         let clip = if scroll.is_some() {
             let content_box = node.content_box();
             let text_clip = Rect::from_center_size(
@@ -560,6 +558,7 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT,
                     paint_order,
                     transform: transform * Affine2::from_translation(run.bounds.center()),
+                    local_translation: content_translation + run.bounds.center(),
                     color: background.0.to_linear(),
                     size: run.bounds.size(),
                 });
@@ -578,6 +577,7 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT_STRIKETHROUGH,
                     paint_order: decoration_ordinal(paint_order, 0),
                     transform: transform * Affine2::from_translation(run.strikethrough_position()),
+                    local_translation: content_translation + run.strikethrough_position(),
                     color: strikethrough_color,
                     size: run.strikethrough_size(),
                 });
@@ -596,6 +596,7 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT_STRIKETHROUGH,
                     paint_order: decoration_ordinal(paint_order, 1),
                     transform: transform * Affine2::from_translation(run.underline_position()),
+                    local_translation: content_translation + run.underline_position(),
                     color: underline_color,
                     size: run.underline_size(),
                 });
@@ -615,6 +616,8 @@ pub(crate) fn extract_retained_text(
                         paint_order: decoration_ordinal(paint_order, 0),
                         transform: shadow_transform
                             * Affine2::from_translation(run.strikethrough_position()),
+                        local_translation: shadow_translation.unwrap()
+                            + run.strikethrough_position(),
                         color: shadow_color,
                         size: run.strikethrough_size(),
                     });
@@ -630,6 +633,7 @@ pub(crate) fn extract_retained_text(
                         paint_order: decoration_ordinal(paint_order, 1),
                         transform: shadow_transform
                             * Affine2::from_translation(run.underline_position()),
+                        local_translation: shadow_translation.unwrap() + run.underline_position(),
                         color: shadow_color,
                         size: run.underline_size(),
                     });
@@ -656,6 +660,7 @@ pub(crate) fn extract_retained_text(
                         paint_order: u32::try_from(index)
                             .expect("text selection count exceeds u32"),
                         transform: transform * Affine2::from_translation(selection.center()),
+                        local_translation: content_translation + selection.center(),
                         color: selection_color.to_linear(),
                         size: selection.size(),
                     });
@@ -674,6 +679,7 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT_CURSOR,
                     paint_order: 0,
                     transform: transform * Affine2::from_translation(cursor.center()),
+                    local_translation: content_translation + cursor.center(),
                     color: cursor_style.color.to_linear(),
                     size: cursor.size(),
                 });
@@ -691,6 +697,7 @@ pub(crate) fn extract_retained_text(
                     z_order: stack.0 as f32 + stack_z_offsets::TEXT_STRIKETHROUGH,
                     paint_order: u32::try_from(index).expect("preedit underline count exceeds u32"),
                     transform: transform * Affine2::from_translation(rect.center()),
+                    local_translation: content_translation + rect.center(),
                     color: text_color.0.to_linear(),
                     size: rect.size(),
                 });
@@ -749,6 +756,7 @@ pub(crate) fn extract_retained_text(
                 stack.0 as f32 + stack_z_offsets::TEXT,
                 clip,
                 shadow_transform.expect("a text shadow must have a shadow transform"),
+                shadow_translation.expect("a text shadow must have a local translation"),
                 PaintFamily::TextShadow,
                 shadow_runs,
             );
@@ -762,6 +770,7 @@ pub(crate) fn extract_retained_text(
             stack.0 as f32 + stack_z_offsets::TEXT,
             clip,
             transform,
+            content_translation,
             PaintFamily::Text,
             runs,
         );
@@ -795,6 +804,7 @@ fn upsert_text_node(
             clip,
             image: AssetId::<Image>::default(),
             transform: paint.transform,
+            local_translation: paint.local_translation,
             item: RetainedDrawItem::Node(crate::scene::RetainedNodeItem {
                 color: paint.color,
                 rect: Rect {
@@ -812,6 +822,7 @@ fn upsert_text_node(
         },
         ResourceFingerprint::None,
         paint_coverage,
+        true,
     );
 }
 
@@ -834,6 +845,7 @@ fn upsert_glyph_runs(
     z_order: f32,
     clip: Option<Rect>,
     transform: Affine2,
+    local_translation: Vec2,
     family: PaintFamily,
     runs: SmallVec<[GlyphRun; 1]>,
 ) {
@@ -864,10 +876,12 @@ fn upsert_glyph_runs(
                 clip,
                 image: run.image,
                 transform,
+                local_translation,
                 item: RetainedDrawItem::Glyphs(run.glyphs.into_vec().into_boxed_slice()),
             },
             ResourceFingerprint::Revisions(revisions),
             glyph_coverage,
+            true,
         );
     }
 }

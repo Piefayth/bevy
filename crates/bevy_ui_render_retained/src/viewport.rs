@@ -108,7 +108,6 @@ pub(crate) fn extract_retained_viewports(
                 Or<(
                     Changed<ComputedNode>,
                     Changed<ComputedStackIndex>,
-                    Changed<UiGlobalTransform>,
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
@@ -241,6 +240,7 @@ pub(crate) fn extract_retained_viewports(
                 clip,
                 image,
                 transform,
+                local_translation: Vec2::ZERO,
                 item: RetainedDrawItem::Node(RetainedNodeItem {
                     color: bevy::color::LinearRgba::WHITE,
                     rect: Rect::from_corners(Vec2::ZERO, node.size()),
@@ -259,6 +259,7 @@ pub(crate) fn extract_retained_viewports(
                 .flatten()
                 .into_iter()
                 .collect(),
+            painted,
         );
     }
 }
