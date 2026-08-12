@@ -56,7 +56,7 @@ fn paint(c: &mut Criterion) {
             BenchmarkId::new("quiet", record_count),
             &record_count,
             |bencher, _| {
-                let quiet = retained_paint(record_count, Coverage::Tiled);
+                let mut quiet = retained_paint(record_count, Coverage::Tiled);
                 bencher.iter(|| black_box(quiet.repair_plan()));
             },
         );
@@ -103,6 +103,38 @@ fn paint(c: &mut Criterion) {
                     }
                     let repair = full.repair_plan().unwrap();
                     black_box(repair.damaged_pixels());
+                    full.acknowledge(&repair);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("full_resize", record_count),
+            &record_count,
+            |bencher, _| {
+                let mut full = retained_paint(record_count, Coverage::Tiled);
+                let mut expanded = false;
+                bencher.iter(|| {
+                    expanded = !expanded;
+                    for id in 0..record_count {
+                        let current = coverage(Coverage::Tiled, id);
+                        full.upsert(
+                            id,
+                            PaintRecord {
+                                coverage: PhysicalRect::from_min_max(
+                                    current.min_x(),
+                                    current.min_y(),
+                                    current.max_x() + i32::from(expanded),
+                                    current.max_y(),
+                                )
+                                .unwrap()
+                                .into(),
+                                value: 0,
+                            },
+                        );
+                    }
+                    let repair = full.repair_plan().unwrap();
+                    black_box((repair.damaged_pixels(), repair.regions().len()));
                     full.acknowledge(&repair);
                 });
             },

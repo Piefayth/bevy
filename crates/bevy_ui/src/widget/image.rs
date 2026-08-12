@@ -196,6 +196,7 @@ pub struct ImageNodeSize {
     ///
     /// This field is updated automatically by [`update_image_content_size_system`]
     size: UVec2,
+    visual_box: VisualBox,
 }
 
 impl ImageNodeSize {
@@ -351,11 +352,12 @@ pub fn update_image_content_size_system(
         {
             // Update only if size or scale factor has changed to avoid needless layout calculations
             if size != image_size.size
+                || image.visual_box != image_size.visual_box
                 || computed_target.is_changed()
                 || content_size.is_added()
-                || image.is_changed()
             {
                 image_size.size = size;
+                image_size.visual_box = image.visual_box;
                 content_size.set(NodeMeasure::Image(ImageMeasure {
                     // multiply the image size by the scale factor to get the physical size
                     size: size.as_vec2() * computed_target.scale_factor(),
@@ -363,5 +365,41 @@ pub fn update_image_content_size_system(
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{change_detection::DetectChanges, schedule::Schedule, world::World};
+
+    #[test]
+    fn tint_change_does_not_rewrite_intrinsic_size() {
+        let mut world = World::new();
+        let mut images = Assets::<Image>::default();
+        let image = images.add(Image::default());
+        world.insert_resource(images);
+        world.insert_resource(Assets::<TextureAtlasLayout>::default());
+        let entity = world
+            .spawn((
+                ContentSize::default(),
+                ImageNode::new(image),
+                ImageNodeSize::default(),
+                ComputedUiRenderTargetInfo::default(),
+            ))
+            .id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_image_content_size_system);
+        schedule.run(&mut world);
+        world.clear_trackers();
+
+        world.get_mut::<ImageNode>(entity).unwrap().color = Color::BLACK;
+        schedule.run(&mut world);
+
+        assert!(!world
+            .entity(entity)
+            .get_ref::<ContentSize>()
+            .unwrap()
+            .is_changed());
     }
 }

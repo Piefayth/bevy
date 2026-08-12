@@ -14,16 +14,20 @@ extern crate alloc;
 
 mod background;
 mod border;
+mod core;
 mod damage;
 mod gradient;
+mod gradient_render;
 mod image;
 mod layer;
+mod mask;
 mod material;
 mod paint;
 mod quiescence;
 mod sampled_image;
 mod scene;
 mod shadow;
+mod shadow_render;
 mod text;
 mod viewport;
 

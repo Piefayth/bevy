@@ -105,7 +105,7 @@ pub(crate) fn extract_retained_gradients(
     camera_map: Extract<UiCameraMap>,
     mut removed: Extract<RemovedGradientInputs>,
 ) {
-    let mut candidates: HashSet<_> = changed.iter().map(|item| item.0).collect();
+    let mut extra_candidates = HashSet::new();
     let RemovedGradientInputs {
         background,
         border,
@@ -118,10 +118,11 @@ pub(crate) fn extract_retained_gradients(
         visibility,
         camera,
     } = &mut *removed;
-    candidates.extend(background.read());
-    candidates.extend(border.read());
-    candidates.extend(clip.read());
-    candidates.extend(target.read());
+    extra_candidates.extend(background.read());
+    extra_candidates.extend(border.read());
+    extra_candidates.extend(clip.read());
+    extra_candidates.extend(target.read());
+    extra_candidates.retain(|entity| !changed.contains(*entity));
 
     let mut surfaces = state.lock();
     for entity in computed_node
@@ -134,28 +135,35 @@ pub(crate) fn extract_retained_gradients(
     {
         remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
     }
+    extra_candidates.retain(|entity| {
+        if all.contains(*entity) {
+            true
+        } else {
+            remove_entity(&mut dependencies, &mut surfaces, &mut commands, *entity);
+            false
+        }
+    });
 
     let mut camera_mapper = camera_map.get_mapper();
     let mut scratch = Vec::new();
     let mut resolved_stops = Vec::new();
-    for entity in candidates {
-        let Ok((
-            entity,
-            source_node,
-            node,
-            stack,
-            transform,
-            visibility,
-            clip,
-            target_camera,
-            target,
-            backgrounds,
-            borders,
-        )) = all.get(entity)
-        else {
-            remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
-            continue;
-        };
+    for (
+        entity,
+        source_node,
+        node,
+        stack,
+        transform,
+        visibility,
+        clip,
+        target_camera,
+        target,
+        backgrounds,
+        borders,
+    ) in changed.iter().chain(
+        extra_candidates
+            .into_iter()
+            .filter_map(|entity| all.get(entity).ok()),
+    ) {
         let Some(camera) = camera_mapper.map(target_camera) else {
             remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
             continue;

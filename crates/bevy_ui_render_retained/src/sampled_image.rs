@@ -6,10 +6,11 @@ use bevy::{
     ecs::{
         entity::Entity,
         message::MessageReader,
-        system::{Query, ResMut},
+        system::{Query, Res},
     },
     image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor},
     math::{Rect, UVec3},
+    platform::collections::{HashMap, HashSet},
     render::{
         render_asset::RenderAssets,
         render_resource::{DefaultImageSamplerDescriptor, TextureDimension, TextureUsages},
@@ -18,8 +19,8 @@ use bevy::{
     },
 };
 use core::any::TypeId;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, PoisonError};
+use smallvec::SmallVec;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 #[derive(Clone, Copy)]
 enum ImageWriteRegion {
@@ -138,10 +139,10 @@ impl ImageSample {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 struct ReaderDependencies {
-    images: HashSet<AssetId<Image>>,
-    samples: HashSet<ImageSample>,
+    images: SmallVec<[AssetId<Image>; 2]>,
+    samples: SmallVec<[ImageSample; 4]>,
 }
 
 struct SampleState {
@@ -155,8 +156,8 @@ struct MetadataState {
     revision: u64,
 }
 
-#[derive(bevy::prelude::Resource, Default)]
-pub(crate) struct RetainedSampledImages {
+#[derive(Default)]
+pub(crate) struct SampledImageState {
     readers: HashMap<ImageReader, ReaderDependencies>,
     image_readers: HashMap<AssetId<Image>, HashSet<ImageReader>>,
     metadata: HashMap<AssetId<Image>, MetadataState>,
@@ -168,7 +169,24 @@ pub(crate) struct RetainedSampledImages {
     next_revision: u64,
 }
 
+/// The exact sampled-image dependency graph shared by every paint family.
+///
+/// Generic material extractors cannot be statically ordered relative to other
+/// instantiations of themselves. A transaction preserves the same serialized
+/// access as an ECS `ResMut` without making valid plugin combinations
+/// schedule-ambiguous.
+#[derive(bevy::prelude::Resource, Default)]
+pub(crate) struct RetainedSampledImages {
+    state: Mutex<SampledImageState>,
+}
+
 impl RetainedSampledImages {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, SampledImageState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl SampledImageState {
     pub(crate) fn replace_reader(
         &mut self,
         reader: ImageReader,
@@ -176,55 +194,56 @@ impl RetainedSampledImages {
         assets: &Assets<Image>,
         default_sampler: &DefaultImageSamplerDescriptor,
     ) {
-        self.detach_reader(reader);
         let mut dependencies = ReaderDependencies::default();
         for requested_sample in samples {
             let image = requested_sample.image();
             let sample = assets.get(image).map_or(requested_sample, |asset| {
                 proven_sample(requested_sample, asset, default_sampler)
             });
-            if dependencies.samples.insert(sample) {
-                self.samples
-                    .entry(sample)
-                    .or_insert_with(|| SampleState {
-                        pixels: assets
-                            .get(sample.image())
-                            .and_then(|image| sample_pixels(image, sample)),
-                        revision: 0,
-                        readers: HashSet::default(),
-                    })
-                    .readers
-                    .insert(reader);
+            if !dependencies.samples.contains(&sample) {
+                dependencies.samples.push(sample);
             }
-            if dependencies.images.insert(image) {
-                self.image_readers.entry(image).or_default().insert(reader);
-                self.metadata.entry(image).or_insert_with(|| MetadataState {
-                    value: assets.get(image).map(image_metadata),
-                    revision: 0,
-                });
+            if !dependencies.images.contains(&image) {
+                dependencies.images.push(image);
             }
         }
-        let newly_active: Vec<_> = dependencies
-            .images
-            .iter()
-            .filter(|image| {
-                self.active_render_targets.contains(image)
-                    && !self.rendered_revisions.contains_key(image)
-            })
-            .copied()
-            .collect();
-        for image in newly_active {
-            let revision = self.new_revision();
-            self.rendered_revisions.insert(image, revision);
+        if self.readers.get(&reader) == Some(&dependencies) {
+            return;
+        }
+
+        self.detach_reader(reader);
+        for &sample in &dependencies.samples {
+            self.samples
+                .entry(sample)
+                .or_insert_with(|| SampleState {
+                    pixels: assets
+                        .get(sample.image())
+                        .and_then(|image| sample_pixels(image, sample)),
+                    revision: 0,
+                    readers: HashSet::default(),
+                })
+                .readers
+                .insert(reader);
+        }
+        for &image in &dependencies.images {
+            self.image_readers.entry(image).or_default().insert(reader);
+            self.metadata.entry(image).or_insert_with(|| MetadataState {
+                value: assets.get(image).map(image_metadata),
+                revision: 0,
+            });
+            if self.active_render_targets.contains(&image)
+                && !self.rendered_revisions.contains_key(&image)
+            {
+                let revision = self.new_revision();
+                self.rendered_revisions.insert(image, revision);
+            }
         }
         self.readers.insert(reader, dependencies);
-        self.prune_unused();
     }
 
     pub(crate) fn remove_reader(&mut self, reader: ImageReader) {
         self.detach_reader(reader);
         self.nominated.remove(&reader);
-        self.prune_unused();
     }
 
     fn detach_reader(&mut self, reader: ImageReader) {
@@ -233,22 +252,20 @@ impl RetainedSampledImages {
         };
         for image in old.images {
             remove_reverse_reader(&mut self.image_readers, image, reader);
+            if !self.image_readers.contains_key(&image) {
+                self.metadata.remove(&image);
+                self.pending.remove(&image);
+                self.rendered_revisions.remove(&image);
+            }
         }
         for sample in old.samples {
             if let Some(state) = self.samples.get_mut(&sample) {
                 state.readers.remove(&reader);
+                if state.readers.is_empty() {
+                    self.samples.remove(&sample);
+                }
             }
         }
-    }
-
-    fn prune_unused(&mut self) {
-        self.metadata
-            .retain(|image, _| self.image_readers.contains_key(image));
-        self.pending
-            .retain(|image| self.image_readers.contains_key(image));
-        self.samples.retain(|_, state| !state.readers.is_empty());
-        self.rendered_revisions
-            .retain(|image, _| self.image_readers.contains_key(image));
     }
 
     pub(crate) fn mark_pending(&mut self, image: AssetId<Image>, asset: Option<&Image>) {
@@ -368,7 +385,7 @@ impl RetainedSampledImages {
         &self,
         image: AssetId<Image>,
         samples: impl IntoIterator<Item = ImageSample>,
-    ) -> Box<[u64]> {
+    ) -> SmallVec<[u64; 4]> {
         let mut samples: Vec<_> = samples.into_iter().collect();
         samples.sort_unstable();
         core::iter::once(self.metadata.get(&image).map_or(0, |state| state.revision))
@@ -406,7 +423,7 @@ impl RetainedSampledImages {
         let active: Vec<_> = self
             .active_render_targets
             .iter()
-            .filter(|image| self.image_readers.contains_key(image))
+            .filter(|image| self.image_readers.contains_key(*image))
             .copied()
             .collect();
         for image in active {
@@ -416,7 +433,6 @@ impl RetainedSampledImages {
                 self.nominated.extend(readers);
             }
         }
-        self.prune_unused();
     }
 
     fn image_written(&mut self, write: ImageWrite) {
@@ -438,12 +454,13 @@ impl RetainedSampledImages {
 }
 
 pub(crate) fn extract_sampled_image_changes(
-    mut retained: ResMut<RetainedSampledImages>,
-    writes: bevy::ecs::system::Res<RetainedUiImageWrites>,
-    images: Extract<bevy::ecs::system::Res<Assets<Image>>>,
+    retained: Res<RetainedSampledImages>,
+    writes: Res<RetainedUiImageWrites>,
+    images: Extract<Res<Assets<Image>>>,
     cameras: Extract<Query<(&'static Camera, &'static RenderTarget)>>,
     mut events: Extract<MessageReader<AssetEvent<Image>>>,
 ) {
+    let mut retained = retained.lock();
     for write in writes.take() {
         retained.image_written(write);
     }
@@ -489,9 +506,10 @@ fn sample_intersects(sample: ImageSample, write: ImageWriteRegion) -> bool {
 }
 
 pub(crate) fn resolve_ready_sampled_images(
-    mut retained: ResMut<RetainedSampledImages>,
-    gpu_images: bevy::ecs::system::Res<RenderAssets<GpuImage>>,
+    retained: Res<RetainedSampledImages>,
+    gpu_images: Res<RenderAssets<GpuImage>>,
 ) {
+    let mut retained = retained.lock();
     retained.resolve_ready(&gpu_images);
 }
 
@@ -704,7 +722,7 @@ mod tests {
         let entity = Entity::from_raw_u32(7).unwrap();
         let reader = ImageReader::Node(entity);
         let sampler = DefaultImageSamplerDescriptor(ImageSamplerDescriptor::linear());
-        let mut retained = RetainedSampledImages::default();
+        let mut retained = SampledImageState::default();
 
         retained.mark_render_targets(HashSet::from([image]));
         assert_eq!(retained.next_revision, 0);
@@ -734,7 +752,7 @@ mod tests {
         let left = Entity::from_raw_u32(7).unwrap();
         let right = Entity::from_raw_u32(8).unwrap();
         let sampler = DefaultImageSamplerDescriptor(ImageSamplerDescriptor::linear());
-        let mut retained = RetainedSampledImages::default();
+        let mut retained = SampledImageState::default();
         retained.replace_reader(
             ImageReader::Node(left),
             [ImageSample::rect(

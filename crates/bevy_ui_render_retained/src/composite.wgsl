@@ -32,6 +32,11 @@ fn wipe() -> @location(0) vec4<f32> {
 }
 
 @fragment
+fn mask() -> @location(0) f32 {
+    return 1.0;
+}
+
+@fragment
 fn copy_retained(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     return textureLoad(retained_ui, vec2<i32>(position.xy), 0);
 }

@@ -2,11 +2,17 @@
 
 use crate::background::extract_retained_backgrounds;
 use crate::border::extract_retained_borders;
-use crate::damage::DamageIndex;
+use crate::core::{
+    prepare_retained_core, queue_retained_core, register_retained_core, DrawRetainedCore,
+    RetainedCore,
+};
 use crate::gradient::{extract_retained_gradients, RetainedGradientDependencies};
+use crate::gradient_render::{
+    prepare as prepare_retained_gradients, queue as queue_retained_gradients,
+    register as register_retained_gradients, DrawRetainedGradients, RetainedGradients,
+};
 use crate::image::{extract_retained_images, RetainedImageDependencies};
 use crate::material::RetainedPendingMaterials;
-use crate::paint::coverage_is_fully_damaged;
 use crate::sampled_image::{
     extract_sampled_image_changes, resolve_ready_sampled_images, RetainedSampledImages,
     RetainedUiImageWrites,
@@ -16,6 +22,10 @@ use crate::scene::{
     RetainedRepairPlans, RetainedUiPaintCounters, RetainedUiScene,
 };
 use crate::shadow::{extract_retained_shadows, RetainedShadowDependencies};
+use crate::shadow_render::{
+    prepare as prepare_retained_shadows, queue as queue_retained_shadows,
+    register as register_retained_shadows, DrawRetainedShadows, RetainedShadows,
+};
 use crate::text::{extract_retained_text, RetainedTextDependencies};
 use crate::viewport::{extract_retained_viewports, RetainedViewportDependencies};
 use crate::{PhysicalRect, RepairPlan};
@@ -35,26 +45,23 @@ use bevy::{
         system::{Commands, Local, Query, Res, ResMut},
     },
     log::error,
-    math::{FloatOrd, UVec2},
+    math::UVec2,
     mesh::{VertexBufferLayout, VertexFormat},
     prelude::{App, Plugin, Resource, World},
     render::{
         camera::ExtractedCamera,
         diagnostic::RecordDiagnostics,
         render_asset::RenderAssets,
-        render_phase::{
-            DrawFunctionId, DrawFunctions, PhaseItem, PhaseItemExtraIndex, ViewSortedRenderPhases,
-        },
+        render_phase::{DrawFunctionId, DrawFunctions, PhaseItem, ViewSortedRenderPhases},
         render_resource::{
             binding_types::{sampler, texture_2d},
             BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
             BlendState, BufferUsages, CachedRenderPipelineId, ColorTargetState, ColorWrites,
             Extent3d, FragmentState, LoadOp, Operations, PipelineCache, RawBufferVec,
             RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor,
-            SamplerBindingType, ShaderStages, SpecializedRenderPipelines, StoreOp, Texture,
-            TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-            TextureView, TextureViewDescriptor, TextureViewId, VertexAttribute, VertexState,
-            VertexStepMode,
+            SamplerBindingType, ShaderStages, StoreOp, Texture, TextureDescriptor,
+            TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
+            TextureViewDescriptor, TextureViewId, VertexAttribute, VertexState, VertexStepMode,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
         texture::{FallbackImageZero, GpuImage},
@@ -62,14 +69,13 @@ use bevy::{
         ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
     },
     ui_render::{
-        box_shadow::{BoxShadowInfrastructurePlugin, DrawBoxShadows, UiShadowsBatch},
-        gradient::{DrawGradientFns, GradientBatch, GradientInfrastructurePlugin},
+        gradient::GradientInfrastructurePlugin,
         ui_texture_slice_pipeline::{
             queue_ui_slice_items, DrawUiTextureSliceItem, UiTextureSlicerBatch,
             UiTextureSlicerInfrastructurePlugin,
         },
-        DrawUi, DrawUiItem, ExtractedUiNodes, RenderUiSystems, TransparentUi, UiAntiAlias, UiBatch,
-        UiCameraView, UiItemBatch, UiMaterialBatchRange, UiPipeline, UiPipelineKey, UiViewTarget,
+        PrepareUiSystems, RenderUiSystems, TransparentUi, UiCameraView, UiMaterialBatchRange,
+        UiViewTarget,
     },
 };
 use core::{
@@ -92,14 +98,31 @@ impl Plugin for RetainedUiRenderPlugin {
         {
             app.add_plugins(crate::RetainedUiMainWorldPlugin);
         }
-        app.add_plugins(BoxShadowInfrastructurePlugin);
-        app.add_plugins(GradientInfrastructurePlugin);
         app.add_plugins(UiTextureSlicerInfrastructurePlugin);
+        app.add_plugins(GradientInfrastructurePlugin);
+        embedded_asset!(app, "core.wgsl");
+        embedded_asset!(app, "gradient_render.wgsl");
+        embedded_asset!(app, "shadow.wgsl");
         embedded_asset!(app, "composite.wgsl");
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
+        register_retained_core(render_app);
+        register_retained_gradients(render_app);
+        register_retained_shadows(render_app);
+
+        let removed_node_preparation = render_app
+            .remove_systems_in_set(
+                Render,
+                PrepareUiSystems::Nodes,
+                ScheduleCleanupPolicy::RemoveSystemsOnly,
+            )
+            .expect("UiRenderInfrastructurePlugin must be added before RetainedUiRenderPlugin");
+        assert_eq!(
+            removed_node_preparation, 1,
+            "UI infrastructure must contain one transient node preparation system"
+        );
 
         render_app
             .init_resource::<LayerSurfaces>()
@@ -130,6 +153,8 @@ impl Plugin for RetainedUiRenderPlugin {
                 ExtractSchedule,
                 extract_retained_viewports
                     .in_set(RenderUiSystems::ExtractViewportNodes)
+                    .before(extract_retained_images)
+                    .before(extract_retained_text)
                     .before(replay_retained_ui),
             )
             .add_systems(
@@ -173,8 +198,25 @@ impl Plugin for RetainedUiRenderPlugin {
                 Render,
                 resolve_ready_sampled_images.in_set(RenderSystems::PrepareResources),
             )
-            .add_systems(Render, queue_retained_uinodes.in_set(RenderSystems::Queue))
+            .add_systems(Render, queue_retained_core.in_set(RenderSystems::Queue))
+            .add_systems(
+                Render,
+                queue_retained_gradients.in_set(RenderSystems::Queue),
+            )
+            .add_systems(Render, queue_retained_shadows.in_set(RenderSystems::Queue))
             .add_systems(Render, queue_ui_slice_items.in_set(RenderSystems::Queue))
+            .add_systems(
+                Render,
+                prepare_retained_core.in_set(RenderSystems::PrepareBindGroups),
+            )
+            .add_systems(
+                Render,
+                prepare_retained_gradients.in_set(RenderSystems::PrepareBindGroups),
+            )
+            .add_systems(
+                Render,
+                prepare_retained_shadows.in_set(RenderSystems::PrepareBindGroups),
+            )
             .add_systems(
                 RenderStartup,
                 (clear_final_pipelines, init_retained_ui_pipelines).chain(),
@@ -198,73 +240,6 @@ impl Plugin for RetainedUiRenderPlugin {
         render_app
             .add_systems(Core2d, retained_ui_pass.after(Core2dSystems::PostProcess))
             .add_systems(Core3d, retained_ui_pass.after(Core3dSystems::PostProcess));
-    }
-}
-
-fn queue_retained_uinodes(
-    extracted_uinodes: Res<ExtractedUiNodes>,
-    ui_pipeline: Res<UiPipeline>,
-    mut pipelines: ResMut<SpecializedRenderPipelines<UiPipeline>>,
-    mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
-    render_views: Query<(&UiCameraView, Option<&UiAntiAlias>), With<ExtractedView>>,
-    camera_views: Query<&ExtractedView>,
-    pipeline_cache: Res<PipelineCache>,
-    draw_functions: Res<DrawFunctions<TransparentUi>>,
-    items: Res<RetainedItems>,
-) {
-    let draw_functions = draw_functions.read();
-    let batched_draw_function = draw_functions.id::<DrawUi>();
-    let item_draw_function = draw_functions.id::<DrawUiItem>();
-    let retained_items = items.0.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut camera_can_batch = HashMap::<Entity, bool>::new();
-    for node in &extracted_uinodes.uinodes {
-        let fully_damaged = retained_items
-            .get(&node.render_entity)
-            .is_some_and(|item| item.fully_damaged);
-        camera_can_batch
-            .entry(node.extracted_camera_entity)
-            .and_modify(|can_batch| *can_batch &= fully_damaged)
-            .or_insert(fully_damaged);
-    }
-    for (index, node) in extracted_uinodes.uinodes.iter().enumerate() {
-        let Ok((default_camera_view, ui_anti_alias)) =
-            render_views.get(node.extracted_camera_entity)
-        else {
-            continue;
-        };
-        let Ok(view) = camera_views.get(default_camera_view.0) else {
-            continue;
-        };
-        let Some(phase) = phases.get_mut(&view.retained_view_entity) else {
-            continue;
-        };
-        let pipeline = pipelines.specialize(
-            &pipeline_cache,
-            &ui_pipeline,
-            UiPipelineKey {
-                target_format: view.target_format,
-                anti_alias: matches!(ui_anti_alias, None | Some(UiAntiAlias::On)),
-            },
-        );
-        let draw_function = if camera_can_batch
-            .get(&node.extracted_camera_entity)
-            .copied()
-            .unwrap_or(false)
-        {
-            batched_draw_function
-        } else {
-            item_draw_function
-        };
-        phase.add_transient(TransparentUi {
-            draw_function,
-            pipeline,
-            entity: (node.render_entity, node.main_entity),
-            sort_key: FloatOrd(node.z_order),
-            index,
-            batch_range: 0..0,
-            extra_index: PhaseItemExtraIndex::None,
-            indexed: true,
-        });
     }
 }
 
@@ -321,12 +296,14 @@ impl RetainedUiLayerCounters {
 #[derive(Resource)]
 struct RetainedUiPipelines {
     final_layout: BindGroupLayoutDescriptor,
+    mask_layout: BindGroupLayoutDescriptor,
     shader: bevy::asset::Handle<bevy::shader::Shader>,
     vertex: VertexState,
     rect_vertex: VertexState,
     final_pipelines: Mutex<HashMap<(BlitPipelineKey, bool), CachedRenderPipelineId>>,
     wipe_pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
     copy_pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
+    mask_pipeline: Mutex<Option<CachedRenderPipelineId>>,
 }
 
 impl RetainedUiPipelines {
@@ -426,6 +403,31 @@ impl RetainedUiPipelines {
                 })
             })
     }
+
+    fn mask_pipeline(&self, pipeline_cache: &PipelineCache) -> CachedRenderPipelineId {
+        *self
+            .mask_pipeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(|| {
+                pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+                    label: Some("retained_ui_damage_mask_pipeline".into()),
+                    layout: Vec::new(),
+                    vertex: self.rect_vertex.clone(),
+                    fragment: Some(FragmentState {
+                        shader: self.shader.clone(),
+                        entry_point: Some("mask".into()),
+                        targets: vec![Some(ColorTargetState {
+                            format: TextureFormat::R8Unorm,
+                            blend: None,
+                            write_mask: ColorWrites::RED,
+                        })],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            })
+    }
 }
 
 fn init_retained_ui_pipelines(
@@ -446,6 +448,7 @@ fn init_retained_ui_pipelines(
                 ),
             ),
         ),
+        mask_layout: crate::mask::layout(),
         shader: shader.clone(),
         vertex: fullscreen_shader.to_vertex_state(),
         rect_vertex: VertexState {
@@ -465,6 +468,7 @@ fn init_retained_ui_pipelines(
         final_pipelines: Mutex::new(HashMap::new()),
         wipe_pipelines: Mutex::new(HashMap::new()),
         copy_pipelines: Mutex::new(HashMap::new()),
+        mask_pipeline: Mutex::new(None),
     });
 }
 
@@ -551,6 +555,8 @@ struct LayerSurface {
     size: UVec2,
     format: TextureFormat,
     slots: [LayerSlot; 2],
+    _mask_texture: Texture,
+    mask_view: TextureView,
     active: usize,
     has_content: bool,
     generation: u64,
@@ -586,10 +592,28 @@ impl LayerSurface {
             }
         };
 
+        let mask_texture = render_device.create_texture(&TextureDescriptor {
+            label: Some("retained_ui_damage_mask"),
+            size: Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mask_view = mask_texture.create_view(&TextureViewDescriptor::default());
+
         Self {
             size,
             format,
             slots: [create_slot(), create_slot()],
+            _mask_texture: mask_texture,
+            mask_view,
             active: 0,
             has_content: false,
             generation: 0,
@@ -610,6 +634,7 @@ impl LayerSurface {
                     .expect("render-attachment formats have a fixed texel size"),
             )
             * self.slots.len() as u64
+            + u64::from(self.size.x) * u64::from(self.size.y)
     }
 
     fn commit(&mut self, active: usize, regions: Vec<PhysicalRect>, has_content: bool) {
@@ -668,7 +693,7 @@ fn phase_is_ready(
         .0
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let sampled_images = world.resource::<RetainedSampledImages>();
+    let sampled_images = world.resource::<RetainedSampledImages>().lock();
     let gpu_images = world.resource::<RenderAssets<GpuImage>>();
     let image_unavailable = |entity| {
         let mut unavailable = false;
@@ -685,25 +710,18 @@ fn phase_is_ready(
         }
         Some(unavailable)
     };
-    let mut batched_draw_expected = false;
-    let mut batched_draw_ready = false;
     for index in 0..phase.items.len() {
         let item = phase.items.get_index(index).unwrap().1;
-        if item.draw_function == draw_functions.ui_batch {
-            let Some(unavailable_image) = image_unavailable(item.entity()) else {
-                return false;
-            };
-            if unavailable_image {
-                continue;
-            }
-            batched_draw_expected = true;
-            if item.batch_range.is_empty() {
-                continue;
-            }
+        if item.draw_function == draw_functions.core {
             if item_batch_range(world, item, draw_functions).is_none() {
+                let Some(unavailable_image) = image_unavailable(item.entity()) else {
+                    return false;
+                };
+                if unavailable_image {
+                    continue;
+                }
                 return false;
             }
-            batched_draw_ready = true;
             if pipeline_cache.get_render_pipeline(item.pipeline).is_none() {
                 return false;
             }
@@ -722,25 +740,23 @@ fn phase_is_ready(
             return false;
         }
     }
-    !batched_draw_expected || batched_draw_ready
+    true
 }
 
 #[derive(Clone, Copy)]
 struct RetainedDrawFunctionIds {
-    box_shadow: DrawFunctionId,
-    gradient: DrawFunctionId,
-    ui_batch: DrawFunctionId,
-    ui_item: DrawFunctionId,
+    core: DrawFunctionId,
+    retained_gradient: DrawFunctionId,
+    retained_shadow: DrawFunctionId,
     texture_slice: DrawFunctionId,
 }
 
 fn retained_draw_function_ids(world: &World) -> RetainedDrawFunctionIds {
     let draw_functions = world.resource::<DrawFunctions<TransparentUi>>().read();
     RetainedDrawFunctionIds {
-        box_shadow: draw_functions.id::<DrawBoxShadows>(),
-        gradient: draw_functions.id::<DrawGradientFns>(),
-        ui_batch: draw_functions.id::<DrawUi>(),
-        ui_item: draw_functions.id::<DrawUiItem>(),
+        core: draw_functions.id::<DrawRetainedCore>(),
+        retained_gradient: draw_functions.id::<DrawRetainedGradients>(),
+        retained_shadow: draw_functions.id::<DrawRetainedShadows>(),
         texture_slice: draw_functions.id::<DrawUiTextureSliceItem>(),
     }
 }
@@ -750,22 +766,16 @@ fn item_batch_range(
     item: &TransparentUi,
     draw_functions: RetainedDrawFunctionIds,
 ) -> Option<Range<u32>> {
-    if item.draw_function == draw_functions.box_shadow {
+    if item.draw_function == draw_functions.core {
+        world.resource::<RetainedCore>().batch_range(item.entity())
+    } else if item.draw_function == draw_functions.retained_shadow {
         world
-            .get::<UiShadowsBatch>(item.entity())
-            .map(|batch| batch.range.clone())
-    } else if item.draw_function == draw_functions.gradient {
+            .resource::<RetainedShadows>()
+            .batch_range(item.entity())
+    } else if item.draw_function == draw_functions.retained_gradient {
         world
-            .get::<GradientBatch>(item.entity())
-            .map(|batch| batch.range.clone())
-    } else if item.draw_function == draw_functions.ui_batch {
-        world
-            .get::<UiBatch>(item.entity())
-            .map(|batch| batch.range.clone())
-    } else if item.draw_function == draw_functions.ui_item {
-        world
-            .get::<UiItemBatch>(item.entity())
-            .map(|batch| batch.range.clone())
+            .resource::<RetainedGradients>()
+            .batch_range(item.entity())
     } else if item.draw_function == draw_functions.texture_slice {
         world
             .get::<UiTextureSlicerBatch>(item.entity())
@@ -782,10 +792,52 @@ fn prepared_quad_count(
     item: &TransparentUi,
     draw_functions: RetainedDrawFunctionIds,
 ) -> u64 {
+    if item.draw_function == draw_functions.core {
+        return world
+            .resource::<RetainedCore>()
+            .batch_range(item.entity())
+            .map(|range| u64::try_from(range.len()).expect("prepared UI quad count exceeds u64"))
+            .unwrap_or_default();
+    }
+    if item.draw_function == draw_functions.retained_shadow {
+        return world
+            .resource::<RetainedShadows>()
+            .batch_range(item.entity())
+            .map(|range| u64::try_from(range.len()).expect("prepared shadow count exceeds u64"))
+            .unwrap_or_default();
+    }
+    if item.draw_function == draw_functions.retained_gradient {
+        return world
+            .resource::<RetainedGradients>()
+            .batch_range(item.entity())
+            .map(|range| u64::try_from(range.len()).expect("prepared gradient count exceeds u64"))
+            .unwrap_or_default();
+    }
     let indices = item_batch_range(world, item, draw_functions)
         .map(|range| range.len())
         .unwrap_or_default();
     u64::try_from(indices / 6).expect("prepared UI quad count exceeds u64")
+}
+
+fn prepared_item_count(
+    world: &World,
+    item: &TransparentUi,
+    draw_functions: RetainedDrawFunctionIds,
+) -> u64 {
+    let count = if item.draw_function == draw_functions.core {
+        world.resource::<RetainedCore>().item_count(item.entity())
+    } else if item.draw_function == draw_functions.retained_shadow {
+        world
+            .resource::<RetainedShadows>()
+            .item_count(item.entity())
+    } else if item.draw_function == draw_functions.retained_gradient {
+        world
+            .resource::<RetainedGradients>()
+            .item_count(item.entity())
+    } else {
+        Some(1)
+    };
+    u64::from(count.unwrap_or_default())
 }
 
 fn target_rect(size: UVec2) -> PhysicalRect {
@@ -1024,7 +1076,6 @@ fn retained_ui_pass(
     let scene = world.resource::<RetainedUiScene>();
     let repair_plan = repair_plans.0.get(&ui_view_target.0).cloned();
     let damage_regions = clipped_damage(repair_plan.as_ref(), size);
-    let damage_index = DamageIndex::new(&damage_regions);
     if let Some(plan) = repair_plan.as_ref()
         && damage_regions.is_empty()
     {
@@ -1098,17 +1149,22 @@ fn retained_ui_pass(
             (
                 pipelines.wipe_pipeline(extracted_view.target_format, &pipeline_cache),
                 pipelines.copy_pipeline(extracted_view.target_format, &pipeline_cache),
+                pipelines.mask_pipeline(&pipeline_cache),
             )
         })
-        .and_then(|(wipe, copy)| {
+        .and_then(|(wipe, copy, mask)| {
             Some((
                 pipeline_cache.get_render_pipeline(wipe)?,
                 pipeline_cache.get_render_pipeline(copy)?,
+                pipeline_cache.get_render_pipeline(mask)?,
             ))
         });
-    if let Some((wipe_pipeline, copy_pipeline)) = repair_pipelines {
+    if let Some((wipe_pipeline, copy_pipeline, mask_pipeline)) = repair_pipelines {
         let pending = 1 - surface.active;
-        let sync_regions = pending_sync_regions(surface, pending, &mut ctx);
+        let mut sync_regions = pending_sync_regions(surface, pending, &mut ctx);
+        if sync_regions == damage_regions {
+            sync_regions.clear();
+        }
         let items = world
             .resource::<RetainedItems>()
             .0
@@ -1146,6 +1202,32 @@ fn retained_ui_pass(
                 &BindGroupEntries::sequential((source, source, &blit_pipeline.sampler)),
             )
         });
+        let mask_bind_group = ctx.render_device().create_bind_group(
+            "retained_ui_damage_mask_bind_group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.mask_layout),
+            &BindGroupEntries::single(&surface.mask_view),
+        );
+        {
+            let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("retained_ui_damage_mask"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &surface.mask_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Default::default()),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_render_pipeline(mask_pipeline);
+            pass.set_vertex_buffer(0, rect_buffer.slice(..));
+            pass.draw(0..6, sync_instances..sync_instances + damage_instances);
+        }
         let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("retained_ui_repair"),
             color_attachments: &[Some(RenderPassColorAttachment {
@@ -1173,7 +1255,6 @@ fn retained_ui_pass(
         pass.draw(0..6, sync_instances..sync_instances + damage_instances);
 
         if let Some(phase) = phase.filter(|phase| !phase.items.is_empty()) {
-            let target = target_rect(size);
             let mut full_run_start = None;
             for index in 0..=phase.items.len() {
                 let phase_item =
@@ -1181,20 +1262,14 @@ fn retained_ui_pass(
                 let prepared = phase_item
                     .and_then(|item| item_batch_range(world, item, draw_functions))
                     .is_some_and(|range| !range.is_empty());
-                let fully_damaged = prepared
+                let mask_clipped = prepared
                     && phase_item.is_some_and(|phase_item| {
-                        phase_item.draw_function == draw_functions.ui_batch
-                            || items.get(&phase_item.entity()).is_some_and(|item| {
-                                coverage_is_fully_damaged(
-                                    &item.coverage,
-                                    &damage_regions,
-                                    &damage_index,
-                                    Some(target),
-                                )
-                            })
+                        phase_item.draw_function == draw_functions.core
+                            || phase_item.draw_function == draw_functions.retained_shadow
+                            || phase_item.draw_function == draw_functions.retained_gradient
                     });
 
-                if fully_damaged {
+                if mask_clipped {
                     full_run_start.get_or_insert(index);
                     continue;
                 }
@@ -1202,9 +1277,10 @@ fn retained_ui_pass(
                 if let Some(start) = full_run_start.take() {
                     let run = start..index;
                     pass.set_scissor_rect(0, 0, size.x, size.y);
-                    replayed += u64::try_from(run.len()).expect("replay range exceeds u64");
+                    pass.set_bind_group(1, &mask_bind_group, &[]);
                     for index in run.clone() {
                         let item = phase.items.get_index(index).unwrap().1;
+                        replayed += prepared_item_count(world, item, draw_functions);
                         replayed_quads += prepared_quad_count(world, item, draw_functions);
                     }
                     if let Err(err) = phase.render_range(&mut pass, world, ui_view_entity, run) {
@@ -1295,57 +1371,5 @@ fn retained_ui_pass(
         counters
             .ui_sample_pixels
             .fetch_add(u64::from(size.x) * u64::from(size.y), Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::PaintCoverage;
-
-    fn rect(min_x: i32, min_y: i32, max_x: i32, max_y: i32) -> PhysicalRect {
-        PhysicalRect::from_min_max(min_x, min_y, max_x, max_y).unwrap()
-    }
-
-    #[test]
-    fn adjacent_damage_regions_can_fully_cover_one_item() {
-        let coverage = PaintCoverage::one(rect(0, 0, 10, 10));
-        let damage = [rect(0, 0, 4, 10), rect(4, 0, 10, 10)];
-        let index = DamageIndex::new(&damage);
-
-        assert!(coverage_is_fully_damaged(
-            &coverage,
-            &damage,
-            &index,
-            Some(rect(0, 0, 20, 20))
-        ));
-    }
-
-    #[test]
-    fn damage_with_a_gap_does_not_fully_cover_an_item() {
-        let coverage = PaintCoverage::one(rect(0, 0, 10, 10));
-        let damage = [rect(0, 0, 4, 10), rect(5, 0, 10, 10)];
-        let index = DamageIndex::new(&damage);
-
-        assert!(!coverage_is_fully_damaged(
-            &coverage,
-            &damage,
-            &index,
-            Some(rect(0, 0, 20, 20))
-        ));
-    }
-
-    #[test]
-    fn coverage_outside_the_target_does_not_prevent_single_draw_replay() {
-        let coverage = PaintCoverage::one(rect(-5, 0, 5, 10));
-        let damage = [rect(0, 0, 5, 10)];
-        let index = DamageIndex::new(&damage);
-
-        assert!(coverage_is_fully_damaged(
-            &coverage,
-            &damage,
-            &index,
-            Some(rect(0, 0, 20, 20))
-        ));
     }
 }

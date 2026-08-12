@@ -24,8 +24,6 @@ use bevy::{
     },
     ui_render::{shader_flags, stack_z_offsets, NodeType, UiCameraMap},
 };
-use std::collections::HashSet;
-
 const EDGE_FLAGS: [u32; 4] = [
     shader_flags::BORDER_LEFT,
     shader_flags::BORDER_TOP,
@@ -86,7 +84,7 @@ pub(crate) fn extract_retained_borders(
     camera_map: Extract<UiCameraMap>,
     mut removed: Extract<RemovedBorderInputs>,
 ) {
-    let mut candidates: HashSet<_> = changed.iter().map(|item| item.0).collect();
+    let mut extra_candidates = bevy::platform::collections::HashSet::<Entity>::default();
     let RemovedBorderInputs {
         border,
         outline,
@@ -113,33 +111,32 @@ pub(crate) fn extract_retained_borders(
     }
     for entity in border.read() {
         remove_edges(&mut surfaces, &mut commands, entity, 0);
-        candidates.insert(entity);
+        extra_candidates.insert(entity);
     }
     for entity in outline.read() {
         remove_edges(&mut surfaces, &mut commands, entity, 4);
-        candidates.insert(entity);
+        extra_candidates.insert(entity);
     }
-    candidates.extend(clip.read());
+    extra_candidates.extend(clip.read());
+    extra_candidates.retain(|entity| !changed.contains(*entity));
 
     let mut camera_mapper = camera_map.get_mapper();
-    for entity in candidates {
-        let Ok((
-            entity,
-            node,
-            computed,
-            stack,
-            transform,
-            visibility,
-            clip,
-            target_camera,
-            border,
-            outline,
-        )) = all.get(entity)
-        else {
-            remove_edges(&mut surfaces, &mut commands, entity, 0);
-            remove_edges(&mut surfaces, &mut commands, entity, 4);
-            continue;
-        };
+    for (
+        entity,
+        node,
+        computed,
+        stack,
+        transform,
+        visibility,
+        clip,
+        target_camera,
+        border,
+        outline,
+    ) in changed.iter().chain(
+        extra_candidates
+            .into_iter()
+            .filter_map(|entity| all.get(entity).ok()),
+    ) {
         let Some(camera) = camera_mapper.map(target_camera) else {
             remove_edges(&mut surfaces, &mut commands, entity, 0);
             remove_edges(&mut surfaces, &mut commands, entity, 4);
@@ -156,41 +153,60 @@ pub(crate) fn extract_retained_borders(
                 border.right.to_linear(),
                 border.bottom.to_linear(),
             ];
-            upsert_edges(
-                &mut surfaces,
-                &mut commands,
-                entity,
-                camera,
-                stack.0 as f32 + stack_z_offsets::BORDER,
-                transform,
-                clip,
-                computed.size(),
-                computed.border(),
-                computed.border_radius(),
-                colors,
-                visible,
-                0,
-            );
+            let widths = computed.border();
+            if visible
+                && [
+                    widths.min_inset.x,
+                    widths.min_inset.y,
+                    widths.max_inset.x,
+                    widths.max_inset.y,
+                ]
+                .into_iter()
+                .zip(colors)
+                .any(|(width, color)| width > 0.0 && !color.is_fully_transparent())
+            {
+                upsert_edges(
+                    &mut surfaces,
+                    &mut commands,
+                    entity,
+                    camera,
+                    stack.0 as f32 + stack_z_offsets::BORDER,
+                    transform,
+                    clip,
+                    computed.size(),
+                    widths,
+                    computed.border_radius(),
+                    colors,
+                    true,
+                    0,
+                );
+            } else {
+                remove_edges(&mut surfaces, &mut commands, entity, 0);
+            }
         } else {
             remove_edges(&mut surfaces, &mut commands, entity, 0);
         }
 
         if let Some(outline) = outline {
-            upsert_edges(
-                &mut surfaces,
-                &mut commands,
-                entity,
-                camera,
-                stack.0 as f32 + stack_z_offsets::BORDER,
-                transform,
-                clip,
-                computed.outlined_node_size(),
-                BorderRect::all(computed.outline_width()),
-                computed.outline_radius(),
-                [outline.color.to_linear(); 4],
-                visible && computed.outline_width() > 0.0,
-                4,
-            );
+            if visible && computed.outline_width() > 0.0 && !outline.color.is_fully_transparent() {
+                upsert_edges(
+                    &mut surfaces,
+                    &mut commands,
+                    entity,
+                    camera,
+                    stack.0 as f32 + stack_z_offsets::BORDER,
+                    transform,
+                    clip,
+                    computed.outlined_node_size(),
+                    BorderRect::all(computed.outline_width()),
+                    computed.outline_radius(),
+                    [outline.color.to_linear(); 4],
+                    true,
+                    4,
+                );
+            } else {
+                remove_edges(&mut surfaces, &mut commands, entity, 4);
+            }
         } else {
             remove_edges(&mut surfaces, &mut commands, entity, 4);
         }
@@ -242,6 +258,7 @@ fn upsert_edges(
                     color: colors[edge],
                     rect: Rect::from_corners(Vec2::ZERO, size),
                     atlas_scaling: None,
+                    image_extent: None,
                     flip_x: false,
                     flip_y: false,
                     border,

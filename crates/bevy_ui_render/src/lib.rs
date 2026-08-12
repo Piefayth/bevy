@@ -136,6 +136,11 @@ pub enum RenderUiSystems {
     ExtractGradient,
 }
 
+#[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+pub enum PrepareUiSystems {
+    Nodes,
+}
+
 /// Marker for controlling whether UI is rendered with or without anti-aliasing
 /// in a camera. By default, UI is always anti-aliased.
 ///
@@ -294,7 +299,9 @@ impl Plugin for UiRenderInfrastructurePlugin {
                 Render,
                 (
                     sort_phase_system::<TransparentUi>.in_set(RenderSystems::PhaseSort),
-                    prepare_uinodes.in_set(RenderSystems::PrepareBindGroups),
+                    prepare_uinodes
+                        .in_set(RenderSystems::PrepareBindGroups)
+                        .in_set(PrepareUiSystems::Nodes),
                 ),
             );
     }

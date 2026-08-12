@@ -1,12 +1,13 @@
 //! Exact physical-pixel damage tracking.
 
+use alloc::sync::Arc;
+use bevy::platform::collections::HashMap;
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::collections::HashMap;
 
 static NEXT_JOURNAL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A non-empty rectangle of physical pixels with an exclusive maximum edge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PhysicalRect {
     min_x: i32,
     min_y: i32,
@@ -94,110 +95,250 @@ struct DamageEvent {
 pub struct RepairPlan {
     journal_id: u64,
     through_epoch: u64,
-    regions: Vec<PhysicalRect>,
+    regions: Arc<[PhysicalRect]>,
+    spatial: Arc<SpatialIndex<()>>,
     damaged_pixels: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DamageIndex {
-    order: Vec<usize>,
-    subtree_max_x: Vec<i32>,
-    leaf_base: usize,
+pub(crate) struct SpatialIndex<T> {
+    values: Vec<T>,
+    nodes: Vec<SpatialNode>,
+    parents: Vec<Option<usize>>,
+    entry_nodes: Vec<usize>,
+    refit_marks: Vec<u32>,
+    refit_generation: u32,
+    root: Option<usize>,
 }
 
-impl DamageIndex {
-    pub(crate) fn new(regions: &[PhysicalRect]) -> Self {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpatialNode {
+    bounds: PhysicalRect,
+    contents: SpatialNodeContents,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpatialNodeContents {
+    Entry(usize),
+    Branch([usize; 2]),
+}
+
+impl<T> SpatialIndex<T> {
+    pub(crate) fn new(entries: impl IntoIterator<Item = (PhysicalRect, T)>) -> Self {
+        let (regions, values): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         let mut order: Vec<_> = (0..regions.len()).collect();
-        order.sort_unstable_by_key(|&index| {
-            let region = regions[index];
-            (
-                region.min_x(),
-                region.max_x(),
-                region.min_y(),
-                region.max_y(),
-            )
-        });
-        let leaf_base = order.len().next_power_of_two().max(1);
-        let mut subtree_max_x = vec![i32::MIN; leaf_base * 2];
-        for (position, &index) in order.iter().enumerate() {
-            subtree_max_x[leaf_base + position] = regions[index].max_x();
-        }
-        for node in (1..leaf_base).rev() {
-            subtree_max_x[node] = subtree_max_x[node * 2].max(subtree_max_x[node * 2 + 1]);
-        }
+        let mut nodes = Vec::with_capacity(regions.len().saturating_mul(2).saturating_sub(1));
+        let mut parents = Vec::with_capacity(nodes.capacity());
+        let mut entry_nodes = vec![usize::MAX; regions.len()];
+        let root = Self::build(
+            &regions,
+            &mut order,
+            0,
+            &mut nodes,
+            &mut parents,
+            &mut entry_nodes,
+        );
+        let refit_marks = vec![0; nodes.len()];
         Self {
-            order,
-            subtree_max_x,
-            leaf_base,
+            values,
+            nodes,
+            parents,
+            entry_nodes,
+            refit_marks,
+            refit_generation: 0,
+            root,
         }
     }
 
-    pub(crate) fn intersects(&self, regions: &[PhysicalRect], query: PhysicalRect) -> bool {
-        let limit = self
-            .order
-            .partition_point(|&index| regions[index].min_x() < query.max_x());
-        self.intersects_node(regions, query, 1, 0, self.leaf_base, limit)
+    pub(crate) fn query_intersecting<U>(&self, other: &SpatialIndex<U>, mut visit: impl FnMut(T))
+    where
+        T: Copy,
+    {
+        if let Some(root) = self.root {
+            self.query_intersecting_node(root, other, &mut visit);
+        }
     }
 
-    pub(crate) fn intersection_area(&self, regions: &[PhysicalRect], query: PhysicalRect) -> u64 {
-        let limit = self
-            .order
-            .partition_point(|&index| regions[index].min_x() < query.max_x());
-        self.area_node(regions, query, 1, 0, self.leaf_base, limit)
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
     }
 
-    fn intersects_node(
-        &self,
+    pub(crate) fn query(&self, region: PhysicalRect, mut visit: impl FnMut(T))
+    where
+        T: Copy,
+    {
+        if let Some(root) = self.root {
+            self.query_node(root, region, &mut visit);
+        }
+    }
+
+    pub(crate) fn update_many(&mut self, updates: impl IntoIterator<Item = (usize, PhysicalRect)>) {
+        self.refit_generation = self.refit_generation.wrapping_add(1);
+        if self.refit_generation == 0 {
+            self.refit_marks.fill(0);
+            self.refit_generation = 1;
+        }
+        let generation = self.refit_generation;
+        for (entry, bounds) in updates {
+            let mut node = self.entry_nodes[entry];
+            self.nodes[node].bounds = bounds;
+            while let Some(parent) = self.parents[node] {
+                if self.refit_marks[parent] == generation {
+                    break;
+                }
+                self.refit_marks[parent] = generation;
+                node = parent;
+            }
+        }
+        if let Some(root) = self.root {
+            self.refit_node(root, generation);
+        }
+    }
+
+    fn refit_node(&mut self, node: usize, generation: u32) {
+        if self.refit_marks[node] != generation {
+            return;
+        }
+        let SpatialNodeContents::Branch(children) = self.nodes[node].contents else {
+            return;
+        };
+        self.refit_node(children[0], generation);
+        self.refit_node(children[1], generation);
+        self.nodes[node].bounds = enclosing_rect(
+            self.nodes[children[0]].bounds,
+            self.nodes[children[1]].bounds,
+        );
+    }
+
+    fn build(
         regions: &[PhysicalRect],
-        query: PhysicalRect,
+        order: &mut [usize],
+        depth: usize,
+        nodes: &mut Vec<SpatialNode>,
+        parents: &mut Vec<Option<usize>>,
+        entry_nodes: &mut [usize],
+    ) -> Option<usize> {
+        if order.is_empty() {
+            return None;
+        }
+        if order.len() == 1 {
+            let entry = order[0];
+            let index = nodes.len();
+            nodes.push(SpatialNode {
+                bounds: regions[entry],
+                contents: SpatialNodeContents::Entry(entry),
+            });
+            parents.push(None);
+            entry_nodes[entry] = index;
+            return Some(index);
+        }
+        let middle = order.len() / 2;
+        order.select_nth_unstable_by_key(middle, |&entry| {
+            let rect = regions[entry];
+            let x = i64::from(rect.min_x()) + i64::from(rect.max_x());
+            let y = i64::from(rect.min_y()) + i64::from(rect.max_y());
+            if depth.is_multiple_of(2) {
+                (x, y)
+            } else {
+                (y, x)
+            }
+        });
+        let (left, right) = order.split_at_mut(middle);
+        let left = Self::build(regions, left, depth + 1, nodes, parents, entry_nodes).unwrap();
+        let right = Self::build(regions, right, depth + 1, nodes, parents, entry_nodes).unwrap();
+        let left_bounds = nodes[left].bounds;
+        let right_bounds = nodes[right].bounds;
+        let bounds = enclosing_rect(left_bounds, right_bounds);
+        let index = nodes.len();
+        nodes.push(SpatialNode {
+            bounds,
+            contents: SpatialNodeContents::Branch([left, right]),
+        });
+        parents.push(None);
+        parents[left] = Some(index);
+        parents[right] = Some(index);
+        Some(index)
+    }
+
+    fn query_intersecting_node<U>(
+        &self,
         node: usize,
-        start: usize,
-        end: usize,
-        limit: usize,
-    ) -> bool {
-        if start >= limit || self.subtree_max_x[node] <= query.min_x() {
+        other: &SpatialIndex<U>,
+        visit: &mut impl FnMut(T),
+    ) where
+        T: Copy,
+    {
+        let node = self.nodes[node];
+        if !other.intersects(node.bounds) {
+            return;
+        }
+        match node.contents {
+            SpatialNodeContents::Entry(entry) => visit(self.values[entry]),
+            SpatialNodeContents::Branch(children) => {
+                self.query_intersecting_node(children[0], other, visit);
+                self.query_intersecting_node(children[1], other, visit);
+            }
+        }
+    }
+
+    fn intersects(&self, query: PhysicalRect) -> bool {
+        self.root
+            .is_some_and(|root| self.intersects_node(root, query))
+    }
+
+    fn query_node(&self, node: usize, query: PhysicalRect, visit: &mut impl FnMut(T))
+    where
+        T: Copy,
+    {
+        let node = self.nodes[node];
+        if node.bounds.intersection(query).is_none() {
+            return;
+        }
+        match node.contents {
+            SpatialNodeContents::Entry(entry) => visit(self.values[entry]),
+            SpatialNodeContents::Branch(children) => {
+                self.query_node(children[0], query, visit);
+                self.query_node(children[1], query, visit);
+            }
+        }
+    }
+
+    fn intersects_node(&self, node: usize, query: PhysicalRect) -> bool {
+        let node = self.nodes[node];
+        if node.bounds.intersection(query).is_none() {
             return false;
         }
-        if end - start == 1 {
-            return self
-                .order
-                .get(start)
-                .is_some_and(|&index| regions[index].intersection(query).is_some());
+        match node.contents {
+            SpatialNodeContents::Entry(_) => true,
+            SpatialNodeContents::Branch(children) => {
+                self.intersects_node(children[0], query) || self.intersects_node(children[1], query)
+            }
         }
-        let middle = (start + end) / 2;
-        self.intersects_node(regions, query, node * 2, start, middle, limit)
-            || self.intersects_node(regions, query, node * 2 + 1, middle, end, limit)
     }
+}
 
-    fn area_node(
-        &self,
-        regions: &[PhysicalRect],
-        query: PhysicalRect,
-        node: usize,
-        start: usize,
-        end: usize,
-        limit: usize,
-    ) -> u64 {
-        if start >= limit || self.subtree_max_x[node] <= query.min_x() {
-            return 0;
-        }
-        if end - start == 1 {
-            return self
-                .order
-                .get(start)
-                .and_then(|&index| regions[index].intersection(query))
-                .map_or(0, |intersection| intersection.area());
-        }
-        let middle = (start + end) / 2;
-        self.area_node(regions, query, node * 2, start, middle, limit)
-            + self.area_node(regions, query, node * 2 + 1, middle, end, limit)
-    }
+fn enclosing_rect(left: PhysicalRect, right: PhysicalRect) -> PhysicalRect {
+    PhysicalRect::from_min_max(
+        left.min_x().min(right.min_x()),
+        left.min_y().min(right.min_y()),
+        left.max_x().max(right.max_x()),
+        left.max_y().max(right.max_y()),
+    )
+    .unwrap()
 }
 
 impl RepairPlan {
     /// Returns the non-overlapping rectangles whose union is exactly the damage.
     pub fn regions(&self) -> &[PhysicalRect] {
         &self.regions
+    }
+
+    pub(crate) fn spatial(&self) -> &SpatialIndex<()> {
+        &self.spatial
+    }
+
+    pub(crate) const fn through_epoch(&self) -> u64 {
+        self.through_epoch
     }
 
     /// Returns the number of unique damaged physical pixels.
@@ -212,6 +353,16 @@ pub struct DamageJournal {
     id: u64,
     next_epoch: u64,
     events: Vec<DamageEvent>,
+    cached_plan: Option<CachedPlan>,
+}
+
+#[derive(Debug)]
+struct CachedPlan {
+    ordered_input: Vec<PhysicalRect>,
+    sorted_input: Vec<PhysicalRect>,
+    regions: Arc<[PhysicalRect]>,
+    spatial: Arc<SpatialIndex<()>>,
+    damaged_pixels: u64,
 }
 
 impl Default for DamageJournal {
@@ -223,13 +374,14 @@ impl Default for DamageJournal {
             id,
             next_epoch: 0,
             events: Vec::new(),
+            cached_plan: None,
         }
     }
 }
 
 impl DamageJournal {
     /// Records a damaged physical rectangle.
-    pub fn record(&mut self, rect: PhysicalRect) {
+    pub fn record(&mut self, rect: PhysicalRect) -> u64 {
         self.next_epoch = self
             .next_epoch
             .checked_add(1)
@@ -238,17 +390,68 @@ impl DamageJournal {
             epoch: self.next_epoch,
             rect,
         });
+        self.next_epoch
+    }
+
+    pub(crate) const fn latest_epoch(&self) -> u64 {
+        self.next_epoch
     }
 
     /// Builds an exact plan for all currently owed damage.
-    pub fn plan(&self) -> Option<RepairPlan> {
+    pub fn plan(&mut self) -> Option<RepairPlan> {
         let through_epoch = self.events.last()?.epoch;
-        let regions = exact_union(self.events.iter().map(|event| event.rect));
-        let damaged_pixels = regions.iter().map(PhysicalRect::area).sum();
+        let matches_ordered_cache = self.cached_plan.as_ref().is_some_and(|cached| {
+            cached.ordered_input.len() == self.events.len()
+                && cached
+                    .ordered_input
+                    .iter()
+                    .zip(&self.events)
+                    .all(|(cached, event)| *cached == event.rect)
+        });
+        let (regions, spatial, damaged_pixels) = if matches_ordered_cache {
+            let cached = self.cached_plan.as_ref().unwrap();
+            (
+                cached.regions.clone(),
+                cached.spatial.clone(),
+                cached.damaged_pixels,
+            )
+        } else {
+            let ordered_input: Vec<_> = self.events.iter().map(|event| event.rect).collect();
+            let mut sorted_input = ordered_input.clone();
+            sorted_input.sort_unstable();
+            if self
+                .cached_plan
+                .as_ref()
+                .is_some_and(|cached| cached.sorted_input == sorted_input)
+            {
+                let cached = self.cached_plan.as_mut().unwrap();
+                cached.ordered_input = ordered_input;
+                (
+                    cached.regions.clone(),
+                    cached.spatial.clone(),
+                    cached.damaged_pixels,
+                )
+            } else {
+                let regions: Arc<[_]> = exact_union(sorted_input.iter().copied()).into();
+                let damaged_pixels = regions.iter().map(PhysicalRect::area).sum();
+                let spatial = Arc::new(SpatialIndex::new(
+                    regions.iter().copied().map(|rect| (rect, ())),
+                ));
+                self.cached_plan = Some(CachedPlan {
+                    ordered_input,
+                    sorted_input,
+                    regions: regions.clone(),
+                    spatial: spatial.clone(),
+                    damaged_pixels,
+                });
+                (regions, spatial, damaged_pixels)
+            }
+        };
         Some(RepairPlan {
             journal_id: self.id,
             through_epoch,
             regions,
+            spatial,
             damaged_pixels,
         })
     }
@@ -476,6 +679,75 @@ mod tests {
     }
 
     #[test]
+    fn spatial_queries_match_exhaustive_intersections() {
+        let entries: Vec<_> = (0..257)
+            .map(|index| {
+                let x = index * 37 % 113 - 20;
+                let y = index * 53 % 97 - 15;
+                let width = index % 11 + 1;
+                let height = index % 7 + 1;
+                (rect(x, y, x + width, y + height), index)
+            })
+            .collect();
+        let index = SpatialIndex::new(entries.iter().copied());
+
+        for query_number in 0..101 {
+            let x = (query_number * 29 % 127) - 25;
+            let y = (query_number * 31 % 109) - 20;
+            let query = rect(x, y, x + 9, y + 6);
+            let mut actual = Vec::new();
+            index.query(query, |entry| actual.push(entry));
+            actual.sort_unstable();
+            let expected: Vec<_> = entries
+                .iter()
+                .filter_map(|(region, entry)| region.intersection(query).map(|_| *entry))
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn index_to_index_query_emits_each_source_once() {
+        let source: Vec<_> = (0..1_000)
+            .map(|entry| (rect(entry * 3, 0, entry * 3 + 2, 2), entry))
+            .collect();
+        let damage = SpatialIndex::new([
+            (rect(0, 0, 1_500, 1), ()),
+            (rect(750, 1, 2_250, 2), ()),
+            (rect(2_700, 0, 3_000, 2), ()),
+        ]);
+        let index = SpatialIndex::new(source.iter().copied());
+        let mut actual = Vec::new();
+        index.query_intersecting(&damage, |entry| actual.push(entry));
+        actual.sort_unstable();
+        let expected: Vec<_> = source
+            .iter()
+            .filter_map(|(region, entry)| damage.intersects(*region).then_some(*entry))
+            .collect();
+
+        assert_eq!(actual, expected);
+        assert!(actual.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn refitting_one_entry_updates_queries_without_rebuilding() {
+        let mut index = SpatialIndex::new([
+            (rect(0, 0, 2, 2), 0),
+            (rect(10, 10, 12, 12), 1),
+            (rect(20, 20, 22, 22), 2),
+        ]);
+
+        index.update_many([(1, rect(3, 3, 5, 5))]);
+
+        let mut old = Vec::new();
+        index.query(rect(10, 10, 12, 12), |entry| old.push(entry));
+        assert!(old.is_empty());
+        let mut new = Vec::new();
+        index.query(rect(3, 3, 5, 5), |entry| new.push(entry));
+        assert_eq!(new, [1]);
+    }
+
+    #[test]
     fn exact_union_matches_source_coverage_for_overlapping_rectangles() {
         let source = [rect(-2, -1, 2, 2), rect(0, -3, 3, 1), rect(1, 1, 4, 3)];
         let regions = exact_union(source);
@@ -508,45 +780,6 @@ mod tests {
 
         assert_eq!(regions.len(), 10_000);
         assert_eq!(regions.iter().map(PhysicalRect::area).sum::<u64>(), 10_000);
-    }
-
-    #[test]
-    fn damage_index_matches_exhaustive_intersection_and_area() {
-        let regions = exact_union([
-            rect(-4, -2, 2, 1),
-            rect(0, -4, 5, 3),
-            rect(7, 1, 9, 6),
-            rect(-3, 4, 8, 5),
-        ]);
-        let index = DamageIndex::new(&regions);
-
-        for min_y in -6..7 {
-            for min_x in -6..10 {
-                let query = rect(min_x, min_y, min_x + 3, min_y + 2);
-                let intersections: Vec<_> = regions
-                    .iter()
-                    .filter_map(|region| region.intersection(query))
-                    .collect();
-                assert_eq!(index.intersects(&regions, query), !intersections.is_empty());
-                assert_eq!(
-                    index.intersection_area(&regions, query),
-                    intersections.iter().map(PhysicalRect::area).sum::<u64>()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn damage_index_prunes_ten_thousand_separated_regions_exactly() {
-        let regions: Vec<_> = (0..10_000).map(|x| rect(x * 2, 0, x * 2 + 1, 1)).collect();
-        let index = DamageIndex::new(&regions);
-
-        assert!(index.intersects(&regions, rect(19_998, 0, 19_999, 1)));
-        assert_eq!(
-            index.intersection_area(&regions, rect(19_997, 0, 20_000, 1)),
-            1
-        );
-        assert!(!index.intersects(&regions, rect(19_999, 0, 20_000, 1)));
     }
 
     #[test]

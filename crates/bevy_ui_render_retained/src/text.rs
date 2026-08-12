@@ -1,6 +1,6 @@
 //! Change-driven retained extraction for ordinary UI text glyphs.
 
-use crate::sampled_image::{ImageReader, ImageSample, RetainedSampledImages};
+use crate::sampled_image::{ImageReader, ImageSample, RetainedSampledImages, SampledImageState};
 use crate::scene::{
     coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
     RetainedGlyph, RetainedUiScene, RetainedUiSurfaces,
@@ -18,6 +18,7 @@ use bevy::{
     image::Image,
     input_focus::InputFocus,
     math::{Affine2, Rect, Vec2},
+    platform::collections::{HashMap, HashSet},
     render::{render_resource::DefaultImageSamplerDescriptor, sync_world::MainEntity, Extract},
     sprite::BorderRect,
     text::{
@@ -31,12 +32,15 @@ use bevy::{
     },
     ui_render::{stack_z_offsets, UiCameraMap},
 };
-use std::collections::{HashMap, HashSet};
+use smallvec::{smallvec, SmallVec};
 
 #[derive(Default)]
 struct TextRootDependencies {
     sections: HashSet<Entity>,
     paints: HashSet<PaintId>,
+    text_paints: SmallVec<[PaintId; 1]>,
+    camera: Option<Entity>,
+    fast_color: bool,
 }
 
 struct GlyphRun {
@@ -44,8 +48,8 @@ struct GlyphRun {
     section_ordinal: u32,
     paint_order: u32,
     image: AssetId<Image>,
-    glyphs: Vec<RetainedGlyph>,
-    samples: HashSet<ImageSample>,
+    glyphs: SmallVec<[RetainedGlyph; 4]>,
+    samples: SmallVec<[ImageSample; 4]>,
 }
 
 struct TextNodePaint {
@@ -58,7 +62,7 @@ struct TextNodePaint {
 }
 
 fn push_glyph_run(
-    runs: &mut Vec<GlyphRun>,
+    runs: &mut SmallVec<[GlyphRun; 1]>,
     section: Entity,
     section_ordinal: u32,
     paint_order: u32,
@@ -71,15 +75,17 @@ fn push_glyph_run(
         && run.section == section
     {
         run.glyphs.push(glyph);
-        run.samples.insert(sample);
+        if !run.samples.contains(&sample) {
+            run.samples.push(sample);
+        }
     } else {
         runs.push(GlyphRun {
             section,
             section_ordinal,
             paint_order,
             image,
-            glyphs: vec![glyph],
-            samples: HashSet::from([sample]),
+            glyphs: smallvec![glyph],
+            samples: smallvec![sample],
         });
     }
 }
@@ -111,10 +117,19 @@ impl RetainedTextDependencies {
         root: Entity,
         sections: impl IntoIterator<Item = Entity>,
         paints: HashSet<PaintId>,
+        camera: Option<Entity>,
+        fast_color: bool,
     ) -> HashSet<PaintId> {
         let old_paints = self.detach_root(root);
         let mut dependencies = TextRootDependencies {
+            text_paints: paints
+                .iter()
+                .filter(|id| id.family == PaintFamily::Text)
+                .copied()
+                .collect(),
             paints,
+            camera,
+            fast_color,
             ..Default::default()
         };
         for section in sections {
@@ -191,7 +206,7 @@ pub(crate) fn extract_retained_text(
     mut commands: Commands,
     state: Res<RetainedUiScene>,
     mut dependencies: ResMut<RetainedTextDependencies>,
-    mut sampled_images: ResMut<RetainedSampledImages>,
+    sampled_images: Res<RetainedSampledImages>,
     default_sampler: Res<DefaultImageSamplerDescriptor>,
     images: Extract<Res<Assets<Image>>>,
     changed: Extract<
@@ -207,7 +222,6 @@ pub(crate) fn extract_retained_text(
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
                     Changed<ComputedTextBlock>,
-                    Changed<TextColor>,
                     Changed<TextLayoutInfo>,
                     Changed<TextScroll>,
                     Changed<TextCursorStyle>,
@@ -224,7 +238,6 @@ pub(crate) fn extract_retained_text(
         Query<
             Entity,
             Or<(
-                Changed<TextColor>,
                 Changed<TextBackgroundColor>,
                 Changed<Strikethrough>,
                 Changed<StrikethroughColor>,
@@ -233,6 +246,7 @@ pub(crate) fn extract_retained_text(
             )>,
         >,
     >,
+    changed_colors: Extract<Query<(Entity, &TextColor), Changed<TextColor>>>,
     section_styles: Extract<
         Query<(
             &TextColor,
@@ -247,17 +261,17 @@ pub(crate) fn extract_retained_text(
     input_focus: Extract<Option<Res<InputFocus>>>,
     mut removed: Extract<RemovedTextInputs>,
 ) {
-    let mut candidates: HashSet<_> = changed.iter().map(|item| item.0).collect();
-    candidates.extend(sampled_images.take_text());
+    let mut sampled_images = sampled_images.lock();
+    let mut extra_candidates = sampled_images.take_text();
     let focused = input_focus.as_ref().and_then(|focus| focus.get());
     if dependencies.focused != focused {
-        candidates.extend(dependencies.focused);
-        candidates.extend(focused);
+        extra_candidates.extend(dependencies.focused);
+        extra_candidates.extend(focused);
         dependencies.focused = focused;
     }
     for section in &changed_sections {
         if let Some(roots) = dependencies.section_roots.get(&section) {
-            candidates.extend(roots);
+            extra_candidates.extend(roots);
         }
     }
     let RemovedTextInputs {
@@ -291,7 +305,7 @@ pub(crate) fn extract_retained_text(
         .chain(underline_color.read())
     {
         if let Some(roots) = dependencies.section_roots.get(&section) {
-            candidates.extend(roots);
+            extra_candidates.extend(roots);
         }
     }
 
@@ -316,41 +330,77 @@ pub(crate) fn extract_retained_text(
             root,
         );
     }
-    candidates.extend(clip.read());
-    candidates.extend(scroll.read());
-    candidates.extend(cursor.read());
-    candidates.extend(shadow.read());
+    extra_candidates.extend(clip.read());
+    extra_candidates.extend(scroll.read());
+    extra_candidates.extend(cursor.read());
+    extra_candidates.extend(shadow.read());
+    extra_candidates.retain(|root| !changed.contains(*root));
+
+    for (section, color) in &changed_colors {
+        let color = color.0.to_linear();
+        if let Some(root_dependencies) = dependencies.roots.get(&section)
+            && !changed.contains(section)
+            && !extra_candidates.contains(&section)
+        {
+            if root_dependencies.fast_color {
+                if let Some(camera) = root_dependencies.camera {
+                    surfaces.retint_text(
+                        camera,
+                        root_dependencies.text_paints.iter().copied(),
+                        section,
+                        color,
+                    );
+                }
+            } else {
+                extra_candidates.insert(section);
+            }
+        }
+        if let Some(roots) = dependencies.section_roots.get(&section) {
+            for &root in roots {
+                if root == section || changed.contains(root) || extra_candidates.contains(&root) {
+                    continue;
+                }
+                let Some(root_dependencies) = dependencies.roots.get(&root) else {
+                    continue;
+                };
+                if root_dependencies.fast_color {
+                    if let Some(camera) = root_dependencies.camera {
+                        surfaces.retint_text(
+                            camera,
+                            root_dependencies.text_paints.iter().copied(),
+                            section,
+                            color,
+                        );
+                    }
+                } else {
+                    extra_candidates.insert(root);
+                }
+            }
+        }
+    }
 
     let mut camera_mapper = camera_map.get_mapper();
-    for root in candidates {
-        let Ok((
-            root,
-            _,
-            node,
-            stack,
-            global_transform,
-            visibility,
-            clip,
-            target_camera,
-            computed_block,
-            text_color,
-            layout,
-            scroll,
-            cursor_style,
-            shadow,
-            editable,
-        )) = all.get(root)
-        else {
-            remove_text_root(
-                &mut dependencies,
-                &mut sampled_images,
-                &mut surfaces,
-                &mut commands,
-                root,
-            );
-            continue;
-        };
-
+    for (
+        root,
+        _,
+        node,
+        stack,
+        global_transform,
+        visibility,
+        clip,
+        target_camera,
+        computed_block,
+        text_color,
+        layout,
+        scroll,
+        cursor_style,
+        shadow,
+        editable,
+    ) in changed.iter().chain(
+        extra_candidates
+            .into_iter()
+            .filter_map(|root| all.get(root).ok()),
+    ) {
         let transform = global_transform.affine()
             * Affine2::from_translation(
                 node.content_box().min - scroll.map_or(Vec2::ZERO, |scroll| scroll.0),
@@ -379,8 +429,8 @@ pub(crate) fn extract_retained_text(
             .map(|color| color.to_linear());
         let mut color = text_color.0.to_linear();
         let mut section_index = 0;
-        let mut runs = Vec::new();
-        let mut shadow_runs = Vec::new();
+        let mut runs = SmallVec::<[GlyphRun; 1]>::new();
+        let mut shadow_runs = SmallVec::<[GlyphRun; 1]>::new();
         let mut section_ordinals = HashMap::<Entity, u32>::new();
         let mut current_source_run = None;
         let shadow_color = shadow.map(|shadow| LinearRgba::from(shadow.color));
@@ -404,15 +454,16 @@ pub(crate) fn extract_retained_text(
                 }
                 section_index = *glyph_section;
             }
-            let glyph_color = if !atlas_info.is_alpha_mask {
-                LinearRgba::WHITE
-            } else if let Some(selected) = selected_text_color
-                && layout.selection_rects.iter().any(|selection| {
+            let selected = selected_text_color.is_some_and(|_| {
+                layout.selection_rects.iter().any(|selection| {
                     let glyph = Rect::from_center_size(*position, atlas_info.rect.size());
                     selection.contains(glyph.min) && selection.contains(glyph.max)
                 })
-            {
-                selected
+            });
+            let glyph_color = if !atlas_info.is_alpha_mask {
+                LinearRgba::WHITE
+            } else if selected {
+                selected_text_color.unwrap()
             } else {
                 color
             };
@@ -436,6 +487,7 @@ pub(crate) fn extract_retained_text(
             };
             let paint_order = u32::try_from(glyph_index).expect("text glyph count exceeds u32");
             let sample = ImageSample::rect(atlas_info.texture, atlas_info.rect);
+            let atlas_extent = images.get(atlas_info.texture).map(Image::size_f32);
             if !glyph_color.is_fully_transparent() {
                 push_glyph_run(
                     &mut runs,
@@ -443,7 +495,13 @@ pub(crate) fn extract_retained_text(
                     section_ordinal,
                     paint_order,
                     atlas_info.texture,
-                    RetainedGlyph::new(glyph_color, *position, atlas_info.rect),
+                    RetainedGlyph::new(
+                        glyph_color,
+                        *position,
+                        atlas_info.rect,
+                        atlas_extent,
+                        atlas_info.is_alpha_mask && !selected,
+                    ),
                     sample,
                 );
             }
@@ -454,13 +512,19 @@ pub(crate) fn extract_retained_text(
                     section_ordinal,
                     paint_order,
                     atlas_info.texture,
-                    RetainedGlyph::new(shadow_color, *position, atlas_info.rect),
+                    RetainedGlyph::new(
+                        shadow_color,
+                        *position,
+                        atlas_info.rect,
+                        atlas_extent,
+                        false,
+                    ),
                     sample,
                 );
             }
         }
 
-        let mut node_paints = Vec::new();
+        let mut node_paints = SmallVec::<[TextNodePaint; 2]>::new();
         let mut decoration_ordinals = HashMap::<Entity, u32>::new();
         for (run_index, run) in layout.run_geometry.iter().enumerate() {
             let Some(section) = computed_block.entities().get(run.section_index) else {
@@ -633,16 +697,6 @@ pub(crate) fn extract_retained_text(
             }
         }
 
-        let image_ids: Vec<_> = runs
-            .iter()
-            .chain(&shadow_runs)
-            .map(|run| run.image)
-            .collect();
-        let atlas_samples: Vec<_> = runs
-            .iter()
-            .chain(&shadow_runs)
-            .flat_map(|run| run.samples.iter().copied())
-            .collect();
         let paint_ids: HashSet<_> = shadow_runs
             .iter()
             .map(|run| glyph_run_id(run, PaintFamily::TextShadow))
@@ -651,19 +705,25 @@ pub(crate) fn extract_retained_text(
             .collect();
         let old_paints = dependencies.set_root(
             root,
-            computed_block
-                .entities()
-                .iter()
-                .map(|section| section.entity),
+            core::iter::once(root).chain(
+                computed_block
+                    .entities()
+                    .iter()
+                    .map(|section| section.entity),
+            ),
             paint_ids.clone(),
+            camera.filter(|_| visible),
+            !editable && node_paints.is_empty(),
         );
         sampled_images.replace_reader(
             ImageReader::Text(root),
-            atlas_samples,
+            runs.iter()
+                .chain(&shadow_runs)
+                .flat_map(|run| run.samples.iter().copied()),
             &images,
             &default_sampler,
         );
-        for &image in &image_ids {
+        for image in runs.iter().chain(&shadow_runs).map(|run| run.image) {
             sampled_images.mark_pending(image, images.get(image));
         }
 
@@ -742,6 +802,7 @@ fn upsert_text_node(
                     max: paint.size,
                 },
                 atlas_scaling: None,
+                image_extent: None,
                 flip_x: false,
                 flip_y: false,
                 border: BorderRect::ZERO,
@@ -767,14 +828,14 @@ fn decoration_ordinal(run: u32, kind: u32) -> u32 {
 fn upsert_glyph_runs(
     surfaces: &mut RetainedUiSurfaces,
     commands: &mut Commands,
-    sampled_images: &RetainedSampledImages,
+    sampled_images: &SampledImageState,
     root: Entity,
     camera: Entity,
     z_order: f32,
     clip: Option<Rect>,
     transform: Affine2,
     family: PaintFamily,
-    runs: Vec<GlyphRun>,
+    runs: SmallVec<[GlyphRun; 1]>,
 ) {
     for run in runs {
         let id = glyph_run_id(&run, family);
@@ -803,7 +864,7 @@ fn upsert_glyph_runs(
                 clip,
                 image: run.image,
                 transform,
-                item: RetainedDrawItem::Glyphs(run.glyphs.into_boxed_slice()),
+                item: RetainedDrawItem::Glyphs(run.glyphs.into_vec().into_boxed_slice()),
             },
             ResourceFingerprint::Revisions(revisions),
             glyph_coverage,
@@ -813,7 +874,7 @@ fn upsert_glyph_runs(
 
 fn remove_text_root(
     dependencies: &mut RetainedTextDependencies,
-    sampled_images: &mut RetainedSampledImages,
+    sampled_images: &mut SampledImageState,
     surfaces: &mut RetainedUiSurfaces,
     commands: &mut Commands,
     root: Entity,

@@ -11,6 +11,7 @@ use bevy::ui_render::{
 use bevy::{
     asset::{embedded_asset, AssetId, RenderAssetUsages},
     camera::{CameraOutputMode, ClearColorConfig, RenderTarget, Viewport},
+    ecs::schedule::{LogLevel, ScheduleBuildSettings, ScheduleLabel, Schedules},
     input_focus::InputFocus,
     log::LogPlugin,
     prelude::*,
@@ -21,7 +22,7 @@ use bevy::{
             AsBindGroup, Extent3d, PollType, TextureDimension, TextureFormat, TextureUsages,
         },
         renderer::RenderDevice,
-        ExtractSchedule, RenderApp, RenderPlugin,
+        ExtractSchedule, Render, RenderApp, RenderPlugin,
     },
     shader::ShaderRef,
     text::{EditableText, TextCursorStyle, TextEdit, TextLayoutInfo},
@@ -270,6 +271,17 @@ fn gpu_app(renderer: UiRenderer, paint_schedule: PaintSchedule) -> App {
             ExtractSchedule,
             RenderUiSystems::ExtractBackgrounds.run_if(paint_enabled),
         );
+    }
+    let render_app = app.sub_app_mut(RenderApp);
+    let mut schedules = render_app.world_mut().resource_mut::<Schedules>();
+    for schedule in [ExtractSchedule.intern(), Render.intern()] {
+        let schedule = schedules
+            .get_mut(schedule)
+            .expect("the render app has every retained UI schedule");
+        schedule.set_build_settings(ScheduleBuildSettings {
+            ambiguity_detection: LogLevel::Error,
+            ..schedule.get_build_settings()
+        });
     }
     app
 }
@@ -523,7 +535,7 @@ fn assert_layout_motion(output: RenderOutput) {
     let after = output.after_mutation.unwrap();
     assert_eq!(after.repairs, before.repairs + 1);
     assert_eq!(after.repair_pixels, before.repair_pixels + 200);
-    assert_eq!(after.items_replayed, before.items_replayed + 3);
+    assert_eq!(after.items_replayed, before.items_replayed + 2);
     let paint_before = output.paint_before_mutation.unwrap();
     let paint_after = output.paint_after_mutation.unwrap();
     assert_eq!(paint_after.records_staged, paint_before.records_staged + 2);
@@ -1215,7 +1227,7 @@ fn quiet_image_pixels_match_stock_without_another_repair() {
         let after = retained.after_mutation.unwrap();
         assert_eq!(after.surfaces_created, 1);
         let expected_surface_bytes =
-            u64::from(WIDTH) * u64::from(HEIGHT) * BYTES_PER_PIXEL as u64 * 2;
+            u64::from(WIDTH) * u64::from(HEIGHT) * (BYTES_PER_PIXEL as u64 * 2 + 1);
         assert_eq!(before.surface_bytes, expected_surface_bytes);
         assert_eq!(after.surface_bytes, expected_surface_bytes);
         assert_eq!(after.repairs, before.repairs);
@@ -2072,6 +2084,7 @@ fn changed_border_gradient_repairs_only_border_pixels() {
         assert_eq!(after.repairs, before.repairs + 1);
         assert_eq!(after.repair_pixels, before.repair_pixels + 340);
         assert_eq!(after.items_replayed, before.items_replayed + 1);
+        // Both gradient segments carry the exact four-rectangle border damage list.
         assert_eq!(after.quads_replayed, before.quads_replayed + 2);
     });
 }
@@ -2936,6 +2949,7 @@ fn one_border_edge_change_repairs_only_its_antialiased_corner_reach() {
         assert_eq!(after.repairs, before.repairs + 1);
         assert_eq!(after.repair_pixels, before.repair_pixels + 140);
         assert_eq!(after.items_replayed, before.items_replayed + 3);
+        assert_eq!(after.quads_replayed, before.quads_replayed + 3);
     });
 }
 
@@ -3284,7 +3298,7 @@ fn removing_main_world_image_keeps_its_live_render_asset() {
 }
 
 #[test]
-fn switching_to_an_unavailable_image_erases_vacated_pixels() {
+fn switching_to_an_unavailable_image_keeps_old_pixels_without_flicker() {
     with_gpu_lock(|| {
         let output = render_scene(
             UiRenderer::Retained,
@@ -3306,12 +3320,12 @@ fn switching_to_an_unavailable_image_erases_vacated_pixels() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 100);
+        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.repair_pixels, before.repair_pixels);
         let center = ((14 * WIDTH + 13) as usize) * BYTES_PER_PIXEL;
         assert_eq!(
             &output.pixels[center..center + BYTES_PER_PIXEL],
-            &[0, 0, 0, 255]
+            &[180, 25, 70, 255]
         );
     });
 }
@@ -3680,7 +3694,7 @@ fn changed_background_encodes_exactly_one_full_repair() {
 }
 
 #[test]
-fn fully_damaged_nodes_share_one_prepared_batch() {
+fn fully_damaged_nodes_report_each_logical_item_and_quad() {
     with_gpu_lock(|| {
         let initial = Color::srgba_u8(30, 80, 180, 160);
         let final_color = Color::srgba_u8(210, 55, 40, 176);
@@ -3724,7 +3738,7 @@ fn fully_damaged_nodes_share_one_prepared_batch() {
         let after = retained.after_mutation.unwrap();
         assert_eq!(after.repairs, before.repairs + 1);
         assert_eq!(after.repair_pixels, before.repair_pixels + 200);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.items_replayed, before.items_replayed + 2);
         assert_eq!(after.quads_replayed, before.quads_replayed + 2);
         let paint_before = retained.paint_before_mutation.unwrap();
         let paint_after = retained.paint_after_mutation.unwrap();
@@ -3831,7 +3845,7 @@ fn ui_transform_motion_nominates_only_the_moved_leaf() {
         let after = output.after_mutation.unwrap();
         assert_eq!(after.repairs, before.repairs + 1);
         assert_eq!(after.repair_pixels, before.repair_pixels + 200);
-        assert_eq!(after.items_replayed, before.items_replayed + 3);
+        assert_eq!(after.items_replayed, before.items_replayed + 2);
         let paint_before = output.paint_before_mutation.unwrap();
         let paint_after = output.paint_after_mutation.unwrap();
         assert_eq!(paint_after.candidates, paint_before.candidates + 1);
@@ -4277,11 +4291,11 @@ fn resizing_a_viewport_reconstructs_its_retained_surface() {
         assert_eq!(after.surfaces_created, before.surfaces_created + 1);
         assert_eq!(
             before.surface_bytes,
-            32_u64 * 40 * BYTES_PER_PIXEL as u64 * 2
+            32_u64 * 40 * (BYTES_PER_PIXEL as u64 * 2 + 1)
         );
         assert_eq!(
             after.surface_bytes,
-            40_u64 * 40 * BYTES_PER_PIXEL as u64 * 2
+            40_u64 * 40 * (BYTES_PER_PIXEL as u64 * 2 + 1)
         );
         assert_eq!(after.repairs, before.repairs + 1);
     });
@@ -4356,13 +4370,38 @@ impl RetainedUiMaterial for TestUiMaterial {
     }
 }
 
+#[derive(Asset, TypePath, AsBindGroup, Clone)]
+struct SecondTestUiMaterial {
+    #[uniform(0)]
+    color: Vec4,
+}
+
+impl UiMaterial for SecondTestUiMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://gpu_ui/test_ui_material.wgsl".into()
+    }
+}
+
+impl RetainedUiMaterial for SecondTestUiMaterial {
+    type PaintKey = [u32; 4];
+
+    fn retained_ui(&self) -> RetainedUiMaterialSnapshot<Self::PaintKey> {
+        RetainedUiMaterialSnapshot::exact(
+            self.color.to_array().map(f32::to_bits),
+            RetainedUiMaterialCoverage::Node,
+            Vec::new(),
+        )
+    }
+}
+
 fn configure_test_ui_material(app: &mut App, renderer: UiRenderer) {
     embedded_asset!(app, "tests", "test_ui_material.wgsl");
     match renderer {
         UiRenderer::Stock => app.add_plugins(UiMaterialPlugin::<TestUiMaterial>::default()),
-        UiRenderer::Retained => {
-            app.add_plugins(RetainedUiMaterialPlugin::<TestUiMaterial>::default())
-        }
+        UiRenderer::Retained => app.add_plugins((
+            RetainedUiMaterialPlugin::<TestUiMaterial>::default(),
+            RetainedUiMaterialPlugin::<SecondTestUiMaterial>::default(),
+        )),
     };
 }
 

@@ -1,4 +1,6 @@
 #import bevy_render::view::View
+#define_import_path bevy_ui::gradient
+
 #import bevy_ui::ui_node::{
     draw_uinode_background,
     draw_uinode_border,

@@ -6,7 +6,7 @@ use bevy_image::ImagePlugin;
 use bevy_math::UVec2;
 use bevy_text::TextPlugin;
 use bevy_time::TimePlugin;
-use bevy_ui::{BorderRadius, LayoutContainment, Node, UiPlugin, UiTransform, Val};
+use bevy_ui::{BorderRadius, LayoutContainment, Node, PositionType, UiPlugin, UiTransform, Val};
 use bevy_ui_render_retained::RetainedUiMainWorldPlugin;
 use criterion::{
     criterion_group, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
@@ -22,6 +22,7 @@ enum TreeShape {
     Balanced,
     Forest,
     Contained(usize),
+    AbsoluteContained(usize),
     Deep,
 }
 
@@ -32,13 +33,14 @@ impl TreeShape {
             Self::Balanced => "balanced".into(),
             Self::Forest => "forest_100".into(),
             Self::Contained(size) => format!("contained_{size}"),
+            Self::AbsoluteContained(size) => format!("absolute_contained_{size}"),
             Self::Deep => "deep".into(),
         }
     }
 
     const fn containment_size(self) -> Option<usize> {
         match self {
-            Self::Contained(size) => Some(size),
+            Self::Contained(size) | Self::AbsoluteContained(size) => Some(size),
             _ => None,
         }
     }
@@ -65,6 +67,19 @@ fn root_node() -> Node {
         width: Val::Px(TARGET_SIZE.x as f32),
         height: Val::Px(TARGET_SIZE.y as f32),
         ..Default::default()
+    }
+}
+
+fn node_for(shape: TreeShape, index: usize) -> Node {
+    if matches!(shape, TreeShape::AbsoluteContained(_)) {
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px((index % 100) as f32 * 10.0),
+            top: Val::Px((index / 100) as f32 * 10.0),
+            ..node()
+        }
+    } else {
+        node()
     }
 }
 
@@ -131,7 +146,9 @@ fn layout_app(node_count: usize, retained: bool, shape: TreeShape) -> LayoutApp 
             }
         };
         let entity = if let Some(parent) = parent {
-            let mut entity = app.world_mut().spawn((node(), ChildOf(parent)));
+            let mut entity = app
+                .world_mut()
+                .spawn((node_for(shape, index), ChildOf(parent)));
             if containment_size.is_some_and(|size| (index - 1) % size == 0) {
                 entity.insert(LayoutContainment);
             }
@@ -384,6 +401,7 @@ fn layout(c: &mut Criterion) {
             (TreeShape::Contained(10), 10_000, false),
             (TreeShape::Contained(100), 10_000, false),
             (TreeShape::Contained(1_000), 10_000, false),
+            (TreeShape::AbsoluteContained(100), 10_000, false),
             (TreeShape::Deep, 256, false),
         ] {
             let mut group = c.benchmark_group(format!("ui_layout/{renderer}/{}", shape.name()));

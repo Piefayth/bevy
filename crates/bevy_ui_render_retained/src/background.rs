@@ -52,7 +52,7 @@ pub(crate) struct RemovedBackgroundInputs<'w, 's> {
 pub(crate) fn extract_retained_backgrounds(
     mut commands: Commands,
     state: Res<RetainedUiScene>,
-    changed: Extract<
+    structural_changed: Extract<
         Query<
             BackgroundQueryItem<'static>,
             (
@@ -64,14 +64,14 @@ pub(crate) fn extract_retained_backgrounds(
                     Changed<InheritedVisibility>,
                     Changed<CalculatedClip>,
                     Changed<ComputedUiTargetCamera>,
-                    Changed<BackgroundColor>,
-                    Changed<OuterColor>,
                     Changed<Node>,
                     Changed<ComputedUiRenderTargetInfo>,
                 )>,
             ),
         >,
     >,
+    changed_backgrounds: Extract<Query<(Entity, &BackgroundColor), Changed<BackgroundColor>>>,
+    changed_outers: Extract<Query<(Entity, &OuterColor), Changed<OuterColor>>>,
     all: Extract<Query<BackgroundQueryItem<'static>, With<BackgroundColor>>>,
     camera_map: Extract<UiCameraMap>,
     mut removed: Extract<RemovedBackgroundInputs>,
@@ -107,13 +107,41 @@ pub(crate) fn extract_retained_backgrounds(
         surfaces.remove(&mut commands, background_id(entity, 1));
     }
 
+    let mut extra_candidates = bevy::platform::collections::HashSet::<Entity>::default();
+    for (entity, background) in changed_backgrounds.iter() {
+        if structural_changed.contains(entity) {
+            continue;
+        }
+        let id = background_id(entity, 0);
+        if background.is_fully_transparent() {
+            surfaces.remove(&mut commands, id);
+        } else if !surfaces.retint_owned_node(id, background.0.into()) {
+            extra_candidates.insert(entity);
+        }
+    }
+    for (entity, outer) in changed_outers.iter() {
+        if structural_changed.contains(entity) {
+            continue;
+        }
+        let id = background_id(entity, 1);
+        if outer.is_fully_transparent() {
+            surfaces.remove(&mut commands, id);
+        } else if !surfaces.retint_owned_node(id, outer.0.into()) {
+            extra_candidates.insert(entity);
+        }
+    }
+
     let mut camera_mapper = camera_map.get_mapper();
-    let rebuilt_after_removal = clip
-        .read()
-        .filter(|entity| !changed.contains(*entity))
-        .filter_map(|entity| all.get(entity).ok());
+    extra_candidates.extend(
+        clip.read()
+            .filter(|entity| !structural_changed.contains(*entity)),
+    );
     for (entity, node, stack, transform, visibility, clip, target_camera, background, outer) in
-        changed.iter().chain(rebuilt_after_removal)
+        structural_changed.iter().chain(
+            extra_candidates
+                .into_iter()
+                .filter_map(|entity| all.get(entity).ok()),
+        )
     {
         let fill_id = background_id(entity, 0);
         let outer_id = background_id(entity, 1);
@@ -133,6 +161,7 @@ pub(crate) fn extract_retained_backgrounds(
                 max: node.size,
             },
             atlas_scaling: None,
+            image_extent: None,
             flip_x: false,
             flip_y: false,
             border: node.border(),
@@ -186,8 +215,6 @@ pub(crate) fn extract_retained_backgrounds(
                     .into_iter()
                     .collect(),
             );
-        } else {
-            surfaces.remove(&mut commands, outer_id);
         }
     }
 }

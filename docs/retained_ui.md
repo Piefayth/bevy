@@ -40,6 +40,15 @@ The implemented expansion decisions are:
    replaces the public final-writer system and preserves Bevy's output attachment
    and presentation bookkeeping.
 
+Two smaller focused changes remain in the crates whose behavior they own.
+`bevy_ui` now caches an image node's intrinsic-size inputs, so changing only an
+image tint does not falsely rewrite `ContentSize` and wake layout.
+`bevy_ui_render` exposes its ordinary-node preparation as a removable public
+system set and gives the shared gradient shader a public import path. The
+replacement can therefore install persistent node preparation and reuse Bevy's
+gradient functions without keeping an unused transient upload. Neither change
+requires `bevy_core_pipeline`.
+
 Current upstream UI-render work retains intermediate render data, but not final
 pixels:
 
@@ -220,11 +229,11 @@ optimization was removed. Resolution now represents a solid gradient as two
 equal stops, so every entry uses one ordered gradient pipeline and the retained
 renderer needs no special case.
 
-Box shadows use a `BoxShadowInfrastructurePlugin` and a shared
-`resolve_box_shadow` function for the same reason. The retained crate owns
-candidate extraction and canonical records while the stock and retained paths
-share target-relative value resolution, queueing, preparation, and the shader.
-This is still entirely inside the focused `bevy_ui_render` replacement patch.
+Box shadows share the public `resolve_box_shadow` function. The retained crate
+owns candidate extraction, canonical records, persistent instances, queueing,
+and its damage-mask-aware shader. Stock and retained paths still have one
+implementation of target-relative value resolution. This remains entirely
+inside the focused `bevy_ui_render` replacement boundary.
 
 `ViewportNode` needs no additional Bevy patch. It resolves to the existing UI
 image command, so the retained crate replaces only its extractor and reuses the
@@ -441,21 +450,39 @@ overwrites the target with transparent pixels. A retained offscreen camera must
 therefore become inactive after a completed repair, or use a render graph that
 does no target write on a quiet frame.
 
-For each damaged region:
+One atomic repair does the following:
 
 1. Preflight every pipeline, bind group, texture, and buffer needed by the
    repair.
 2. Keep old retained state and damage owed if preflight fails.
-3. Wipe the damaged region with blending disabled.
-4. Replay every intersecting record bottom-up, with the repair scissor active.
-5. Commit the new retained state only after commands for the complete repair
+3. Rasterize the exact rectangle union once into an `R8Unorm` damage mask.
+4. Wipe that union with blending disabled.
+5. Replay every intersecting retained record once, bottom-up; retained core,
+   gradient, and shadow shaders discard fragments outside the mask.
+6. Replay arbitrary stock slice/material pipelines under exact region scissors,
+   because third-party pipelines cannot be required to bind the mask.
+7. Commit the new retained state only after commands for the complete repair
    were encoded.
+
+Stencil was tested and rejected. Adding a stencil attachment changes render
+pipeline compatibility, so every stock and third-party material pipeline would
+need a matching depth/stencil specialization. A sampled color mask preserves
+exact pixels for the renderer-owned families without expanding that contract.
+It also lets a moved item draw once across disjoint old and new regions instead
+of once per scissor.
 
 The region representation is a canonical union of integer physical rectangles.
 No subpixel tolerance is required. A record's conservative coverage includes
 antialiasing, shadows, outlines, filters, and texture sampling reach. Old
 coverage remains authoritative until the new pixels commit, so subpixel drift
 cannot accumulate invisibly.
+
+Candidate selection uses a persistent exact two-dimensional bounds tree.
+Geometry changes refit only affected leaves and ancestors. Direct dirty groups
+are tracked by a fixed-size earliest/latest epoch interval, so dense changes can
+skip spatial work while delayed resources cannot grow unbounded history. The
+tree is brought current before the next partial spatial query; no stale bound is
+ever queried.
 
 Offscreen surfaces carry monotonically increasing content generations. Readers
 declare the sampled surface and source region. A source commit invalidates the
@@ -575,6 +602,10 @@ allows it:
   texture samples.
 
 Every regression test must first fail with the named defect reintroduced.
+The production GPU harness also builds both `ExtractSchedule` and `Render` with
+ambiguity detection at `Error`. Enabling it found and fixed a real unordered
+shared-resource conflict between viewport and image/text dependency extraction;
+the backstop remains active in every GPU case.
 
 Performance has two separate test layers. Large-scene deterministic contracts
 run with the normal test suite and assert exact work cardinality, so timing
@@ -672,19 +703,21 @@ quiet path's remaining size dependence.
 
 Canonical paint repair planning measured about 6.43 ns when quiet and 0.246
 microseconds for one change, independent of whether 100 or 10,000 records are
-retained. Changing all 10,000 adjacent records measured 0.971 ms; 10,000
-separated one-pixel records measured 1.545 ms, while 10,000 records with
-identical coverage measured 0.327 ms. Equal old/new coverage is journaled once,
-not duplicated as separate old and new damage events. The common zero/one-region
-coverage forms allocate nothing.
+retained. After caching repeated unions, changing all 10,000 adjacent records
+measured about 90 microseconds and resizing all 10,000 about 130 microseconds in
+the local Criterion run. Separate benchmarks retain the scattered and complete-
+overlap shapes. Equal old/new coverage is journaled once, not duplicated as
+separate old and new damage events. The common zero/one-region coverage forms
+allocate nothing.
 
 The former sorted-phase replay benchmark was deleted when production stopped
-using that algorithm. Canonical records are now filtered through an augmented
-exact interval index before entering Bevy's transient extraction, queue, and
-prepare buffers. A one-item repair therefore stages the intersecting records
-rather than building a 10,000-item phase and culling it at draw time. The index
-has no tile-size or count threshold: it prunes by exact interval bounds and
-returns the same intersections and covered area as exhaustive comparison.
+using that algorithm. Canonical records are now filtered through a persistent
+exact two-dimensional spatial index before entering transient queue and prepare
+buffers. A one-item repair therefore stages intersecting records rather than
+building a 10,000-item phase and culling it at draw time. Directly changed
+groups bypass the query, dense direct changes bypass tree refitting, and partial
+queries refit every outstanding bound first. The index has no tile-size or
+count threshold and is exhaustively differential-tested.
 
 The GPU acceptance harness uses a 64-by-64 image target, synchronous pipeline
 compilation, explicit device polling, an in-process mutex, and a cross-process
@@ -701,15 +734,25 @@ share one scene, one stable
 Family extractors only update canonical records; a single later replay stage
 sorts every visible family together. This is required for correctness:
 repairing a translucent image or glyph must first replay the background
-beneath it. The named GPU image proof changes a 10-by-10 image, repairs exactly
-100 pixels, and replays exactly those two intersecting records bottom-up.
+beneath it. Ordinary nodes, images, glyphs, gradients, and shadows retain their
+prepared instance data and use mask-aware instanced pipelines. Slices and
+arbitrary materials reuse Bevy's pipelines with exact-scissor fallback. The
+named GPU image proof changes a 10-by-10 image, repairs exactly 100 pixels, and
+replays exactly the two intersecting logical items bottom-up.
+
+All image-reading families share one exact reverse-dependency graph. Access is
+an explicit locked extraction transaction rather than an ECS `ResMut`: generic
+material plugins cannot declare a static order relative to other
+monomorphizations of the same extractor. The GPU material tests register two
+retained material types under strict schedule ambiguity detection, so adding a
+new material type cannot turn a valid app into a launch-order lottery.
 
 Records use `Changed<T>` candidate nomination, bit-exact canonical values,
-stable render entities, and old-union-new damage. Each exact, non-overlapping
-damage rectangle is wiped to transparent and rebuilt from only the sorted
-phase items whose physical bounds intersect it. A localized background proof
-moves a 10-by-10 leaf across a larger background: exactly 200 pixels are
-repaired and only the three necessary item-region intersections are replayed.
+stable render entities, and old-union-new damage. The exact, non-overlapping
+damage union is wiped to transparent and rebuilt from only the sorted items
+whose physical bounds intersect it. A localized background proof moves a
+10-by-10 leaf across a larger background: exactly 200 pixels are repaired and
+the two necessary logical items are each replayed once through the exact mask.
 
 The mutation audit found that `ComputedNode` alone is not a complete
 nomination source: Bevy intentionally writes resolved borders and corner radii
@@ -867,7 +910,7 @@ equal-color corner ties then alpha-blended more than once. The accepted path
 keeps edge identity stable, but merges equal canonical commands at replay time
 by OR-ing their border flags. Changing the left edge out of an equal-color
 group therefore damages only that edge's 140-pixel rounded-corner reach, while
-the other three edges still replay as one command under the damage scissor.
+the other three edges still replay as one command through the damage mask.
 Equal-color borders, distinct-color regrouping, outlines, and component
 removal are byte-identical to stock in named GPU tests.
 
@@ -924,8 +967,9 @@ for storage only when they use it. Damage and item intersection consume the
 same region set. A unit proof keeps the gap between two regions absent from
 damage; composition no longer needs a second coverage representation.
 
-The owned UI layer is double-buffered. A repair encodes into the inactive
-texture and replaces the visible texture only after every region succeeds.
+The owned UI layer is double-buffered and owns one byte-per-pixel damage mask.
+A repair encodes into the inactive texture and replaces the visible texture
+only after every region succeeds.
 Each slot carries a committed generation; bringing an older slot current
 copies only damage committed since that generation, rather than copying the
 whole layer. Those exact rectangles are copied by one instanced GPU draw; an
@@ -939,13 +983,11 @@ replacement nominates and compares exactly one record but changes zero records
 and causes zero repairs; a real color change repairs exactly that record's old
 and new physical coverage.
 
-Only records intersecting exact damage are staged into Bevy's transient draw
-machinery. Normal UI records are independently drawable when any contributor
-is only partially damaged. When every staged normal item for a camera is proven
-wholly inside the exact damage, the same records use Bevy's ordinary batch draw
-instead: two disjoint changed quads are proven to stage two records, repair 200
-pixels, submit one prepared batch, and draw two quads. This classification is a
-coverage proof, not a node-count or area heuristic.
+Only records intersecting exact damage are staged. Renderer-owned families are
+grouped into persistent instanced runs and draw once through the mask even when
+damage is disjoint. Two disjoint changed quads are proven to stage two records,
+repair 200 pixels, report two logical items, and draw two quads from one run.
+There is no node-count, damaged-area, or region-count threshold.
 
 Two readback tests inspect animation streams rather than only final frames. One
 moves a translucent item through three disjoint positions and requires at least
@@ -1003,37 +1045,59 @@ p99, maximum, number of frames at or above 4 ms, and longest consecutive run at
 or above 4 ms. This distinguishes a single setup spike from a sustained busy-UI
 failure without making log output create the tail it is measuring. The retained
 counter report includes the current retained texture payload bytes; that gauge
-is exact for the two layer textures but excludes driver bookkeeping. This
+is exact for the two RGBA layer textures plus the R8 damage mask, but excludes
+driver bookkeeping. This
 executable has no universal pass/fail frame-time threshold:
 the same command is the measurement instrument, while the acceptable budget is
 chosen for the game's target hardware and frame rate.
 
-The same development machine's release-profile Vulkan runs on 2026-08-11 found
-both the intended win and an unresolved busy-scene failure:
+The same development machine's release-profile Vulkan runs on 2026-08-11/12
+measure the current persistent-instance and exact-mask implementation:
 
 | 10,000-node end-to-end windowed workload | Stock | Retained |
 |---|---:|---:|
-| grid background, one placement per frame | 3.100 ms | 0.823 ms |
-| grid mixed paint, one contained layout change per frame | 17.585 ms | 1.111 ms |
-| grid background, all colors change per frame | 3.078 ms | 16.756 ms |
-| grid background, all widths change per frame | 5.766 ms | 20.958 ms |
-| fully overlapping mixed paint, one layout change per frame | not yet recorded | 26.092 ms |
+| grid mixed, quiet | 17.629 ms | 1.052 ms |
+| grid mixed, one paint change per frame | 18.429 ms | 1.281 ms |
+| grid mixed, one layout change in a 100-node boundary | 18.107 ms | 1.278 ms |
+| overlap background, one paint change per frame | 3.259 ms | 1.836 ms |
+| overlap background, all paint changes per frame | 3.244 ms | 2.980 ms |
+| grid effects, all paint changes per frame | 46.019 ms | 42.109 ms |
+| grid mixed, all paint changes per frame | 17.875 ms | 19.336 ms |
+| grid background, all placement changes per frame | 3.283 ms | 5.028 ms |
+| grid mixed, all placement changes per frame | 17.671 ms | 33.191 ms |
+| grid background, all contained widths change per frame | 5.096 ms | 8.185 ms |
+| grid mixed, all contained widths change per frame | 98.769 ms | 114.767 ms |
 
-These are 120 or 240 consecutive measured frames after a 60-frame warmup, not
-single events. The all-color and all-layout retained rows exceeded 4 ms on every
-measured frame. The overlap row must rebuild every translucent contributor
-bottom-up and also exceeded 4 ms throughout. This does not satisfy the
-across-the-board performance requirement. Exact pre-staging removed the
-10,000-record quiet/localized replay, exact interval indexing reduced a
-separated all-color run from about 116 ms to 17 ms, and coverage-proven batching
-reduced 10,000 normal UI draw items to one batch, but every-changing scenes still
-translate and prepare all canonical records through Bevy's transient UI buffers.
-The next renderer architecture must retain prepared geometry/batch ownership and
-update only changed slots; another threshold, full-redraw fallback, or tuning
-constant would hide rather than remove this structural cost.
+These are 60, 120, or 180 consecutive measured frames after a 60-frame warmup,
+not single events. The quiet and localized retained rows had no frame at or
+above 4 ms. The overlap/localized row is deliberately adversarial: one changed
+translucent node requires all 10,000 contributors beneath it to replay, yet the
+retained path still wins because unchanged extraction and preparation stay
+retained. The effect row also wins under complete paint mutation.
+
+Global paint, placement, and layout remain the honest boundary. When all
+content changes, canonical comparison is additional necessary proof work; a
+retained renderer cannot make that proof free. Prepared ordinary geometry,
+gradients, and shadows are now retained, damage unions are cached, dense direct
+changes skip spatial refits, and ordinary replay is instanced, reducing the old
+16.756 ms all-background-paint result to near stock. Mixed all-paint remains
+about 1.5 ms slower locally, and global geometry changes remain slower because
+every affected family must update old/new coverage and rerasterize.
+
+The global-placement result identifies the next missing capability rather than
+a tuning problem. A node transform on one monolithic cached surface changes
+pixels, so 25,000 mixed-family records move and repaint. Declared repaint
+boundaries must instead create a compositor display list of cached chunks and
+island surfaces; moving an island then changes one composite transform and zero
+island pixels. This is required for the promised placement/paint separation.
+No full-redraw fallback, area threshold, or promotion heuristic can provide
+that semantic result.
 
 Known portable test gaps remain. They are missing proofs, not known failures:
 
+- compositor display lists and declared repaint boundaries are designed but not
+  implemented; transform animation of ordinary nodes therefore still repaints
+  old union new coverage on the monolithic layer;
 - containment still lacks differentials for min/max/aspect constraints and real
   glyph reflow. Flex-wrap reverse, right-to-left layout, percentages, absolute
   descendants, hidden nodes, intrinsic `ContentSize`, and scrollbar appearance
@@ -1070,23 +1134,20 @@ These are reported as measured platform results, never inferred from desktop
 timings. Pixel correctness remains testable through image targets and device
 readback even when the performance mechanism is opaque.
 
-## Increment order
+## Increment status
 
-1. Prove external `UiSystems` quiescence and final-writer interposition. These
-   decide crate scope.
-2. Build a serialized GPU-test harness and retained-vs-full differential scene.
-3. Retain canonical paint records and process only changed/removed entities.
-4. Add a persistent window UI surface, full repair on change, and complete skip
-   on a quiet frame.
-5. Add exact damage regions, wipe/replay, old/new coverage, and per-record
-   culling.
-6. Add transform/clip/effect/scroll property separation and declared retained
-   boundaries.
-7. Propagate committed damage from retained offscreen surfaces to their exact
-   image readers.
-8. Gate or replace main-world layout, stack, and clipping work by dirty domain.
-9. Perform runtime-selectable on-device architecture sweeps and retain only
-   mechanisms justified by measurements.
+The external scope probes, serialized GPU harness, canonical paint records,
+persistent atomic surface, exact mask repair, old/new coverage, two-dimensional
+candidate index, sampled-image propagation, persistent prepared instances,
+main-world dirty domains, layout containment, fused final composition, and the
+runtime A/B stress matrix are implemented.
+
+The next implementation increment is the compositor display list and declared
+repaint-boundary API. It must preserve arbitrary sibling stacking, nested
+boundaries, clips, opacity, and transforms while stopping invalidation in both
+directions. It lands only with GPU ordering/motion differentials, exact memory
+counters, and sustained placement benchmarks. Physical-device architecture and
+energy sweeps follow; desktop Vulkan numbers cannot substitute for them.
 
 Cleanup is part of every increment: superseded paths, flags, thresholds, and
 comments are removed before the next capability is added.

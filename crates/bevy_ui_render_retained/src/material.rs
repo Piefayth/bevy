@@ -1,7 +1,7 @@
 //! Exact retained contracts and extraction for custom UI materials.
 
 use crate::{
-    sampled_image::{ImageReader, ImageSample, RetainedSampledImages},
+    sampled_image::{ImageReader, ImageSample, RetainedSampledImages, SampledImageState},
     scene::{
         coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
         RetainedMaterialItem, RetainedMaterialReplays, RetainedUiScene, RetainedUiSurfaces,
@@ -391,7 +391,7 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
     mut commands: Commands,
     state: Res<RetainedUiScene>,
     mut dependencies: ResMut<RetainedMaterialDependencies<M>>,
-    mut sampled_images: ResMut<RetainedSampledImages>,
+    sampled_images: Res<RetainedSampledImages>,
     default_sampler: Res<DefaultImageSamplerDescriptor>,
     materials: Extract<Res<Assets<M>>>,
     images: Extract<Res<Assets<Image>>>,
@@ -421,8 +421,9 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
 {
-    let mut candidates: HashSet<_> = changed.iter().map(|item| item.0).collect();
-    candidates.extend(sampled_images.take_materials::<M>());
+    let mut sampled_images = sampled_images.lock();
+    let mut extra_candidates: HashSet<_> =
+        sampled_images.take_materials::<M>().into_iter().collect();
     for event in events.read() {
         let material = match *event {
             AssetEvent::Added { id }
@@ -431,9 +432,9 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
             | AssetEvent::Removed { id } => id,
             AssetEvent::LoadedWithDependencies { .. } => continue,
         };
-        dependencies.process_asset(material, materials.get(material), &mut candidates);
+        dependencies.process_asset(material, materials.get(material), &mut extra_candidates);
     }
-    dependencies.nominate_volatile(&mut candidates);
+    dependencies.nominate_volatile(&mut extra_candidates);
 
     let RemovedMaterialInputs {
         material,
@@ -446,9 +447,10 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
         visibility,
         camera,
     } = &mut *removed;
-    candidates.extend(material.read());
-    candidates.extend(clip.read());
-    candidates.extend(target.read());
+    extra_candidates.extend(material.read());
+    extra_candidates.extend(clip.read());
+    extra_candidates.extend(target.read());
+    extra_candidates.retain(|entity| !changed.contains(*entity));
     let mut surfaces = state.lock();
     for entity in computed_node
         .read()
@@ -466,31 +468,38 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
             entity,
         );
     }
-
-    let mut camera_mapper = camera_map.get_mapper();
-    for entity in candidates {
-        let Ok((
-            entity,
-            source_node,
-            node,
-            stack,
-            transform,
-            handle,
-            visibility,
-            clip,
-            target_camera,
-            target,
-        )) = all.get(entity)
-        else {
+    extra_candidates.retain(|entity| {
+        if all.contains(*entity) {
+            true
+        } else {
             remove_material::<M>(
                 &mut dependencies,
                 &mut sampled_images,
                 &mut surfaces,
                 &mut commands,
-                entity,
+                *entity,
             );
-            continue;
-        };
+            false
+        }
+    });
+
+    let mut camera_mapper = camera_map.get_mapper();
+    for (
+        entity,
+        source_node,
+        node,
+        stack,
+        transform,
+        handle,
+        visibility,
+        clip,
+        target_camera,
+        target,
+    ) in changed.iter().chain(
+        extra_candidates
+            .into_iter()
+            .filter_map(|entity| all.get(entity).ok()),
+    ) {
         let value = materials.get(handle);
         let snapshot = value.map(RetainedUiMaterial::retained_ui);
         dependencies.set_entity(
@@ -553,7 +562,7 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
                     ),
                 );
             }
-            ResourceFingerprint::Revisions(revisions.into_boxed_slice())
+            ResourceFingerprint::Revisions(revisions.into_iter().collect())
         } else {
             sampled_images.remove_reader(reader);
             ResourceFingerprint::None
@@ -613,7 +622,7 @@ fn material_id<M: RetainedUiMaterial>(entity: Entity) -> PaintId {
 
 fn remove_material<M: RetainedUiMaterial>(
     dependencies: &mut RetainedMaterialDependencies<M>,
-    sampled_images: &mut RetainedSampledImages,
+    sampled_images: &mut SampledImageState,
     surfaces: &mut RetainedUiSurfaces,
     commands: &mut Commands,
     entity: Entity,

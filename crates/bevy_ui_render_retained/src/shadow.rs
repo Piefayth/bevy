@@ -99,7 +99,7 @@ pub(crate) fn extract_retained_shadows(
     changed_samples: Extract<Query<Entity, Changed<BoxShadowSamples>>>,
     mut removed: Extract<RemovedShadowInputs>,
 ) {
-    let mut candidates: HashSet<_> = changed.iter().map(|item| item.0).collect();
+    let mut extra_candidates = HashSet::new();
     let RemovedShadowInputs {
         shadow,
         clip,
@@ -112,21 +112,22 @@ pub(crate) fn extract_retained_shadows(
         visibility,
         camera,
     } = &mut *removed;
-    candidates.extend(shadow.read());
-    candidates.extend(clip.read());
-    candidates.extend(target.read());
+    extra_candidates.extend(shadow.read());
+    extra_candidates.extend(clip.read());
+    extra_candidates.extend(target.read());
     let changed_cameras: HashSet<_> = changed_samples
         .iter()
         .chain(removed_samples.read())
         .collect();
     if !changed_cameras.is_empty() {
-        candidates.extend(all.iter().filter_map(|item| {
+        extra_candidates.extend(all.iter().filter_map(|item| {
             item.8
                 .get()
                 .filter(|camera| changed_cameras.contains(camera))
                 .map(|_| item.0)
         }));
     }
+    extra_candidates.retain(|entity| !changed.contains(*entity));
 
     let mut surfaces = state.lock();
     for entity in computed_node
@@ -139,25 +140,32 @@ pub(crate) fn extract_retained_shadows(
     {
         remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
     }
+    extra_candidates.retain(|entity| {
+        if all.contains(*entity) {
+            true
+        } else {
+            remove_entity(&mut dependencies, &mut surfaces, &mut commands, *entity);
+            false
+        }
+    });
 
     let mut camera_mapper = camera_map.get_mapper();
-    for entity in candidates {
-        let Ok((
-            entity,
-            source_node,
-            node,
-            stack,
-            transform,
-            visibility,
-            shadows,
-            clip,
-            target_camera,
-            target,
-        )) = all.get(entity)
-        else {
-            remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
-            continue;
-        };
+    for (
+        entity,
+        source_node,
+        node,
+        stack,
+        transform,
+        visibility,
+        shadows,
+        clip,
+        target_camera,
+        target,
+    ) in changed.iter().chain(
+        extra_candidates
+            .into_iter()
+            .filter_map(|entity| all.get(entity).ok()),
+    ) {
         let Some(camera) = camera_mapper.map(target_camera) else {
             remove_entity(&mut dependencies, &mut surfaces, &mut commands, entity);
             continue;
