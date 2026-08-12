@@ -264,16 +264,18 @@ impl<K: Eq + Hash, V: PartialEq> RetainedPaint<K, V> {
 
     /// Removes one paint record and damages the pixels it occupied.
     pub fn remove(&mut self, id: &K) -> bool {
-        let Some(entry) = self.records.remove(id) else {
-            return false;
-        };
+        self.take(id).is_some()
+    }
+
+    pub(crate) fn take(&mut self, id: &K) -> Option<PaintRecord<V>> {
+        let entry = self.records.remove(id)?;
         record_damage(
             &mut self.damage,
             &mut self.counters,
             entry.coverage.as_slice(),
         );
         self.counters.records_removed += 1;
-        true
+        Some(entry)
     }
 
     /// Returns a canonical paint record.
@@ -298,6 +300,10 @@ impl<K: Eq + Hash, V: PartialEq> RetainedPaint<K, V> {
 
     pub(crate) const fn latest_damage_epoch(&self) -> u64 {
         self.damage.latest_epoch()
+    }
+
+    pub(crate) fn has_damage(&self) -> bool {
+        !self.damage.is_empty()
     }
 
     /// Invalidates pixels because the surface holding otherwise unchanged records was lost.

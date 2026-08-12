@@ -18,7 +18,7 @@ use bevy::{
     winit::WinitSettings,
 };
 use bevy_ui_render_retained::{
-    RetainedUiLayerCounters, RetainedUiMainWorldCounters, RetainedUiPaintCounters,
+    RepaintBoundary, RetainedUiLayerCounters, RetainedUiMainWorldCounters, RetainedUiPaintCounters,
     RetainedUiRenderPlugin,
 };
 
@@ -78,6 +78,8 @@ enum Workload {
     AllPlacement,
     OneLayout,
     AllLayout,
+    OneBoundaryPlacement,
+    AllBoundaryPlacement,
     OneChurn,
 }
 
@@ -153,6 +155,8 @@ impl Config {
                         "all-placement" => Workload::AllPlacement,
                         "one-layout" => Workload::OneLayout,
                         "all-layout" => Workload::AllLayout,
+                        "one-boundary-placement" => Workload::OneBoundaryPlacement,
+                        "all-boundary-placement" => Workload::AllBoundaryPlacement,
                         "one-churn" => Workload::OneChurn,
                         value => panic!("unknown workload {value:?}"),
                     };
@@ -173,7 +177,8 @@ impl Config {
                         "--renderer stock|retained --geometry grid|overlap|alternating \
                          --family background|text|image|effects|mixed \
                          --workload quiet|one-paint|all-paint|one-placement|all-placement|\
-                         one-layout|all-layout|one-churn --nodes N [--layout-group N] [--frames N] \
+                         one-layout|all-layout|one-boundary-placement|all-boundary-placement|\
+                         one-churn --nodes N [--layout-group N] [--frames N] \
                          [--warmup N]"
                     );
                     std::process::exit(0);
@@ -192,6 +197,20 @@ impl Config {
                 .is_none_or(|frames| frames > config.warmup_frames),
             "--frames must exceed --warmup"
         );
+        assert!(
+            !matches!(
+                config.workload,
+                Workload::OneBoundaryPlacement | Workload::AllBoundaryPlacement
+            ) || config.layout_group.is_some(),
+            "boundary placement workloads require --layout-group"
+        );
+        assert!(
+            !matches!(
+                config.workload,
+                Workload::OneBoundaryPlacement | Workload::AllBoundaryPlacement
+            ) || config.geometry == Geometry::Grid,
+            "boundary placement workloads currently use grid geometry"
+        );
         config
     }
 }
@@ -205,6 +224,7 @@ struct FrameTiming {
 #[derive(Resource)]
 struct StressNodes {
     nodes: Vec<StressItem>,
+    boundaries: Vec<Entity>,
     image: Handle<Image>,
     alternate: bool,
 }
@@ -271,6 +291,22 @@ fn main() {
         Workload::AllLayout => {
             app.add_systems(Update, animate_all_layout);
         }
+        Workload::OneBoundaryPlacement => match config.renderer {
+            Renderer::Stock => {
+                app.add_systems(Update, animate_one_stock_boundary);
+            }
+            Renderer::Retained => {
+                app.add_systems(Update, animate_one_retained_boundary);
+            }
+        },
+        Workload::AllBoundaryPlacement => match config.renderer {
+            Renderer::Stock => {
+                app.add_systems(Update, animate_all_stock_boundaries);
+            }
+            Renderer::Retained => {
+                app.add_systems(Update, animate_all_retained_boundaries);
+            }
+        },
         Workload::OneChurn => {
             app.add_systems(Update, churn_one);
         }
@@ -302,34 +338,81 @@ fn setup(mut commands: Commands, config: Res<Config>, mut images: ResMut<Assets<
         })
         .id();
     let columns = (config.nodes as f32).sqrt().ceil() as usize;
+    let boundary_workload = matches!(
+        config.workload,
+        Workload::OneBoundaryPlacement | Workload::AllBoundaryPlacement
+    );
+    let group_size = config.layout_group.unwrap_or(config.nodes);
+    let group_columns = (group_size as f32).sqrt().ceil() as usize;
+    let group_count = config.nodes.div_ceil(group_size);
+    let boundary_columns = (group_count as f32).sqrt().ceil() as usize;
     let mut nodes = Vec::with_capacity(config.nodes);
+    let mut boundaries = Vec::new();
     let mut parent = root;
     for index in 0..config.nodes {
         if config
             .layout_group
             .is_some_and(|group_size| index.is_multiple_of(group_size))
         {
-            parent = commands
-                .spawn((
-                    Node {
-                        position_type: PositionType::Absolute,
-                        width: percent(100),
-                        height: percent(100),
-                        ..Default::default()
+            let group = index / group_size;
+            let members = group_size.min(config.nodes - index);
+            let rows = members.div_ceil(group_columns);
+            let mut boundary = commands.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: if boundary_workload {
+                        px((group % boundary_columns * group_columns) as f32 * 7.0)
+                    } else {
+                        px(0)
                     },
-                    LayoutContainment,
-                    ChildOf(root),
-                ))
-                .id();
+                    top: if boundary_workload {
+                        px((group / boundary_columns * group_columns) as f32 * 7.0)
+                    } else {
+                        px(0)
+                    },
+                    width: if boundary_workload {
+                        px(group_columns as f32 * 7.0)
+                    } else {
+                        percent(100)
+                    },
+                    height: if boundary_workload {
+                        px(rows as f32 * 7.0)
+                    } else {
+                        percent(100)
+                    },
+                    ..Default::default()
+                },
+                LayoutContainment,
+                ChildOf(root),
+            ));
+            if config.renderer == Renderer::Retained
+                && matches!(
+                    config.workload,
+                    Workload::OneBoundaryPlacement | Workload::AllBoundaryPlacement
+                )
+            {
+                boundary.insert(RepaintBoundary::default());
+            }
+            parent = boundary.id();
+            boundaries.push(parent);
         }
         let family = config.family.item(index);
+        let item_index = if boundary_workload {
+            index % group_size
+        } else {
+            index
+        };
         let entity = spawn_item(
             &mut commands,
             parent,
             family,
             config.geometry,
-            index,
-            columns,
+            item_index,
+            if boundary_workload {
+                group_columns
+            } else {
+                columns
+            },
             &image,
         );
         nodes.push(StressItem {
@@ -340,6 +423,7 @@ fn setup(mut commands: Commands, config: Res<Config>, mut images: ResMut<Assets<
     }
     commands.insert_resource(StressNodes {
         nodes,
+        boundaries,
         image,
         alternate: false,
     });
@@ -501,6 +585,58 @@ fn animate_all_layout(mut stress: ResMut<StressNodes>, mut nodes: Query<&mut Nod
     let width = px(if stress.alternate { 7.0 } else { 6.0 });
     for item in &stress.nodes {
         nodes.get_mut(item.entity).unwrap().width = width;
+    }
+}
+
+fn animate_one_stock_boundary(
+    mut stress: ResMut<StressNodes>,
+    mut transforms: Query<&mut UiTransform>,
+) {
+    stress.alternate = !stress.alternate;
+    transforms
+        .get_mut(stress.boundaries[0])
+        .unwrap()
+        .translation
+        .x = px(if stress.alternate { 1.0 } else { 0.0 });
+}
+
+fn animate_all_stock_boundaries(
+    mut stress: ResMut<StressNodes>,
+    mut transforms: Query<&mut UiTransform>,
+) {
+    stress.alternate = !stress.alternate;
+    let x = px(if stress.alternate { 1.0 } else { 0.0 });
+    for &boundary in &stress.boundaries {
+        transforms.get_mut(boundary).unwrap().translation.x = x;
+    }
+}
+
+fn animate_one_retained_boundary(
+    mut stress: ResMut<StressNodes>,
+    mut boundaries: Query<&mut RepaintBoundary>,
+) {
+    stress.alternate = !stress.alternate;
+    boundaries
+        .get_mut(stress.boundaries[0])
+        .unwrap()
+        .transform
+        .translation
+        .x = px(if stress.alternate { 1.0 } else { 0.0 });
+}
+
+fn animate_all_retained_boundaries(
+    mut stress: ResMut<StressNodes>,
+    mut boundaries: Query<&mut RepaintBoundary>,
+) {
+    stress.alternate = !stress.alternate;
+    let x = px(if stress.alternate { 1.0 } else { 0.0 });
+    for &boundary in &stress.boundaries {
+        boundaries
+            .get_mut(boundary)
+            .unwrap()
+            .transform
+            .translation
+            .x = x;
     }
 }
 

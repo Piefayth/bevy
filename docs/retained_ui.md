@@ -35,19 +35,25 @@ The implemented expansion decisions are:
    and stock Taffy invalidation coupled every descendant to its complete UI root.
    [Issue #22909](https://github.com/bevyengine/bevy/issues/22909) describes the
    same idle cost and root invalidation. A focused `bevy_ui` patch was required
-   for independent layout/geometry scheduling and semantic layout containment.
+   for independent layout/geometry scheduling and semantic layout and paint
+   containment.
 2. `bevy_core_pipeline`: no patch is currently required. The retained crate
    replaces the public final-writer system and preserves Bevy's output attachment
    and presentation bookkeeping.
 
-Two smaller focused changes remain in the crates whose behavior they own.
+Focused changes remain in the crates whose behavior they own.
 `bevy_ui` now caches an image node's intrinsic-size inputs, so changing only an
 image tint does not falsely rewrite `ContentSize` and wake layout.
 `bevy_ui_render` exposes its ordinary-node preparation as a removable public
 system set and gives the shared gradient shader a public import path. The
 replacement can therefore install persistent node preparation and reuse Bevy's
-gradient functions without keeping an unused transient upload. Neither change
-requires `bevy_core_pipeline`.
+gradient functions without keeping an unused transient upload. Repaint
+boundaries also propagate a generic `ComputedUiPaintTarget`; the stock generic
+`UiMaterial` extractor honors it and records immediate-mode target volatility.
+That small cross-crate hook is necessary because an arbitrary material plugin is
+monomorphized outside the replacement crate: without it, a material below a
+boundary would queue onto the camera phase and bypass the cached surface.
+Neither change requires `bevy_core_pipeline`.
 
 Current upstream UI-render work retains intermediate render data, but not final
 pixels:
@@ -128,6 +134,45 @@ boundary's own size computes the outer tree and then the contained tree if its
 constraints changed. Nested containment stops at the nearest boundary, and
 reparenting updates exactly the old and new boundaries. Equal `Node` writes are
 compared against Taffy's canonical style and do not dirty Taffy.
+
+`PaintContainment` is a separate semantic promise. Descendant paint and
+`OverrideClip` may not escape the boundary's border box. `CalculatedClip`
+therefore carries two exact clip chains: the final parent-facing clip and the
+boundary-local raster clip. The local chain restarts at each nested paint
+boundary, while the parent chain keeps accumulating normally. Keeping the two
+channels is necessary: a cached subtree must rasterize pixels hidden by its
+current parent clip so a later compositor transform can reveal them, but it
+must never rasterize pixels outside its own paint promise.
+
+`RepaintBoundary` requires `PaintContainment` but deliberately does not require
+`LayoutContainment`. Raster caching must not silently change intrinsic sizing
+or flex dependencies. Applications combine both components when they can make
+both promises. As with other Bevy required components, removing
+`RepaintBoundary` does not remove an existing `PaintContainment`; remove both
+components explicitly when both semantics should end.
+
+The retained source is exactly the boundary's border box. Its own paint is
+therefore clipped there too; put an exterior shadow or outline on a parent
+wrapper. This makes the surface size a declared, stable quantity instead of a
+content-dependent allocation that can jump when an effect or overflowing child
+changes. The behavior is part of the boundary contract, not inferred promotion
+or a renderer threshold.
+
+```rust
+commands.spawn((
+    Node {
+        width: px(640),
+        height: px(360),
+        ..default()
+    },
+    LayoutContainment,
+    RepaintBoundary::from_translation(Val2::px(0, 0)),
+));
+```
+
+Animating `RepaintBoundary::transform` or `opacity` changes only composition.
+Animating the node's ordinary `UiTransform` remains a layout-tree placement
+change and updates descendant `UiGlobalTransform`s.
 
 There is a second possible `bevy_ui` boundary for O(changes) candidate
 nomination. In Bevy 0.19, lifecycle hooks run for component insertion,
@@ -464,6 +509,13 @@ One atomic repair does the following:
 7. Commit the new retained state only after commands for the complete repair
    were encoded.
 
+All repairs encoded in one render frame append their mask/copy/wipe rectangles
+to one immutable-range GPU arena. Reusing offset zero for each surface was
+proven wrong by a sustained boundary-content animation: a later parent repair
+overwrote the child repair's vertex data before the command encoder executed,
+and presented an L-shaped mixture of two color generations. The arena is
+cleared once before render-graph execution, never between surface repairs.
+
 Stencil was tested and rejected. Adding a stencil attachment changes render
 pipeline compatibility, so every stock and third-party material pipeline would
 need a matching depth/stencil specialization. A sampled color mask preserves
@@ -531,13 +583,47 @@ portable platform partial-present behavior cannot currently be promised.
 A general subtree repaint boundary cannot be implemented by cutting a hole in
 one cached parent texture and compositing the subtree afterward. A later sibling
 may paint above the boundary; flattening all non-boundary paint into one texture
-loses the ordering point at which the boundary layer must be inserted. The exact
-representation is a compositor display list alternating cached paint chunks
-with boundary surfaces. Nested boundaries recurse, and each boundary defines an
-atomic stacking context. This is now a prerequisite for the boundary increment;
-a component that merely suppresses transform invalidation is rejected because
-it preserves stale pixels, while a topmost-only restriction is too narrow for
-the intended API.
+loses the ordering point at which the boundary layer must be inserted.
+
+The implemented representation is a compositor display list alternating paint
+runs with boundary-surface records at their exact `ComputedStackIndex`. A
+boundary owns a tightly sized double-buffered texture. Its subtree rasterizes in
+global physical coordinates through a synthetic UI view whose projection maps
+the boundary box to that texture. The parent replays the boundary texture at the
+same ordering point as the replaced subtree. Nested boundaries repair deepest
+first and recurse through the same representation; every boundary is an atomic
+stacking context.
+
+Boundary content damage is mapped from source pixels through the boundary's
+affine UV transform into exact conservative parent rectangles. A scaled proof
+changes 336 source pixels, repairs those 336 pixels in the child and exactly
+1,344 mapped pixels in the parent; it does not promote the change to the full
+boundary. Propagation records the exact source damage epoch, not a boolean dirty
+bit, so a source that repairs and changes again on the next frame propagates the
+new generation instead of becoming permanently stale. Boundary transform and
+group opacity live only on the parent display record. Changing either damages
+old union new parent coverage and never dirties the child surface, layout,
+geometry, stack, or clipping.
+
+Zero opacity is an exact suspension state. Content changes still update
+canonical records, but their damage is acknowledged without raster or parent
+work. An initially hidden source allocates no texture, and hiding a previously
+visible boundary retires that boundary's own surface. Cached descendant
+surfaces may remain allocated while an outer boundary is hidden, but perform no
+work. Effective visibility walks the declared boundary ancestry, so a hidden
+outer boundary also suspends nested sources. Revealing it invalidates every
+visible descendant source and repairs them deepest first before the parent
+composition; GPU tests cover both the zero-work hidden interval and the
+complete reveal.
+
+The cache uses the parent's render-target format. With the common four-byte
+RGBA8 target, an intermediate surface adds one quantization point: direct and
+one-boundary alpha composition can differ by at most one stored channel value
+in the acceptance scenes, and nesting can accumulate one value per cache
+level. This bounded precision cost is tested explicitly. Forcing an eight-byte
+half-float cache for an RGBA8 parent would reduce it but double retained memory
+and compositor sampling bandwidth; preserving the parent format is the
+performance default and also avoids an implicit format conversion policy.
 
 ## Handoff audit
 
@@ -619,10 +705,10 @@ The current matrix is exact about what it includes:
 | Layer | Sizes | Shapes | Mutations | Deliberately excluded |
 |---|---:|---|---|---|
 | `Changed<T>` nomination | 100, 1,000, 10,000 entities | one archetype | quiet, one changed, all changed; one input and an eight-input `Or` | canonical extraction and rendering |
-| Main-world UI work | 100, 1,000, 10,000 nodes | flat, four-way balanced, 100-node independent roots, explicit containment groups of 10/100/1,000; a 256-deep chain | quiet, equal `Node` write, one/all layout, one local node-geometry change, one placement, one change per boundary, all contained leaves; one reparent for the forest; 64 consecutive contained-layout frames | render extraction and GPU work |
+| Main-world UI work | 100, 1,000, 10,000 nodes | flat, four-way balanced, 100-node independent roots, explicit containment groups of 10/100/1,000; a 256-deep chain | quiet, equal `Node` write, one/all layout, one local node-geometry change, one placement, one/all compositor-boundary placement, one change per layout boundary, all contained leaves; one reparent for the forest; 64 consecutive contained-layout frames | render extraction and GPU work |
 | Canonical paint and exact damage | 100, 1,000, 10,000 records | adjacent tiles, separated pixels, full overlap | quiet, one paint change, all paint changes; indexed intersection and area against 10,000 separated regions | Bevy extraction and rasterization |
-| GPU acceptance | small 64-by-64 scenes | disjoint and translucent overlap across every integrated family | quiet and targeted changes | stable wall-clock timing |
-| Windowed stress executable | configurable, 10,000 by default | grid, full overlap, alternating overlap; background, text, image, gradients/shadows/borders, or mixed | quiet, one/all paint, one/all placement, one/all layout, one churn | automated pass/fail timing thresholds |
+| GPU acceptance | small 64-by-64 scenes | disjoint and translucent overlap across every integrated family; arbitrary and nested repaint boundaries | quiet, targeted changes, compositor transform/opacity, boundary content animation, boundary removal | stable wall-clock timing |
+| Windowed stress executable | configurable, 10,000 by default | grid, full overlap, alternating overlap; background, text, image, gradients/shadows/borders, or mixed | quiet, one/all paint, one/all placement, one/all layout, one/all boundary placement, one churn | automated pass/fail timing thresholds |
 
 Layout topology and paint overlap are orthogonal inputs: overlap does not alter
 Taffy's dependency graph, so the layout Criterion cases do not duplicate every
@@ -668,6 +754,30 @@ baselines:
 | contained 100, boundary's own layout changes | 0.805 ms | 0.686 ms |
 | contained 100, one internal change in every boundary | 2.868 ms | 2.778 ms |
 | contained 100, all internal leaves change | 4.453 ms | 4.236 ms |
+
+The repaint-boundary increment adds `one_boundary_compositor_change` and
+`all_boundary_compositor_changes` to every contained Criterion shape. In the
+10,000-node absolute-contained-100 scene, changing one boundary property in
+`PostUpdate` measured 0.134 ms retained versus 0.274 ms for the equivalent stock
+`UiTransform` subtree placement. The retained main-world counters stayed at one
+initial layout, geometry, stack, and clip run throughout the animation.
+
+The 1280-by-720 windowed stress executable was also run for 240 frames with 120
+warmup frames on the development RTX 4090/Vulkan machine on 2026-08-12. These
+are local end-to-end samples, not cross-device claims:
+
+| Sustained 10,000-node placement | Mean | p95 | Max | Frames >= 4 ms | Longest >= 4 ms streak |
+|---|---:|---:|---:|---:|---:|
+| stock, one transform containing 10,000 nodes | 3.430 ms | 3.776 ms | 4.327 ms | 1 | 1 |
+| retained, one repaint boundary containing 10,000 nodes | 1.219 ms | 1.348 ms | 1.506 ms | 0 | 0 |
+| stock, 100 transforms each containing 100 nodes | 3.212 ms | 3.583 ms | 4.530 ms | 3 | 2 |
+| retained, 100 repaint boundaries each containing 100 nodes | 1.564 ms | 1.693 ms | 2.559 ms | 0 | 0 |
+
+The retained runs allocate each source surface once. Thereafter boundary motion
+changes only 1 or 100 parent display records per frame; none of the 10,000 child
+paint records are compared or rerasterized. The parent still repairs the exact
+old/new composite coverage and the final fused blit still samples the visible UI
+layer, so these numbers do not mislabel composition as free.
 
 Each Criterion iteration mutates the next state and immediately runs
 `PostUpdate`, so every change row is sustained consecutive-frame work rather
@@ -747,6 +857,15 @@ monomorphizations of the same extractor. The GPU material tests register two
 retained material types under strict schedule ambiguity detection, so adding a
 new material type cannot turn a valid app into a launch-order lottery.
 
+An ordinary `UiMaterialPlugin` remains correct without opting into the exact
+contract. Its extractor declares the actual camera or repaint-boundary surface
+volatile once per target, not once per node; planning then journals a full
+target repair through the same owed-damage path. A GPU differential places such
+a material inside a translated boundary and proves that it is rasterized into
+the child surface before parent composition. Opting into
+`RetainedUiMaterialPlugin` replaces that conservative cost with exact keys,
+coverage, and image dependencies.
+
 Records use `Changed<T>` candidate nomination, bit-exact canonical values,
 stable render entities, and old-union-new damage. The exact, non-overlapping
 damage union is wiped to transparent and rebuilt from only the sorted items
@@ -764,6 +883,16 @@ with a matrix inverse, makes a zero-scale-to-visible transition exact. Painted
 records clipped to empty coverage stay canonical but out of the spatial/order
 index, allowing placement alone to reveal them again. GPU differentials cover
 mixed-family translation, fully clipped re-entry, and zero-scale recovery.
+
+Declared `RepaintBoundary` placement is a different domain from ordinary
+`UiTransform` placement. Its `transform` and `opacity` are extracted once into
+the parent surface's boundary record. A 28-by-24 translation proof changes one
+canonical record, repairs one parent surface and the exact 1,104-pixel old/new
+union, replays only the underlying parent item plus the boundary quad, and
+allocates or repairs no child surface. An opacity-only proof has the same
+one-record/one-parent-repair contract. Identity, arbitrary sibling ordering,
+nested boundaries, paint clipping, post-flatten group opacity, removal and
+surface-memory release all have GPU readback proofs.
 
 The mutation audit found that `ComputedNode` alone is not a complete
 nomination source: Bevy intentionally writes resolved borders and corner radii
@@ -1000,14 +1129,20 @@ damage is disjoint. Two disjoint changed quads are proven to stage two records,
 repair 200 pixels, report two logical items, and draw two quads from one run.
 There is no node-count, damaged-area, or region-count threshold.
 
-Two readback tests inspect animation streams rather than only final frames. One
+Four readback tests inspect animation streams rather than only final frames. One
 moves a translucent item through three disjoint positions and requires at least
 24 captured frames to cycle through three stock-rendered complete states with
 no stale repeat, ghost, partial repair, or skipped state. It was confirmed red
 by removing inactive-slot synchronization. The other cycles a translucent
 full-surface repair through three states on the batched path and enforces the
 same generation ordering; it was confirmed red by removing the wipe, which
-immediately exposed alpha accumulation. These tests exercise Bevy's pipelined
+immediately exposed alpha accumulation. A third moves an unchanged repaint
+boundary through three compositor positions and accepts only complete cached
+states. The fourth changes content inside a static boundary every frame and
+requires each child and parent surface generation to land atomically. It first
+failed because a boolean "already propagated" marker suppressed every source
+epoch after the first, then exposed the shared-rectangle-buffer overwrite that
+mixed two generations within one box. These tests exercise Bevy's pipelined
 render app against an image target, not a window-system compositor.
 
 Each layer is sized in viewport-local physical pixels. UI repair uses that
@@ -1041,7 +1176,11 @@ cargo run --profile stress-test -p bevy_ui_render_retained --features stress_tes
 Run the same command with `--renderer stock` for the A/B. Geometry accepts
 `grid`, `overlap`, and `alternating`; family accepts `background`, `text`,
 `image`, `effects`, and `mixed`; workload accepts `quiet`, `one-paint`, `all-paint`,
-`one-placement`, `all-placement`, `one-layout`, `all-layout`, and `one-churn`.
+`one-placement`, `all-placement`, `one-layout`, `all-layout`,
+`one-boundary-placement`, `all-boundary-placement`, and `one-churn`. Boundary
+placement requires grid geometry plus `--layout-group`; retained mode moves
+`RepaintBoundary::transform`, while stock moves the equivalent group
+`UiTransform`.
 Omitting `--layout-group` creates one coupled root; supplying a positive size
 partitions the nodes into explicit `LayoutContainment` widgets of that size.
 The 10/100/1,000 sweep used by Criterion can therefore be repeated on physical
@@ -1099,20 +1238,17 @@ global geometry remains slower than stock because all 25,000 records still
 change pixels on the monolithic retained surface and must update old/new
 coverage and rerasterize.
 
-The global-placement result identifies the next missing capability rather than
-a tuning problem. A node transform on one monolithic cached surface changes
-pixels, so 25,000 mixed-family records move and repaint. Declared repaint
-boundaries must instead create a compositor display list of cached chunks and
-island surfaces; moving an island then changes one composite transform and zero
-island pixels. This is required for the promised placement/paint separation.
-No full-redraw fallback, area threshold, or promotion heuristic can provide
-that semantic result.
+The global-placement result identified a missing capability rather than a
+tuning problem. A node transform on one monolithic cached surface changes
+pixels, so 25,000 mixed-family records move and repaint. The implemented
+declared repaint boundaries instead create a compositor display list of cached
+chunks and island surfaces; moving an island changes one composite transform
+and zero island pixels. Ordinary `UiTransform` retains its normal paint
+semantics. No full-redraw fallback, area threshold, or promotion heuristic can
+provide compositor-only placement without that explicit boundary contract.
 
 Known portable test gaps remain. They are missing proofs, not known failures:
 
-- compositor display lists and declared repaint boundaries are designed but not
-  implemented; transform animation of ordinary nodes therefore still repaints
-  old union new coverage on the monolithic layer;
 - containment still lacks differentials for min/max/aspect constraints and real
   glyph reflow. Flex-wrap reverse, right-to-left layout, percentages, absolute
   descendants, hidden nodes, intrinsic `ContentSize`, and scrollbar appearance
@@ -1155,14 +1291,15 @@ The external scope probes, serialized GPU harness, canonical paint records,
 persistent atomic surface, exact mask repair, old/new coverage, two-dimensional
 candidate index, sampled-image propagation, persistent prepared instances,
 main-world dirty domains, layout containment, fused final composition, and the
-runtime A/B stress matrix are implemented.
+runtime A/B stress matrix are implemented. The compositor display list and
+declared repaint-boundary API are also implemented with arbitrary sibling
+stacking, nesting, clips, post-flatten opacity, transform-only placement,
+hidden-subtree suspension, exact memory counters, sustained animation
+differentials, and placement benchmarks.
 
-The next implementation increment is the compositor display list and declared
-repaint-boundary API. It must preserve arbitrary sibling stacking, nested
-boundaries, clips, opacity, and transforms while stopping invalidation in both
-directions. It lands only with GPU ordering/motion differentials, exact memory
-counters, and sustained placement benchmarks. Physical-device architecture and
-energy sweeps follow; desktop Vulkan numbers cannot substitute for them.
+The remaining validation increment is physical-device architecture and energy
+sweeps. Desktop Vulkan numbers cannot establish tile-memory traffic, Metal and
+mobile driver behavior, or battery impact.
 
 Cleanup is part of every increment: superseded paths, flags, thresholds, and
 comments are removed before the next capability is added.

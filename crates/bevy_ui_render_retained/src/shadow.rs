@@ -1,10 +1,14 @@
 //! Change-driven retained extraction for UI box shadows.
 
-use crate::scene::{
-    coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedBoxShadowItem, RetainedDraw,
-    RetainedDrawItem, RetainedUiScene, RetainedUiSurfaces,
+use crate::{
+    boundary::retained_clip,
+    scene::{
+        coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedBoxShadowItem, RetainedDraw,
+        RetainedDrawItem, RetainedUiScene, RetainedUiSurfaces,
+    },
 };
 use bevy::{
+    app::Inherited,
     asset::AssetId,
     camera::visibility::InheritedVisibility,
     color::Alpha,
@@ -18,8 +22,8 @@ use bevy::{
     math::{Affine2, Vec2},
     render::{sync_world::MainEntity, Extract},
     ui::{
-        BoxShadow, CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
-        ComputedUiTargetCamera, Display, Node, UiGlobalTransform,
+        BoxShadow, CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiPaintTarget,
+        ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Display, Node, UiGlobalTransform,
     },
     ui_render::{box_shadow::resolve_box_shadow, stack_z_offsets, BoxShadowSamples, UiCameraMap},
 };
@@ -53,6 +57,7 @@ type ShadowQueryItem<'a> = (
     &'a InheritedVisibility,
     &'a BoxShadow,
     Option<&'a CalculatedClip>,
+    Option<&'a Inherited<ComputedUiPaintTarget>>,
     &'a ComputedUiTargetCamera,
     &'a ComputedUiRenderTargetInfo,
 );
@@ -121,7 +126,7 @@ pub(crate) fn extract_retained_shadows(
         .collect();
     if !changed_cameras.is_empty() {
         extra_candidates.extend(all.iter().filter_map(|item| {
-            item.8
+            item.9
                 .get()
                 .filter(|camera| changed_cameras.contains(camera))
                 .map(|_| item.0)
@@ -159,6 +164,7 @@ pub(crate) fn extract_retained_shadows(
         visibility,
         shadows,
         clip,
+        owner,
         target_camera,
         target,
     ) in changed.iter().chain(
@@ -180,8 +186,8 @@ pub(crate) fn extract_retained_shadows(
             && source_node.display != Display::None
             && !node.is_empty()
             && !node.size().cmple(Vec2::ZERO).any();
+        let clip = retained_clip(entity, node, transform, clip, owner);
         let node_transform = transform.affine();
-        let clip = clip.map(|clip| clip.clip);
         let mut paints = HashSet::new();
         for (ordinal, logical) in shadows.iter().enumerate() {
             let Some(shadow) = resolve_box_shadow(

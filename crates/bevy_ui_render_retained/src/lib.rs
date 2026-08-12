@@ -14,6 +14,7 @@ extern crate alloc;
 
 mod background;
 mod border;
+mod boundary;
 mod core;
 mod damage;
 mod gradient;
@@ -31,6 +32,7 @@ mod shadow_render;
 mod text;
 mod viewport;
 
+pub use boundary::RepaintBoundary;
 pub use damage::{DamageJournal, PhysicalRect, RepairPlan};
 pub use layer::{RetainedUiLayerCounters, RetainedUiLayerWork, RetainedUiRenderPlugin};
 pub use material::{

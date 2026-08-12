@@ -41,6 +41,61 @@ fn copy_retained(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
     return textureLoad(retained_ui, vec2<i32>(position.xy), 0);
 }
 
+struct BoundaryVertexInput {
+    @builtin(vertex_index) vertex_index: u32,
+    @location(0) transform: vec4<f32>,
+    @location(1) translation: vec2<f32>,
+    @location(2) size: vec2<f32>,
+    @location(3) uv_rect: vec4<f32>,
+    @location(4) opacity: f32,
+    @location(5) target_size: vec2<f32>,
+}
+
+struct BoundaryVertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) opacity: f32,
+}
+
+@vertex
+fn boundary_vertex(in: BoundaryVertexInput) -> BoundaryVertexOutput {
+    let corners = array(0u, 2u, 3u, 0u, 1u, 2u);
+    let unit_positions = array(
+        vec2(-0.5, -0.5),
+        vec2(0.5, -0.5),
+        vec2(0.5, 0.5),
+        vec2(-0.5, 0.5),
+    );
+    let uv_positions = array(
+        in.uv_rect.xy,
+        in.uv_rect.zy,
+        in.uv_rect.zw,
+        in.uv_rect.xw,
+    );
+    let corner = corners[in.vertex_index];
+    let local = unit_positions[corner] * in.size;
+    let world = vec2(
+        in.transform.x * local.x + in.transform.z * local.y + in.translation.x,
+        in.transform.y * local.x + in.transform.w * local.y + in.translation.y,
+    );
+    var out: BoundaryVertexOutput;
+    out.position = vec4(
+        world.x * 2.0 / in.target_size.x - 1.0,
+        1.0 - world.y * 2.0 / in.target_size.y,
+        0.0,
+        1.0,
+    );
+    out.uv = uv_positions[corner];
+    out.opacity = in.opacity;
+    return out;
+}
+
+@fragment
+fn boundary_fragment(in: BoundaryVertexOutput) -> @location(0) vec4<f32> {
+    let size = vec2<f32>(textureDimensions(final_world));
+    return textureLoad(final_world, vec2<i32>(in.uv * size), 0) * in.opacity;
+}
+
 @group(0) @binding(1) var final_world: texture_2d<f32>;
 @group(0) @binding(2) var final_sampler: sampler;
 

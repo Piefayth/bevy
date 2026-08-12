@@ -1,10 +1,14 @@
 //! Change-driven retained extraction for UI backgrounds.
 
-use crate::scene::{
-    coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
-    RetainedNodeItem, RetainedUiScene,
+use crate::{
+    boundary::retained_clip,
+    scene::{
+        coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
+        RetainedNodeItem, RetainedUiScene,
+    },
 };
 use bevy::{
+    app::Inherited,
     camera::visibility::InheritedVisibility,
     color::Alpha,
     ecs::{
@@ -18,7 +22,7 @@ use bevy::{
     render::Extract,
     sprite::BorderRect,
     ui::{
-        BackgroundColor, CalculatedClip, ComputedNode, ComputedStackIndex,
+        BackgroundColor, CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiPaintTarget,
         ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, OuterColor, UiGlobalTransform,
     },
     ui_render::{stack_z_offsets, NodeType, UiCameraMap},
@@ -31,6 +35,7 @@ type BackgroundQueryItem<'a> = (
     &'a UiGlobalTransform,
     &'a InheritedVisibility,
     Option<&'a CalculatedClip>,
+    Option<&'a Inherited<ComputedUiPaintTarget>>,
     &'a ComputedUiTargetCamera,
     &'a BackgroundColor,
     Option<&'a OuterColor>,
@@ -135,13 +140,22 @@ pub(crate) fn extract_retained_backgrounds(
         clip.read()
             .filter(|entity| !structural_changed.contains(*entity)),
     );
-    for (entity, node, stack, transform, visibility, clip, target_camera, background, outer) in
-        structural_changed.iter().chain(
-            extra_candidates
-                .into_iter()
-                .filter_map(|entity| all.get(entity).ok()),
-        )
-    {
+    for (
+        entity,
+        node,
+        stack,
+        transform,
+        visibility,
+        clip,
+        owner,
+        target_camera,
+        background,
+        outer,
+    ) in structural_changed.iter().chain(
+        extra_candidates
+            .into_iter()
+            .filter_map(|entity| all.get(entity).ok()),
+    ) {
         let fill_id = background_id(entity, 0);
         let outer_id = background_id(entity, 1);
         let Some(camera) = camera_mapper.map(target_camera) else {
@@ -149,8 +163,8 @@ pub(crate) fn extract_retained_backgrounds(
             surfaces.remove(&mut commands, outer_id);
             continue;
         };
+        let clip = retained_clip(entity, node, transform, clip, owner);
         let transform = transform.affine();
-        let clip = clip.map(|clip| clip.clip);
         let visible = visibility.get() && !node.is_empty();
         let z_order = stack.0 as f32 + stack_z_offsets::BACKGROUND_COLOR;
         let base_item = RetainedNodeItem {

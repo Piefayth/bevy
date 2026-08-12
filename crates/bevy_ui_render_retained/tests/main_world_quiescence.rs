@@ -11,12 +11,13 @@ use bevy::{
     text::TextPlugin,
     time::TimePlugin,
     ui::{
-        BackgroundColor, ComputedNode, ComputedStackIndex, Node, OverrideClip, UiGlobalTransform,
-        UiStack, UiSystems, UiTransform, Val, ZIndex,
+        BackgroundColor, ComputedNode, ComputedStackIndex, LayoutContainment, Node, OverrideClip,
+        PaintContainment, UiGlobalTransform, UiStack, UiSystems, UiTransform, Val, ZIndex,
     },
 };
 use bevy_ui_render_retained::{
-    RetainedUiMainWorldCounters, RetainedUiMainWorldPlugin, RetainedUiMainWorldWork,
+    RepaintBoundary, RetainedUiMainWorldCounters, RetainedUiMainWorldPlugin,
+    RetainedUiMainWorldWork,
 };
 
 const TARGET_SIZE: UVec2 = UVec2::new(64, 64);
@@ -224,6 +225,47 @@ fn clipping_only_inputs_do_not_wake_layout_or_stack() {
     assert_eq!(after.geometry_runs, before.geometry_runs);
     assert_eq!(after.stack_runs, before.stack_runs);
     assert_eq!(after.clip_runs, before.clip_runs + 1);
+}
+
+#[test]
+fn repaint_boundary_requires_paint_containment_without_owning_layout() {
+    let (mut app, _, leaf) = test_app();
+
+    app.world_mut()
+        .entity_mut(leaf)
+        .insert(RepaintBoundary::default());
+    app.world_mut().run_schedule(PostUpdate);
+    assert!(!app.world().entity(leaf).contains::<LayoutContainment>());
+    assert!(app.world().entity(leaf).contains::<PaintContainment>());
+
+    app.world_mut().entity_mut(leaf).remove::<RepaintBoundary>();
+    app.world_mut().run_schedule(PostUpdate);
+    assert!(!app.world().entity(leaf).contains::<LayoutContainment>());
+    assert!(app.world().entity(leaf).contains::<PaintContainment>());
+}
+
+#[test]
+fn compositor_only_boundary_changes_skip_every_main_world_ui_walk() {
+    let (mut app, _, leaf) = test_app();
+    app.world_mut()
+        .entity_mut(leaf)
+        .insert(RepaintBoundary::default());
+    app.world_mut().run_schedule(PostUpdate);
+    let before = retained_work(&app);
+    let global_before = *app.world().get::<UiGlobalTransform>(leaf).unwrap();
+
+    {
+        let mut boundary = app.world_mut().get_mut::<RepaintBoundary>(leaf).unwrap();
+        boundary.transform.translation.x = Val::Px(7.0);
+        boundary.opacity = 0.4;
+    }
+    app.world_mut().run_schedule(PostUpdate);
+
+    assert_eq!(retained_work(&app), before);
+    assert_eq!(
+        *app.world().get::<UiGlobalTransform>(leaf).unwrap(),
+        global_before
+    );
 }
 
 #[test]

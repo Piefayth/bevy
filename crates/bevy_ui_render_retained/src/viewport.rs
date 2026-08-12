@@ -1,6 +1,7 @@
 //! Change-driven retained extraction for camera-backed UI viewport nodes.
 
 use crate::{
+    boundary::retained_clip,
     sampled_image::{ImageReader, ImageSample, RetainedSampledImages, SampledImageState},
     scene::{
         coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
@@ -8,6 +9,7 @@ use crate::{
     },
 };
 use bevy::{
+    app::Inherited,
     asset::{Assets, Handle},
     camera::visibility::InheritedVisibility,
     camera::{Camera, RenderTarget},
@@ -22,7 +24,7 @@ use bevy::{
     render::{render_resource::DefaultImageSamplerDescriptor, sync_world::MainEntity, Extract},
     ui::{
         widget::ViewportNode, CalculatedClip, ComputedNode, ComputedStackIndex,
-        ComputedUiTargetCamera, Display, Node, UiGlobalTransform,
+        ComputedUiPaintTarget, ComputedUiTargetCamera, Display, Node, UiGlobalTransform,
     },
     ui_render::{stack_z_offsets, NodeType, UiCameraMap},
 };
@@ -71,6 +73,7 @@ type ViewportQueryItem<'a> = (
     &'a UiGlobalTransform,
     &'a InheritedVisibility,
     Option<&'a CalculatedClip>,
+    Option<&'a Inherited<ComputedUiPaintTarget>>,
     &'a ComputedUiTargetCamera,
     &'a ViewportNode,
 );
@@ -181,13 +184,22 @@ pub(crate) fn extract_retained_viewports(
     });
 
     let mut camera_mapper = camera_map.get_mapper();
-    for (entity, source_node, node, stack, transform, visibility, clip, target_camera, viewport) in
-        changed.iter().chain(
-            extra_candidates
-                .into_iter()
-                .filter_map(|entity| all.get(entity).ok()),
-        )
-    {
+    for (
+        entity,
+        source_node,
+        node,
+        stack,
+        transform,
+        visibility,
+        clip,
+        owner,
+        target_camera,
+        viewport,
+    ) in changed.iter().chain(
+        extra_candidates
+            .into_iter()
+            .filter_map(|entity| all.get(entity).ok()),
+    ) {
         dependencies.set_source(entity, viewport.camera);
         let id = viewport_id(entity);
         let reader = ImageReader::Viewport(entity);
@@ -212,8 +224,8 @@ pub(crate) fn extract_retained_viewports(
             continue;
         };
 
+        let clip = retained_clip(entity, node, transform, clip, owner);
         let transform = transform.affine();
-        let clip = clip.map(|clip| clip.clip);
         let painted = visibility.get()
             && source_node.display != Display::None
             && !node.is_empty()

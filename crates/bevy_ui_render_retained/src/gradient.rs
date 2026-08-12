@@ -2,12 +2,14 @@
 
 use crate::{
     border::edge_rect,
+    boundary::retained_clip,
     scene::{
         coverage, coverage_rect, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw,
         RetainedDrawItem, RetainedGradientItem, RetainedUiScene, RetainedUiSurfaces,
     },
 };
 use bevy::{
+    app::Inherited,
     asset::AssetId,
     camera::visibility::InheritedVisibility,
     color::Alpha,
@@ -22,7 +24,8 @@ use bevy::{
     render::{sync_world::MainEntity, Extract},
     ui::{
         BackgroundGradient, BorderGradient, CalculatedClip, ComputedNode, ComputedStackIndex,
-        ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Display, Node, UiGlobalTransform,
+        ComputedUiPaintTarget, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Display, Node,
+        UiGlobalTransform,
     },
     ui_render::{gradient::resolve_gradient, stack_z_offsets, UiCameraMap},
 };
@@ -55,6 +58,7 @@ type GradientQueryItem<'a> = (
     &'a UiGlobalTransform,
     &'a InheritedVisibility,
     Option<&'a CalculatedClip>,
+    Option<&'a Inherited<ComputedUiPaintTarget>>,
     &'a ComputedUiTargetCamera,
     &'a ComputedUiRenderTargetInfo,
     Option<&'a BackgroundGradient>,
@@ -154,6 +158,7 @@ pub(crate) fn extract_retained_gradients(
         transform,
         visibility,
         clip,
+        owner,
         target_camera,
         target,
         backgrounds,
@@ -172,8 +177,8 @@ pub(crate) fn extract_retained_gradients(
             && source_node.display != Display::None
             && !node.is_empty()
             && !node.size().cmple(Vec2::ZERO).any();
+        let clip = retained_clip(entity, node, transform, clip, owner);
         let transform = transform.affine();
-        let clip = clip.map(|clip| clip.clip);
         let mut paint_ids = HashSet::new();
         for (gradients, border_gradient) in [
             (backgrounds.map(|gradients| &gradients.0), false),

@@ -1323,6 +1323,121 @@ mod tests {
     }
 
     #[test]
+    fn paint_containment_separates_parent_and_surface_clips() {
+        let mut app = setup_ui_test_app();
+        let parent = app
+            .world_mut()
+            .spawn(Node {
+                width: Val::Px(50.0),
+                height: Val::Px(50.0),
+                overflow: Overflow::clip(),
+                ..default()
+            })
+            .id();
+        let boundary = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(100.0),
+                    height: Val::Px(100.0),
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+                PaintContainment,
+                ChildOf(parent),
+            ))
+            .id();
+        let leaf = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(boundary)))
+            .id();
+        app.update();
+
+        let boundary_clip = *app.world().get::<CalculatedClip>(boundary).unwrap();
+        let leaf_clip = *app.world().get::<CalculatedClip>(leaf).unwrap();
+        let boundary_node = app.world().get::<ComputedNode>(boundary).unwrap();
+        let boundary_transform = app.world().get::<UiGlobalTransform>(boundary).unwrap();
+        let boundary_rect =
+            Rect::from_center_size(boundary_transform.translation, boundary_node.size());
+
+        assert_eq!(boundary_clip.clip, boundary_clip.paint_clip);
+        assert_eq!(leaf_clip.clip, boundary_clip.clip.intersect(boundary_rect));
+        assert_eq!(leaf_clip.paint_clip, boundary_rect);
+        assert!(leaf_clip.paint_clip.width() > leaf_clip.clip.width());
+    }
+
+    #[test]
+    fn override_clip_cannot_escape_paint_containment() {
+        let mut app = setup_ui_test_app();
+        let boundary = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(40.0),
+                    height: Val::Px(30.0),
+                    ..default()
+                },
+                PaintContainment,
+            ))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((Node::default(), OverrideClip, ChildOf(boundary)))
+            .id();
+        app.update();
+
+        let clip = *app.world().get::<CalculatedClip>(child).unwrap();
+        let node = app.world().get::<ComputedNode>(boundary).unwrap();
+        let transform = app.world().get::<UiGlobalTransform>(boundary).unwrap();
+        let boundary_rect = Rect::from_center_size(transform.translation, node.size());
+        assert_eq!(clip.clip, boundary_rect);
+        assert_eq!(clip.paint_clip, boundary_rect);
+    }
+
+    #[test]
+    fn nested_paint_containment_restarts_only_the_inner_surface_clip() {
+        let mut app = setup_ui_test_app();
+        let outer = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(100.0),
+                    height: Val::Px(100.0),
+                    ..default()
+                },
+                PaintContainment,
+            ))
+            .id();
+        let inner = app
+            .world_mut()
+            .spawn((
+                Node {
+                    width: Val::Px(40.0),
+                    height: Val::Px(30.0),
+                    ..default()
+                },
+                PaintContainment,
+                ChildOf(outer),
+            ))
+            .id();
+        let leaf = app
+            .world_mut()
+            .spawn((Node::default(), ChildOf(inner)))
+            .id();
+        app.update();
+
+        let inner_clip = *app.world().get::<CalculatedClip>(inner).unwrap();
+        let leaf_clip = *app.world().get::<CalculatedClip>(leaf).unwrap();
+        let inner_node = app.world().get::<ComputedNode>(inner).unwrap();
+        let inner_transform = app.world().get::<UiGlobalTransform>(inner).unwrap();
+        let inner_rect = Rect::from_center_size(inner_transform.translation, inner_node.size());
+
+        assert_eq!(inner_clip.paint_clip.width(), 100.0);
+        assert_eq!(leaf_clip.paint_clip, inner_rect);
+        assert_eq!(leaf_clip.clip, inner_clip.clip.intersect(inner_rect));
+    }
+
+    #[test]
     fn contained_layout_matches_an_uncontained_fixed_box() {
         let mut app = setup_ui_test_app();
 

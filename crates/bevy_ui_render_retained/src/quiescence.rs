@@ -1,19 +1,20 @@
 //! Exact main-world gates for recursive Bevy UI work.
 
+use crate::boundary::{install_boundary_source, remove_boundary_source};
 use bevy::{
-    app::{App, Plugin, PostUpdate},
+    app::{App, HierarchyPropagatePlugin, Plugin, PostUpdate},
     ecs::{
         hierarchy::{ChildOf, Children},
         lifecycle::RemovedComponents,
-        query::{Added, Changed, Or},
+        query::{Added, Changed, Or, With},
         schedule::{IntoScheduleConfigs, ScheduleCleanupPolicy},
         system::{Query, Res, ResMut, SystemParam},
     },
     ui::{
-        ui_geometry_system, ui_layout_system, ui_stack_system, ComputedNode,
+        ui_geometry_system, ui_layout_system, ui_stack_system, ComputedNode, ComputedUiPaintTarget,
         ComputedUiRenderTargetInfo, ContentSize, GlobalZIndex, IgnoreScroll, LayoutConfig,
-        LayoutContainment, Node, Outline, OverrideClip, ScrollPosition, UiGlobalTransform,
-        UiSystems, UiTransform, ZIndex,
+        LayoutContainment, Node, Outline, OverrideClip, PaintContainment, ScrollPosition,
+        UiGlobalTransform, UiSystems, UiTransform, ZIndex,
     },
 };
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -66,7 +67,13 @@ pub struct RetainedUiMainWorldPlugin;
 
 impl Plugin for RetainedUiMainWorldPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<RetainedUiMainWorldCounters>()
+        app.register_type::<crate::RepaintBoundary>()
+            .add_plugins(
+                HierarchyPropagatePlugin::<ComputedUiPaintTarget, With<Node>>::new(PostUpdate),
+            )
+            .add_observer(install_boundary_source)
+            .add_observer(remove_boundary_source)
+            .init_resource::<RetainedUiMainWorldCounters>()
             .init_resource::<UiDirtyDomains>();
 
         let removed_layout = app
@@ -286,6 +293,7 @@ struct RemovedClippingInputs<'w, 's> {
     computed: RemovedComponents<'w, 's, ComputedNode>,
     transform: RemovedComponents<'w, 's, UiGlobalTransform>,
     override_clip: RemovedComponents<'w, 's, OverrideClip>,
+    containment: RemovedComponents<'w, 's, PaintContainment>,
     children: RemovedComponents<'w, 's, Children>,
     parent: RemovedComponents<'w, 's, ChildOf>,
 }
@@ -296,6 +304,7 @@ impl RemovedClippingInputs<'_, '_> {
             | drain_removed(&mut self.computed)
             | drain_removed(&mut self.transform)
             | drain_removed(&mut self.override_clip)
+            | drain_removed(&mut self.containment)
             | drain_removed(&mut self.children)
             | drain_removed(&mut self.parent)
     }
@@ -309,6 +318,7 @@ fn clipping_may_change(
             Changed<ComputedNode>,
             Changed<UiGlobalTransform>,
             Changed<OverrideClip>,
+            Changed<PaintContainment>,
             Changed<Children>,
             Changed<ChildOf>,
         )>,

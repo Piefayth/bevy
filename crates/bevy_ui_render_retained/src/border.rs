@@ -1,10 +1,14 @@
 //! Change-driven retained extraction for solid borders and outlines.
 
-use crate::scene::{
-    coverage_rect, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
-    RetainedNodeItem, RetainedUiScene, RetainedUiSurfaces,
+use crate::{
+    boundary::retained_clip,
+    scene::{
+        coverage_rect, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
+        RetainedNodeItem, RetainedUiScene, RetainedUiSurfaces,
+    },
 };
 use bevy::{
+    app::Inherited,
     asset::AssetId,
     camera::visibility::InheritedVisibility,
     color::{Alpha, LinearRgba},
@@ -19,8 +23,9 @@ use bevy::{
     render::Extract,
     sprite::BorderRect,
     ui::{
-        BorderColor, CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
-        ComputedUiTargetCamera, Display, Node, Outline, ResolvedBorderRadius, UiGlobalTransform,
+        BorderColor, CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiPaintTarget,
+        ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Display, Node, Outline,
+        ResolvedBorderRadius, UiGlobalTransform,
     },
     ui_render::{shader_flags, stack_z_offsets, NodeType, UiCameraMap},
 };
@@ -39,6 +44,7 @@ type BorderQueryItem<'a> = (
     &'a UiGlobalTransform,
     &'a InheritedVisibility,
     Option<&'a CalculatedClip>,
+    Option<&'a Inherited<ComputedUiPaintTarget>>,
     &'a ComputedUiTargetCamera,
     Option<&'a BorderColor>,
     Option<&'a Outline>,
@@ -128,6 +134,7 @@ pub(crate) fn extract_retained_borders(
         transform,
         visibility,
         clip,
+        owner,
         target_camera,
         border,
         outline,
@@ -142,8 +149,8 @@ pub(crate) fn extract_retained_borders(
             continue;
         };
         let visible = visibility.get() && node.display != Display::None && !computed.is_empty();
+        let clip = retained_clip(entity, computed, transform, clip, owner);
         let transform = transform.affine();
-        let clip = clip.map(|clip| clip.clip);
 
         if let Some(border) = border {
             let colors = [

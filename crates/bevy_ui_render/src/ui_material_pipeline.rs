@@ -1,5 +1,6 @@
 use crate::ui_material::{MaterialNode, UiMaterial, UiMaterialKey};
 use crate::*;
+use bevy_app::Inherited;
 use bevy_asset::*;
 use bevy_ecs::{
     prelude::{Component, With},
@@ -9,22 +10,23 @@ use bevy_ecs::{
         *,
     },
 };
-use bevy_math::{Affine2, FloatOrd, Rect, Vec2};
+use bevy_math::{Affine2, FloatOrd, Rect, UVec2, Vec2};
 use bevy_mesh::VertexBufferLayout;
+use bevy_platform::collections::HashMap;
 use bevy_render::{
     globals::{GlobalsBuffer, GlobalsUniform},
     render_asset::{PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets},
     render_phase::*,
     render_resource::{binding_types::uniform_buffer, *},
     renderer::{RenderDevice, RenderQueue},
-    sync_world::{MainEntity, TemporaryRenderEntity},
+    sync_world::{MainEntity, RenderEntity, TemporaryRenderEntity},
     view::*,
     Extract, ExtractSchedule, Render, RenderSystems,
 };
 use bevy_render::{GpuResourceAppExt, RenderApp, RenderStartup};
 use bevy_shader::{load_shader_library, Shader, ShaderRef};
 use bevy_sprite::BorderRect;
-use bevy_ui::ComputedStackIndex;
+use bevy_ui::{ComputedStackIndex, ComputedUiPaintTarget, ComputedUiRenderTargetInfo};
 use bevy_utils::default;
 use bytemuck::{Pod, Zeroable};
 use core::{hash::Hash, marker::PhantomData, ops::Range};
@@ -358,12 +360,18 @@ pub fn extract_ui_material_nodes<M: UiMaterial>(
             &MaterialNode<M>,
             &InheritedVisibility,
             Option<&CalculatedClip>,
+            Option<&Inherited<ComputedUiPaintTarget>>,
             &ComputedUiTargetCamera,
+            &ComputedUiRenderTargetInfo,
         )>,
     >,
+    paint_targets: Extract<Query<&RenderEntity>>,
     camera_map: Extract<UiCameraMap>,
+    volatile_targets: Res<VolatileUiPaintTargets>,
+    mut volatile_targets_local: Local<HashMap<Entity, UVec2>>,
 ) {
     let mut camera_mapper = camera_map.get_mapper();
+    volatile_targets_local.clear();
 
     for (
         entity,
@@ -373,7 +381,9 @@ pub fn extract_ui_material_nodes<M: UiMaterial>(
         handle,
         inherited_visibility,
         clip,
+        paint_target,
         camera,
+        target_info,
     ) in uinode_query.iter()
     {
         // skip invisible nodes
@@ -386,9 +396,24 @@ pub fn extract_ui_material_nodes<M: UiMaterial>(
             continue;
         }
 
-        let Some(extracted_camera_entity) = camera_mapper.map(camera) else {
-            continue;
+        let (extracted_camera_entity, clip) = if let Some(paint_target) = paint_target {
+            let Ok(render_target) = paint_targets.get(paint_target.0 .0) else {
+                continue;
+            };
+            let clip = if paint_target.0 .0 == entity {
+                Rect::from_center_size(transform.translation, computed_node.size())
+            } else {
+                clip.expect("paint-contained descendants must have a surface-local clip")
+                    .paint_clip
+            };
+            (render_target.id(), Some(clip))
+        } else {
+            let Some(camera) = camera_mapper.map(camera) else {
+                continue;
+            };
+            (camera, clip.map(|clip| clip.clip))
         };
+        volatile_targets_local.insert(extracted_camera_entity, target_info.physical_size());
 
         extracted_uinodes.uinodes.push(ExtractedUiMaterialNode {
             render_entity: commands.spawn(TemporaryRenderEntity).id(),
@@ -401,11 +426,16 @@ pub fn extract_ui_material_nodes<M: UiMaterial>(
             },
             border: computed_node.border(),
             border_radius: computed_node.border_radius().into(),
-            clip: clip.map(|clip| clip.clip),
+            clip,
             extracted_camera_entity,
             main_entity: entity.into(),
         });
     }
+    volatile_targets.extend(
+        volatile_targets_local
+            .iter()
+            .map(|(&target, &size)| (target, size)),
+    );
 }
 
 pub fn prepare_uimaterial_nodes<M: UiMaterial>(

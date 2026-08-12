@@ -29,9 +29,9 @@ use bevy::{
     window::{ExitCondition, WindowPlugin},
 };
 use bevy_ui_render_retained::{
-    RetainedUiLayerCounters, RetainedUiLayerWork, RetainedUiMaterial, RetainedUiMaterialCoverage,
-    RetainedUiMaterialImage, RetainedUiMaterialPlugin, RetainedUiMaterialSnapshot,
-    RetainedUiPaintCounters, RetainedUiRenderPlugin, WorkCounters,
+    RepaintBoundary, RetainedUiLayerCounters, RetainedUiLayerWork, RetainedUiMaterial,
+    RetainedUiMaterialCoverage, RetainedUiMaterialImage, RetainedUiMaterialPlugin,
+    RetainedUiMaterialSnapshot, RetainedUiPaintCounters, RetainedUiRenderPlugin, WorkCounters,
 };
 use core::time::Duration;
 use std::{
@@ -292,6 +292,12 @@ struct FlickerProbe;
 #[derive(Component)]
 struct BatchedFlickerProbe;
 
+#[derive(Component)]
+struct BoundaryFlickerProbe;
+
+#[derive(Component)]
+struct BoundaryContentFlickerProbe;
+
 fn animate_flicker_probe(
     mut probe: Single<&mut Node, With<FlickerProbe>>,
     mut position: Local<usize>,
@@ -315,6 +321,106 @@ fn animate_batched_flicker_probe(
 ) {
     *position = (*position + 1) % 3;
     probe.0 = batched_flicker_color(*position);
+}
+
+fn animate_boundary_flicker_probe(
+    mut probe: Single<&mut RepaintBoundary, With<BoundaryFlickerProbe>>,
+    mut position: Local<usize>,
+) {
+    const POSITIONS: [f32; 3] = [0.0, 18.0, 30.0];
+    *position = (*position + 1) % POSITIONS.len();
+    probe.transform = UiTransform::from_translation(Val2::px(POSITIONS[*position], 0));
+}
+
+fn animate_boundary_content_flicker_probe(
+    mut probe: Single<&mut BackgroundColor, With<BoundaryContentFlickerProbe>>,
+    mut position: Local<usize>,
+) {
+    *position = (*position + 1) % 3;
+    probe.0 = batched_flicker_color(*position);
+}
+
+fn spawn_boundary_content_scene(world: &mut World, camera: Entity, position: usize) -> Entity {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let boundary = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(11),
+                top: px(13),
+                width: px(36),
+                height: px(30),
+                ..default()
+            },
+            RepaintBoundary::default(),
+            ChildOf(root),
+        ))
+        .id();
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(5),
+                top: px(7),
+                width: px(21),
+                height: px(16),
+                ..default()
+            },
+            BackgroundColor(batched_flicker_color(position)),
+            ChildOf(boundary),
+        ))
+        .id()
+}
+
+fn spawn_nested_visibility_scene(
+    world: &mut World,
+    camera: Entity,
+    opacity: f32,
+) -> (Entity, Entity) {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let outer = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(8),
+                top: px(9),
+                width: px(40),
+                height: px(36),
+                ..default()
+            },
+            RepaintBoundary {
+                opacity,
+                ..default()
+            },
+            ChildOf(root),
+        ))
+        .id();
+    let inner = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(7),
+                top: px(8),
+                width: px(24),
+                height: px(20),
+                ..default()
+            },
+            RepaintBoundary::default(),
+            ChildOf(outer),
+        ))
+        .id();
+    let content = world
+        .spawn((
+            Node {
+                width: percent(100),
+                height: percent(100),
+                ..default()
+            },
+            BackgroundColor(batched_flicker_color(0)),
+            ChildOf(inner),
+        ))
+        .id();
+    (outer, content)
 }
 
 fn spawn_flicker_scene(world: &mut World, camera: Entity, left: f32) -> Entity {
@@ -430,17 +536,29 @@ fn assert_complete_cycle(frames: &[Vec<u8>], references: &[Vec<u8>]) {
                 .iter()
                 .position(|expected| frame == expected)
                 .unwrap_or_else(|| {
-                    assert_pixels_eq(frame, &references[0]);
-                    unreachable!()
+                    let differences: Vec<_> = references
+                        .iter()
+                        .map(|expected| {
+                            frame
+                                .iter()
+                                .zip(expected)
+                                .filter(|(actual, expected)| actual != expected)
+                                .count()
+                        })
+                        .collect();
+                    panic!("animation produced no complete reference state: {differences:?}");
                 })
         })
         .collect();
-    assert!((0..references.len()).all(|state| states.contains(&state)));
+    assert!(
+        (0..references.len()).all(|state| states.contains(&state)),
+        "animation omitted a complete state: {states:?}"
+    );
     assert!(
         states
             .windows(2)
             .all(|pair| pair[1] == (pair[0] + 1) % references.len()),
-        "each submitted animation frame must present the next complete state"
+        "each submitted animation frame must present the next complete state: {states:?}"
     );
 }
 
@@ -463,6 +581,25 @@ fn assert_pixels_eq(actual: &[u8], expected: &[u8]) {
     }
 }
 
+fn assert_pixels_within(actual: &[u8], expected: &[u8], tolerance: u8) {
+    assert_eq!(actual.len(), expected.len());
+    if let Some(index) = actual
+        .iter()
+        .zip(expected)
+        .position(|(actual, expected)| actual.abs_diff(*expected) > tolerance)
+    {
+        let pixel = index / BYTES_PER_PIXEL;
+        let byte = pixel * BYTES_PER_PIXEL;
+        panic!(
+            "pixels first differ beyond {tolerance} at ({}, {}): actual {:?}, expected {:?}",
+            pixel as u32 % WIDTH,
+            pixel as u32 / WIDTH,
+            &actual[byte..byte + BYTES_PER_PIXEL],
+            &expected[byte..byte + BYTES_PER_PIXEL]
+        );
+    }
+}
+
 fn spawn_full_background(world: &mut World, camera: Entity, color: Color) -> Entity {
     world
         .spawn((
@@ -475,6 +612,644 @@ fn spawn_full_background(world: &mut World, camera: Entity, color: Color) -> Ent
             UiTargetCamera(camera),
         ))
         .id()
+}
+
+fn spawn_boundary_scene(world: &mut World, camera: Entity, retained: bool) {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let mut boundary = world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(9),
+            top: px(11),
+            width: px(28),
+            height: px(24),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(220, 45, 28, 180)),
+        ChildOf(root),
+    ));
+    if retained {
+        boundary.insert(RepaintBoundary::default());
+    }
+    let boundary = boundary.id();
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(5),
+            top: px(7),
+            width: px(12),
+            height: px(10),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(30, 190, 90, 200)),
+        ChildOf(boundary),
+    ));
+}
+
+#[test]
+fn identity_repaint_boundary_matches_direct_rasterization() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_boundary_scene(world, camera, false),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_boundary_scene(world, camera, true),
+            |_, _| {},
+        );
+        assert_pixels_within(&retained.pixels, &stock.pixels, 1);
+    });
+}
+
+fn spawn_ordered_boundary_scene(world: &mut World, camera: Entity, retained: bool) {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(7),
+            top: px(9),
+            width: px(30),
+            height: px(28),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(235, 180, 30, 170)),
+        ChildOf(root),
+    ));
+    let mut boundary = world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(13),
+            top: px(12),
+            width: px(34),
+            height: px(31),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(210, 45, 35, 180)),
+        ChildOf(root),
+    ));
+    if retained {
+        boundary.insert(RepaintBoundary::default());
+    }
+    let boundary = boundary.id();
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(4),
+            top: px(6),
+            width: px(24),
+            height: px(19),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(35, 195, 90, 190)),
+        ChildOf(boundary),
+    ));
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(25),
+            top: px(20),
+            width: px(27),
+            height: px(25),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(45, 95, 225, 175)),
+        ChildOf(root),
+    ));
+}
+
+#[test]
+fn repaint_boundary_preserves_arbitrary_sibling_paint_order() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_ordered_boundary_scene(world, camera, false),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_ordered_boundary_scene(world, camera, true),
+            |_, _| {},
+        );
+        assert_pixels_within(&retained.pixels, &stock.pixels, 1);
+    });
+}
+
+fn spawn_nested_boundary_scene(world: &mut World, camera: Entity, retained: bool) {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let mut outer = world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(8),
+            top: px(7),
+            width: px(44),
+            height: px(39),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(220, 55, 30, 145)),
+        ChildOf(root),
+    ));
+    if retained {
+        outer.insert(RepaintBoundary::default());
+    }
+    let outer = outer.id();
+    let mut inner = world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(9),
+            top: px(8),
+            width: px(26),
+            height: px(23),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(35, 175, 80, 165)),
+        ChildOf(outer),
+    ));
+    if retained {
+        inner.insert(RepaintBoundary::default());
+    }
+    let inner = inner.id();
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(5),
+            top: px(4),
+            width: px(13),
+            height: px(12),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(45, 80, 225, 205)),
+        ChildOf(inner),
+    ));
+}
+
+#[test]
+fn nested_repaint_boundaries_match_direct_rasterization() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_nested_boundary_scene(world, camera, false),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_nested_boundary_scene(world, camera, true),
+            |_, _| {},
+        );
+        assert_pixels_within(&retained.pixels, &stock.pixels, 2);
+    });
+}
+
+fn spawn_clipped_boundary_scene(world: &mut World, camera: Entity, retained: bool) {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let mut boundary = world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(17),
+            top: px(15),
+            width: px(24),
+            height: px(20),
+            overflow: Overflow::clip(),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(220, 55, 30, 165)),
+        ChildOf(root),
+    ));
+    if retained {
+        boundary.insert(RepaintBoundary::default());
+    }
+    let boundary = boundary.id();
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(-7),
+            top: px(6),
+            width: px(39),
+            height: px(9),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(35, 190, 90, 210)),
+        ChildOf(boundary),
+    ));
+}
+
+#[test]
+fn repaint_boundary_clips_its_cached_surface_exactly() {
+    with_gpu_lock(|| {
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_clipped_boundary_scene(world, camera, false),
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_clipped_boundary_scene(world, camera, true),
+            |_, _| {},
+        );
+        assert_pixels_within(&retained.pixels, &stock.pixels, 1);
+    });
+}
+
+#[test]
+fn repaint_boundary_opacity_is_applied_after_flattening() {
+    with_gpu_lock(|| {
+        const RED: [f32; 4] = [0.8, 0.1, 0.05, 0.55];
+        const GREEN: [f32; 4] = [0.05, 0.7, 0.2, 0.6];
+        const OPACITY: f32 = 0.4;
+        let source_alpha = GREEN[3] + RED[3] * (1.0 - GREEN[3]);
+        let source_rgb = Vec3::new(GREEN[0], GREEN[1], GREEN[2]) * GREEN[3]
+            + Vec3::new(RED[0], RED[1], RED[2]) * RED[3] * (1.0 - GREEN[3]);
+        let flattened = source_rgb / source_alpha;
+        let expected = Color::linear_rgba(
+            flattened.x,
+            flattened.y,
+            flattened.z,
+            source_alpha * OPACITY,
+        );
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+                world.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(12),
+                        top: px(10),
+                        width: px(30),
+                        height: px(26),
+                        ..default()
+                    },
+                    BackgroundColor(expected),
+                    ChildOf(root),
+                ));
+            },
+            |_, _| {},
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+                let boundary = world
+                    .spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(12),
+                            top: px(10),
+                            width: px(30),
+                            height: px(26),
+                            ..default()
+                        },
+                        RepaintBoundary {
+                            opacity: OPACITY,
+                            ..default()
+                        },
+                        ChildOf(root),
+                    ))
+                    .id();
+                for color in [
+                    Color::linear_rgba(RED[0], RED[1], RED[2], RED[3]),
+                    Color::linear_rgba(GREEN[0], GREEN[1], GREEN[2], GREEN[3]),
+                ] {
+                    world.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(color),
+                        ChildOf(boundary),
+                    ));
+                }
+            },
+            |_, _| {},
+        );
+        assert_pixels_within(&retained.pixels, &stock.pixels, 1);
+    });
+}
+
+fn spawn_moving_boundary_scene(
+    world: &mut World,
+    camera: Entity,
+    retained: bool,
+    translation: Val2,
+) -> Entity {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let mut boundary = world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(9),
+            top: px(11),
+            width: px(28),
+            height: px(24),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(220, 45, 28, 180)),
+        ChildOf(root),
+    ));
+    if retained {
+        boundary.insert(RepaintBoundary::from_translation(translation));
+    } else {
+        boundary.insert(UiTransform::from_translation(translation));
+    }
+    let boundary = boundary.id();
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(5),
+            top: px(7),
+            width: px(12),
+            height: px(10),
+            ..default()
+        },
+        BackgroundColor(Color::srgba_u8(30, 190, 90, 200)),
+        ChildOf(boundary),
+    ));
+    boundary
+}
+
+#[test]
+fn boundary_translation_repairs_only_the_parent_surface() {
+    with_gpu_lock(|| {
+        let final_translation = Val2::px(18, 0);
+        let direct = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                spawn_moving_boundary_scene(world, camera, false, final_translation);
+            },
+            |_, _| {},
+        );
+        let moved = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_moving_boundary_scene(world, camera, true, Val2::ZERO),
+            move |world, boundary| {
+                world
+                    .entity_mut(boundary)
+                    .get_mut::<RepaintBoundary>()
+                    .unwrap()
+                    .transform = UiTransform::from_translation(final_translation);
+            },
+        );
+        assert_pixels_within(&moved.pixels, &direct.pixels, 1);
+
+        let before = moved.before_mutation.unwrap();
+        let after = moved.after_mutation.unwrap();
+        assert_eq!(after.surfaces_created, before.surfaces_created);
+        assert_eq!(after.surface_bytes, before.surface_bytes);
+        assert_eq!(after.repairs - before.repairs, 1);
+        assert_eq!(after.repair_pixels - before.repair_pixels, 46 * 24);
+        assert_eq!(after.items_replayed - before.items_replayed, 2);
+        assert_eq!(after.quads_replayed - before.quads_replayed, 2);
+
+        let paint_before = moved.paint_before_mutation.unwrap();
+        let paint_after = moved.paint_after_mutation.unwrap();
+        assert_eq!(paint_after.candidates - paint_before.candidates, 1);
+        assert_eq!(
+            paint_after.records_changed - paint_before.records_changed,
+            1
+        );
+    });
+}
+
+#[test]
+fn boundary_opacity_repairs_only_the_parent_surface() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+                world
+                    .spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(9),
+                            top: px(11),
+                            width: px(28),
+                            height: px(24),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba_u8(220, 45, 28, 180)),
+                        RepaintBoundary::default(),
+                        ChildOf(root),
+                    ))
+                    .id()
+            },
+            |world, boundary| {
+                world
+                    .entity_mut(boundary)
+                    .get_mut::<RepaintBoundary>()
+                    .unwrap()
+                    .opacity = 0.4;
+            },
+        );
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.surfaces_created, before.surfaces_created);
+        assert_eq!(after.surface_bytes, before.surface_bytes);
+        assert_eq!(after.repairs - before.repairs, 1);
+        assert_eq!(after.repair_pixels - before.repair_pixels, 28 * 24);
+        assert_eq!(after.items_replayed - before.items_replayed, 2);
+        assert_eq!(after.quads_replayed - before.quads_replayed, 2);
+    });
+}
+
+#[test]
+fn boundary_content_change_repairs_only_its_mapped_pixels() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let content = spawn_boundary_content_scene(world, camera, 0);
+                let boundary = world
+                    .query_filtered::<Entity, With<RepaintBoundary>>()
+                    .single(world)
+                    .unwrap();
+                world
+                    .get_mut::<RepaintBoundary>(boundary)
+                    .unwrap()
+                    .transform = UiTransform::from_scale(Vec2::splat(2.0));
+                content
+            },
+            |world, content| {
+                world.get_mut::<BackgroundColor>(content).unwrap().0 = batched_flicker_color(1);
+            },
+        );
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.repairs - before.repairs, 2);
+        assert_eq!(
+            after.repair_pixels - before.repair_pixels,
+            21 * 16 + 42 * 32
+        );
+        assert_eq!(after.items_replayed - before.items_replayed, 3);
+        assert_eq!(after.quads_replayed - before.quads_replayed, 3);
+    });
+}
+
+#[test]
+fn invisible_boundary_content_changes_do_no_raster_or_parent_work() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                let content = spawn_boundary_content_scene(world, camera, 0);
+                let boundary = world
+                    .query_filtered::<Entity, With<RepaintBoundary>>()
+                    .single(world)
+                    .unwrap();
+                world.get_mut::<RepaintBoundary>(boundary).unwrap().opacity = 0.0;
+                content
+            },
+            |world, content| {
+                world.get_mut::<BackgroundColor>(content).unwrap().0 = batched_flicker_color(1);
+            },
+        );
+        assert_no_layer_repair(
+            output.before_mutation.unwrap(),
+            output.after_mutation.unwrap(),
+        );
+        let before = output.paint_before_mutation.unwrap();
+        let after = output.paint_after_mutation.unwrap();
+        assert_eq!(after.candidates - before.candidates, 1);
+        assert_eq!(after.records_changed - before.records_changed, 1);
+    });
+}
+
+#[test]
+fn revealing_an_invisible_boundary_rebuilds_its_source_before_composition() {
+    with_gpu_lock(|| {
+        let direct = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                spawn_boundary_content_scene(world, camera, 0);
+            },
+            |_, _| {},
+        );
+        let revealed = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                spawn_boundary_content_scene(world, camera, 0);
+                let boundary = world
+                    .query_filtered::<Entity, With<RepaintBoundary>>()
+                    .single(world)
+                    .unwrap();
+                world.get_mut::<RepaintBoundary>(boundary).unwrap().opacity = 0.0;
+                boundary
+            },
+            |world, boundary| {
+                world.get_mut::<RepaintBoundary>(boundary).unwrap().opacity = 1.0;
+            },
+        );
+        assert_pixels_eq(&revealed.pixels, &direct.pixels);
+        let before = revealed.before_mutation.unwrap();
+        let after = revealed.after_mutation.unwrap();
+        assert_eq!(after.surfaces_created - before.surfaces_created, 1);
+        assert_eq!(after.surface_bytes - before.surface_bytes, 36 * 30 * 9);
+        assert_eq!(after.repairs - before.repairs, 2);
+        assert_eq!(after.repair_pixels - before.repair_pixels, 2 * 36 * 30);
+        assert_eq!(after.items_replayed - before.items_replayed, 3);
+    });
+}
+
+#[test]
+fn hidden_ancestor_suppresses_nested_boundary_raster_work() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_nested_visibility_scene(world, camera, 0.0).1,
+            |world, content| {
+                world.get_mut::<BackgroundColor>(content).unwrap().0 = batched_flicker_color(1);
+            },
+        );
+        assert_no_layer_repair(
+            output.before_mutation.unwrap(),
+            output.after_mutation.unwrap(),
+        );
+    });
+}
+
+#[test]
+fn revealing_a_hidden_ancestor_rebuilds_nested_sources_deepest_first() {
+    with_gpu_lock(|| {
+        let direct = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_nested_visibility_scene(world, camera, 1.0),
+            |_, _| {},
+        );
+        let revealed = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_nested_visibility_scene(world, camera, 0.0).0,
+            |world, outer| {
+                world.get_mut::<RepaintBoundary>(outer).unwrap().opacity = 1.0;
+            },
+        );
+        assert_pixels_eq(&revealed.pixels, &direct.pixels);
+        let before = revealed.before_mutation.unwrap();
+        let after = revealed.after_mutation.unwrap();
+        assert_eq!(after.surfaces_created - before.surfaces_created, 2);
+        assert_eq!(
+            after.surface_bytes - before.surface_bytes,
+            (40 * 36 + 24 * 20) * 9
+        );
+        assert_eq!(after.repairs - before.repairs, 3);
+        assert_eq!(
+            after.repair_pixels - before.repair_pixels,
+            40 * 36 * 2 + 24 * 20
+        );
+        assert_eq!(after.items_replayed - before.items_replayed, 4);
+    });
+}
+
+#[test]
+fn removing_a_boundary_releases_its_surface_and_preserves_pixels() {
+    with_gpu_lock(|| {
+        let direct = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_boundary_scene(world, camera, false),
+            |_, _| {},
+        );
+        let removed = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| {
+                spawn_boundary_scene(world, camera, true);
+                world
+                    .query_filtered::<Entity, With<RepaintBoundary>>()
+                    .single(world)
+                    .unwrap()
+            },
+            |world, boundary| {
+                world.entity_mut(boundary).remove::<RepaintBoundary>();
+            },
+        );
+        assert_pixels_eq(&removed.pixels, &direct.pixels);
+        let before = removed.before_mutation.unwrap();
+        let after = removed.after_mutation.unwrap();
+        assert_eq!(after.surfaces_created, before.surfaces_created);
+        assert_eq!(before.surface_bytes - after.surface_bytes, 28 * 24 * 9);
+    });
 }
 
 fn spawn_leaf_background(world: &mut World, camera: Entity, node: Node) -> Entity {
@@ -3813,6 +4588,64 @@ fn batched_full_repairs_never_present_mixed_generations() {
 }
 
 #[test]
+fn boundary_motion_never_presents_a_stale_or_partially_repaired_frame() {
+    with_gpu_lock(|| {
+        let reference = |translation| {
+            render_scene(
+                UiRenderer::Retained,
+                PaintSchedule::EveryFrame,
+                move |world, camera| {
+                    spawn_moving_boundary_scene(world, camera, true, Val2::px(translation, 0));
+                },
+                |_, _| {},
+            )
+            .pixels
+        };
+        let references = [reference(0.0), reference(18.0), reference(30.0)];
+        let frames = capture_retained_stream(
+            |app| {
+                app.add_systems(Update, animate_boundary_flicker_probe);
+            },
+            |world, camera| {
+                let boundary = spawn_moving_boundary_scene(world, camera, true, Val2::ZERO);
+                world.entity_mut(boundary).insert(BoundaryFlickerProbe);
+            },
+        );
+        assert_complete_cycle(&frames, &references);
+    });
+}
+
+#[test]
+fn boundary_content_animation_never_presents_mixed_surface_generations() {
+    with_gpu_lock(|| {
+        let reference = |position| {
+            render_scene(
+                UiRenderer::Retained,
+                PaintSchedule::EveryFrame,
+                move |world, camera| {
+                    spawn_boundary_content_scene(world, camera, position);
+                },
+                |_, _| {},
+            )
+            .pixels
+        };
+        let references = [reference(0), reference(1), reference(2)];
+        let frames = capture_retained_stream(
+            |app| {
+                app.add_systems(Update, animate_boundary_content_flicker_probe);
+            },
+            |world, camera| {
+                let content = spawn_boundary_content_scene(world, camera, 0);
+                world
+                    .entity_mut(content)
+                    .insert(BoundaryContentFlickerProbe);
+            },
+        );
+        assert_complete_cycle(&frames, &references);
+    });
+}
+
+#[test]
 fn ui_transform_motion_nominates_only_the_moved_leaf() {
     with_gpu_lock(|| {
         let output = render_scene(
@@ -4675,12 +5508,78 @@ fn unretained_custom_material_uses_the_safe_full_repaint_fallback() {
         let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
         assert_eq!(
             &output.pixels[sample..sample + BYTES_PER_PIXEL],
-            &[220, 45, 28, 255]
+            &[220, 45, 28, 255],
+            "layer work: before={:?}, after={:?}",
+            output.before_mutation,
+            output.after_mutation,
         );
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
         assert!(after.repairs > before.repairs);
         assert!(after.repair_pixels >= before.repair_pixels + u64::from(WIDTH * HEIGHT));
+    });
+}
+
+fn spawn_unretained_material_boundary_scene(world: &mut World, camera: Entity, retained: bool) {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let mut boundary = world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(if retained { 8 } else { 15 }),
+            top: px(if retained { 9 } else { 12 }),
+            width: px(20),
+            height: px(20),
+            ..default()
+        },
+        ChildOf(root),
+    ));
+    if retained {
+        boundary.insert(RepaintBoundary::from_translation(Val2::px(7, 3)));
+    }
+    let boundary = boundary.id();
+    let image = add_solid_image(world, [255; 4]);
+    let material = world
+        .resource_mut::<Assets<TestUiMaterial>>()
+        .add(TestUiMaterial {
+            color: Color::srgb_u8(220, 45, 28).to_linear().to_vec4(),
+            image,
+            volatile: false,
+            target_coverage: false,
+        });
+    world.spawn((
+        Node {
+            width: percent(100),
+            height: percent(100),
+            ..default()
+        },
+        MaterialNode(material),
+        ChildOf(boundary),
+    ));
+}
+
+#[test]
+fn unretained_custom_material_routes_through_its_repaint_boundary() {
+    with_gpu_lock(|| {
+        let stock = render_scene_configured(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            configure_unretained_test_ui_material,
+            |world, camera| spawn_unretained_material_boundary_scene(world, camera, false),
+            |_, _| {},
+        );
+        let retained = render_scene_configured(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            configure_unretained_test_ui_material,
+            |world, camera| spawn_unretained_material_boundary_scene(world, camera, true),
+            |_, _| {},
+        );
+
+        assert_pixels_within(&retained.pixels, &stock.pixels, 1);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert!(after.repairs >= before.repairs + 2);
+        assert!(after.repair_pixels >= before.repair_pixels + 800);
     });
 }
 

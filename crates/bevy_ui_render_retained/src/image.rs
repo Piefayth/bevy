@@ -1,11 +1,15 @@
 //! Change-driven retained extraction for ordinary UI images.
 
-use crate::sampled_image::{ImageReader, ImageSample, RetainedSampledImages};
-use crate::scene::{
-    coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
-    RetainedNodeItem, RetainedTextureSliceItem, RetainedUiScene,
+use crate::{
+    boundary::retained_clip,
+    sampled_image::{ImageReader, ImageSample, RetainedSampledImages},
+    scene::{
+        coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
+        RetainedNodeItem, RetainedTextureSliceItem, RetainedUiScene,
+    },
 };
 use bevy::{
+    app::Inherited,
     asset::{AssetEvent, AssetId, Assets},
     camera::visibility::InheritedVisibility,
     color::Alpha,
@@ -22,8 +26,8 @@ use bevy::{
     sprite::{BorderRect, SpriteImageMode},
     ui::{
         widget::{ImageNode, ImageNodeSize, NodeImageMode},
-        CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
-        ComputedUiTargetCamera, Node, UiGlobalTransform, VisualBox,
+        CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiPaintTarget,
+        ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, UiGlobalTransform, VisualBox,
     },
     ui_render::{stack_z_offsets, NodeType, UiCameraMap},
 };
@@ -118,6 +122,7 @@ type ImageQueryItem<'a> = (
     &'a UiGlobalTransform,
     &'a InheritedVisibility,
     Option<&'a CalculatedClip>,
+    Option<&'a Inherited<ComputedUiPaintTarget>>,
     &'a ComputedUiTargetCamera,
     &'a ImageNode,
     &'a ImageNodeSize,
@@ -216,29 +221,37 @@ pub(crate) fn extract_retained_images(
         if structural_changed.contains(entity) || extra_candidates.contains(&entity) {
             continue;
         }
-        let Ok((_, _, _, _, _, _, _, image, _)) = all.get(entity) else {
+        let Ok((_, _, _, _, _, _, _, _, image, _)) = all.get(entity) else {
             dependencies.remove_entity(entity);
             sampled_images.remove_reader(ImageReader::Node(entity));
             surfaces.remove(&mut commands, image_id(entity));
             continue;
         };
-        if !image.color.is_fully_transparent()
-            && let Some(camera) = dependencies.can_retint(entity, image)
+        if image.color.is_fully_transparent()
+            || dependencies.can_retint(entity, image).is_none()
+            || !surfaces.retint_owned_node(image_id(entity), image.color.into())
         {
-            surfaces.retint_node(camera, image_id(entity), image.color.into());
-        } else {
             extra_candidates.insert(entity);
         }
     }
 
     let mut camera_mapper = camera_map.get_mapper();
-    for (entity, node, stack, transform, visibility, clip, target_camera, image, image_size) in
-        structural_changed.iter().chain(
-            extra_candidates
-                .into_iter()
-                .filter_map(|entity| all.get(entity).ok()),
-        )
-    {
+    for (
+        entity,
+        node,
+        stack,
+        transform,
+        visibility,
+        clip,
+        owner,
+        target_camera,
+        image,
+        image_size,
+    ) in structural_changed.iter().chain(
+        extra_candidates
+            .into_iter()
+            .filter_map(|entity| all.get(entity).ok()),
+    ) {
         let image_asset = image.image.id();
         let atlas_asset = image.texture_atlas.as_ref().map(|atlas| atlas.layout.id());
         let Some(camera) = camera_mapper.map(target_camera) else {
@@ -344,8 +357,8 @@ pub(crate) fn extract_retained_images(
             || ImageSample::all(image_asset),
             |rect| ImageSample::rect(image_asset, rect),
         );
+        let clip = retained_clip(entity, node, transform, clip, owner);
         let transform = transform.affine() * Affine2::from_translation(visual_box.center());
-        let clip = clip.map(|clip| clip.clip);
         let painted = visibility.get()
             && !image.color.is_fully_transparent()
             && image_asset != TRANSPARENT_IMAGE_HANDLE.id()

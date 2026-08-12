@@ -30,6 +30,24 @@ use tracing::warn;
 #[reflect(Component, Default, Debug, Clone)]
 pub struct LayoutContainment;
 
+/// Makes this node a semantic paint boundary.
+///
+/// The node's border box clips all descendant paint, regardless of [`Node::overflow`] and
+/// descendant [`OverrideClip`] components. Renderers may therefore cache the subtree in an
+/// independent surface without losing pixels outside that surface. The boundary's own paint is
+/// still clipped by its ancestors when composited into its parent.
+#[derive(Component, Clone, Copy, Debug, Default, Reflect)]
+#[reflect(Component, Default, Debug, Clone)]
+pub struct PaintContainment;
+
+/// The root entity of the independent surface that paints this UI subtree.
+///
+/// Render backends install and propagate this component when they split a UI hierarchy across
+/// multiple targets. Applications should not write it directly.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ComputedUiPaintTarget(pub Entity);
+
 /// Provides the computed size and layout properties of the node.
 ///
 /// Fields in this struct are public but should not be modified under most circumstances.
@@ -2423,8 +2441,13 @@ impl Default for Outline {
 #[derive(Component, Default, Copy, Clone, Debug, Reflect)]
 #[reflect(Component, Default, Debug, Clone)]
 pub struct CalculatedClip {
-    /// The rect of the clip
+    /// The final clip inherited by this node in the complete UI hierarchy.
     pub clip: Rect,
+    /// The clip inherited within the nearest [`PaintContainment`] surface.
+    ///
+    /// On the boundary node itself this remains the parent-surface clip. Descendants restart at
+    /// the boundary's border box, allowing the subtree to be rasterized independently.
+    pub paint_clip: Rect,
 }
 
 /// UI node entities with this component will ignore any clipping rect they inherit,

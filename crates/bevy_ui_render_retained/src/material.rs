@@ -1,6 +1,7 @@
 //! Exact retained contracts and extraction for custom UI materials.
 
 use crate::{
+    boundary::retained_clip,
     sampled_image::{ImageReader, ImageSample, RetainedSampledImages, SampledImageState},
     scene::{
         coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
@@ -10,7 +11,7 @@ use crate::{
 };
 use bevy::ui_render::ui_material::{MaterialNode, UiMaterial};
 use bevy::{
-    app::{App, Plugin},
+    app::{App, Inherited, Plugin},
     asset::{AssetEvent, AssetId, Assets},
     camera::visibility::InheritedVisibility,
     ecs::{
@@ -28,8 +29,8 @@ use bevy::{
         ExtractSchedule, Render, RenderApp, RenderSystems,
     },
     ui::{
-        CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
-        ComputedUiTargetCamera, Display, Node, UiGlobalTransform,
+        CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiPaintTarget,
+        ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Display, Node, UiGlobalTransform,
     },
     ui_render::{
         queue_ui_material_nodes, ExtractedUiMaterialNode, ExtractedUiMaterialNodes,
@@ -366,6 +367,7 @@ type MaterialQueryItem<'a, M> = (
     &'a MaterialNode<M>,
     &'a InheritedVisibility,
     Option<&'a CalculatedClip>,
+    Option<&'a Inherited<ComputedUiPaintTarget>>,
     &'a ComputedUiTargetCamera,
     &'a ComputedUiRenderTargetInfo,
 );
@@ -492,6 +494,7 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
         handle,
         visibility,
         clip,
+        owner,
         target_camera,
         target,
     ) in changed.iter().chain(
@@ -520,8 +523,8 @@ fn extract_retained_materials<M: RetainedUiMaterial>(
             sampled_images.remove_reader(reader);
             continue;
         };
+        let clip = retained_clip(entity, node, transform, clip, owner);
         let transform = transform.affine();
-        let clip = clip.map(|clip| clip.clip);
         let visible = visibility.get()
             && source_node.display != Display::None
             && !node.is_empty()

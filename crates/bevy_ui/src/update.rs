@@ -4,7 +4,7 @@ use crate::{
     experimental::{UiChildren, UiRootNodes},
     ui_transform::UiGlobalTransform,
     CalculatedClip, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, DefaultUiCamera, Display,
-    Node, OverrideClip, UiScale, UiTargetCamera,
+    Node, OverrideClip, PaintContainment, UiScale, UiTargetCamera,
 };
 
 use super::ComputedNode;
@@ -54,6 +54,7 @@ pub struct ClippingChanges<'w, 's> {
                 Changed<ComputedNode>,
                 Changed<UiGlobalTransform>,
                 Changed<OverrideClip>,
+                Changed<PaintContainment>,
             )>,
         ),
     >,
@@ -63,6 +64,7 @@ pub struct ClippingChanges<'w, 's> {
     removed_computed: RemovedComponents<'w, 's, ComputedNode>,
     removed_transform: RemovedComponents<'w, 's, UiGlobalTransform>,
     removed_override: RemovedComponents<'w, 's, OverrideClip>,
+    removed_containment: RemovedComponents<'w, 's, PaintContainment>,
     removed_children: RemovedComponents<'w, 's, Children>,
     removed_parent: RemovedComponents<'w, 's, ChildOf>,
 }
@@ -75,7 +77,9 @@ pub fn update_clipping_system(
         &ComputedNode,
         &UiGlobalTransform,
         Option<&mut CalculatedClip>,
+        Option<&mut DerivedClipState>,
         Has<OverrideClip>,
+        Has<PaintContainment>,
     )>,
     ui_children: UiChildren,
     mut changes: ClippingChanges,
@@ -90,6 +94,7 @@ pub fn update_clipping_system(
     dirty_subtrees.extend(changes.removed_computed.read());
     dirty_subtrees.extend(changes.removed_transform.read());
     dirty_subtrees.extend(changes.removed_override.read());
+    dirty_subtrees.extend(changes.removed_containment.read());
     dirty_subtrees.extend(changes.removed_children.read());
     dirty_subtrees.extend(changes.removed_parent.read());
     for (entity, node) in changes.nodes.iter() {
@@ -138,31 +143,26 @@ fn inherited_clip(
         &ComputedNode,
         &UiGlobalTransform,
         Option<&mut CalculatedClip>,
+        Option<&mut DerivedClipState>,
         Has<OverrideClip>,
+        Has<PaintContainment>,
     )>,
-) -> Option<Rect> {
-    let parent = ui_children.get_parent(entity)?;
-    let Ok((node, computed_node, transform, calculated_clip, has_override_clip)) =
+) -> ClipState {
+    let Some(parent) = ui_children.get_parent(entity) else {
+        return ClipState::default();
+    };
+    let Ok((node, computed_node, transform, _, state, _, has_containment)) =
         node_query.get_mut(parent)
     else {
-        return None;
+        return ClipState::default();
     };
-    let mut inherited = calculated_clip.map(|clip| clip.clip);
-    if has_override_clip {
-        inherited = None;
-    }
-    if node.display == Display::None {
-        inherited = Some(Rect::default());
-    }
-    if node.overflow.is_visible() {
-        inherited
-    } else {
-        let mut clip_rect =
-            computed_node.resolve_clip_rect(node.overflow, node.overflow_clip_margin);
-        clip_rect.min += transform.translation;
-        clip_rect.max += transform.translation;
-        Some(inherited.map_or(clip_rect, |clip| clip.intersect(clip_rect)))
-    }
+    children_clip(
+        state.as_deref().copied().unwrap_or_default().0,
+        node,
+        computed_node,
+        transform,
+        has_containment,
+    )
 }
 
 fn update_clipping(
@@ -173,67 +173,157 @@ fn update_clipping(
         &ComputedNode,
         &UiGlobalTransform,
         Option<&mut CalculatedClip>,
+        Option<&mut DerivedClipState>,
         Has<OverrideClip>,
+        Has<PaintContainment>,
     )>,
     entity: Entity,
-    mut maybe_inherited_clip: Option<Rect>,
+    mut state: ClipState,
 ) {
-    let Ok((node, computed_node, transform, maybe_calculated_clip, has_override_clip)) =
-        node_query.get_mut(entity)
+    let Ok((
+        node,
+        computed_node,
+        transform,
+        maybe_calculated_clip,
+        maybe_derived_state,
+        has_override_clip,
+        has_containment,
+    )) = node_query.get_mut(entity)
     else {
         return;
     };
 
-    // If the UI node entity has an `OverrideClip` component, discard any inherited clip rect
     if has_override_clip {
-        maybe_inherited_clip = None;
+        state.clear_overridable();
     }
-
-    // If `display` is None, clip the entire node and all its descendants by replacing the inherited clip with a default rect (which is empty)
     if node.display == Display::None {
-        maybe_inherited_clip = Some(Rect::default());
+        state.hide();
     }
 
-    // Update this node's CalculatedClip component
-    if let Some(mut calculated_clip) = maybe_calculated_clip {
-        if let Some(inherited_clip) = maybe_inherited_clip {
-            // Replace the previous calculated clip with the inherited clipping rect
-            if calculated_clip.clip != inherited_clip {
-                *calculated_clip = CalculatedClip {
-                    clip: inherited_clip,
-                };
+    match (maybe_calculated_clip, state.effective()) {
+        (Some(mut calculated), Some((clip, paint_clip))) => {
+            if calculated.clip != clip || calculated.paint_clip != paint_clip {
+                *calculated = CalculatedClip { clip, paint_clip };
             }
-        } else {
-            // No inherited clipping rect, remove the component
+        }
+        (Some(_), None) => {
             commands.entity(entity).remove::<CalculatedClip>();
         }
-    } else if let Some(inherited_clip) = maybe_inherited_clip {
-        // No previous calculated clip, add a new CalculatedClip component with the inherited clipping rect
-        commands.entity(entity).try_insert(CalculatedClip {
-            clip: inherited_clip,
-        });
+        (None, Some((clip, paint_clip))) => {
+            commands
+                .entity(entity)
+                .try_insert(CalculatedClip { clip, paint_clip });
+        }
+        (None, None) => {}
     }
 
-    // Calculate new clip rectangle for children nodes
-    let children_clip = if node.overflow.is_visible() {
-        // The current node doesn't clip, propagate the optional inherited clipping rect to any children
-        maybe_inherited_clip
-    } else {
-        // Find the current node's clipping rect and intersect it with the inherited clipping rect, if one exists
-        // Content isn't clipped at the edges of the node but at the edges of the region specified by [`Node::overflow_clip_margin`].
-        //
-        // `clip_inset` should always fit inside `node_rect`.
-        // Even if `clip_inset` were to overflow, we won't return a degenerate result as `Rect::intersect` will clamp the intersection, leaving it empty.
-        let mut clip_rect =
-            computed_node.resolve_clip_rect(node.overflow, node.overflow_clip_margin);
-        clip_rect.min += transform.translation;
-        clip_rect.max += transform.translation;
-        Some(maybe_inherited_clip.map_or(clip_rect, |c| c.intersect(clip_rect)))
-    };
+    match (maybe_derived_state, state == ClipState::default()) {
+        (Some(_), true) => {
+            commands.entity(entity).remove::<DerivedClipState>();
+        }
+        (Some(mut previous), false) if previous.0 != state => previous.0 = state,
+        (Some(_), false) | (None, true) => {}
+        (None, false) => {
+            commands.entity(entity).try_insert(DerivedClipState(state));
+        }
+    }
+
+    let children_clip = children_clip(state, node, computed_node, transform, has_containment);
 
     for child in ui_children.iter_ui_children(entity) {
         update_clipping(commands, ui_children, node_query, child, children_clip);
     }
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+struct ClipAxis {
+    inherited: Option<Rect>,
+    containment: Option<Rect>,
+}
+
+impl ClipAxis {
+    fn effective(self) -> Option<Rect> {
+        match (self.inherited, self.containment) {
+            (Some(inherited), Some(containment)) => Some(inherited.intersect(containment)),
+            (Some(clip), None) | (None, Some(clip)) => Some(clip),
+            (None, None) => None,
+        }
+    }
+
+    fn contain(&mut self, clip: Rect) {
+        self.containment = Some(
+            self.containment
+                .map_or(clip, |current| current.intersect(clip)),
+        );
+    }
+
+    fn clip(&mut self, clip: Rect) {
+        self.inherited = Some(
+            self.inherited
+                .map_or(clip, |current| current.intersect(clip)),
+        );
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+struct ClipState {
+    global: ClipAxis,
+    paint: ClipAxis,
+}
+
+impl ClipState {
+    fn effective(self) -> Option<(Rect, Rect)> {
+        match (self.global.effective(), self.paint.effective()) {
+            (Some(global), Some(paint)) => Some((global, paint)),
+            (None, None) => None,
+            _ => unreachable!("global and paint clip presence must match"),
+        }
+    }
+
+    fn clear_overridable(&mut self) {
+        self.global.inherited = None;
+        self.paint.inherited = None;
+    }
+
+    fn hide(&mut self) {
+        self.global.contain(Rect::default());
+        self.paint.contain(Rect::default());
+    }
+}
+
+#[derive(bevy_ecs::component::Component, Clone, Copy, Default, PartialEq)]
+#[doc(hidden)]
+pub struct DerivedClipState(ClipState);
+
+fn children_clip(
+    mut state: ClipState,
+    node: &Node,
+    computed_node: &ComputedNode,
+    transform: &UiGlobalTransform,
+    has_containment: bool,
+) -> ClipState {
+    if node.display == Display::None {
+        state.hide();
+        return state;
+    }
+
+    if has_containment {
+        let boundary = Rect::from_center_size(transform.translation, computed_node.size());
+        state.global.contain(boundary);
+        state.paint = ClipAxis {
+            inherited: None,
+            containment: Some(boundary),
+        };
+    }
+
+    if !node.overflow.is_visible() {
+        let mut clip = computed_node.resolve_clip_rect(node.overflow, node.overflow_clip_margin);
+        clip.min += transform.translation;
+        clip.max += transform.translation;
+        state.global.clip(clip);
+        state.paint.clip(clip);
+    }
+    state
 }
 
 pub fn propagate_ui_target_cameras(

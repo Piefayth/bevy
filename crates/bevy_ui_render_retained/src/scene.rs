@@ -2,6 +2,7 @@
 
 use crate::{
     border::{edge_rect, EDGE_FLAGS},
+    boundary::{retained_clip, RepaintBoundary},
     core::{
         prepare_glyph_instance, prepare_persistent_instance, GpuUiInstance, RetainedCoreRuns,
         RetainedCoreSource,
@@ -13,6 +14,7 @@ use crate::{
     FloatBits, PaintCoverage, PaintRecord, PhysicalRect, RepairPlan, RetainedPaint, WorkCounters,
 };
 use bevy::{
+    app::Inherited,
     asset::{AssetId, UntypedAssetId},
     color::ColorToComponents,
     ecs::{
@@ -24,11 +26,14 @@ use bevy::{
     image::Image,
     math::{Affine2, Rect, Vec2},
     platform::collections::{hash_map::Entry, HashMap, HashSet},
-    render::{sync_world::MainEntity, Extract},
+    render::{
+        sync_world::{MainEntity, RenderEntity},
+        Extract,
+    },
     sprite::{BorderRect, SliceScaleMode, SpriteImageMode},
     ui::{
-        widget::TextScroll, CalculatedClip, ComputedNode, Node, ResolvedBorderRadius,
-        UiGlobalTransform,
+        widget::TextScroll, CalculatedClip, ComputedNode, ComputedUiPaintTarget,
+        ComputedUiTargetCamera, Node, ResolvedBorderRadius, UiGlobalTransform,
     },
     ui_render::{
         box_shadow::ResolvedBoxShadow,
@@ -46,6 +51,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum PaintFamily {
+    Boundary,
     BoxShadow,
     Background,
     Border,
@@ -94,12 +100,43 @@ pub(crate) enum ResourceFingerprint {
 
 #[derive(Clone)]
 pub(crate) enum RetainedDrawItem {
+    Boundary(RetainedBoundaryItem),
     BoxShadow(RetainedBoxShadowItem),
     Gradient(RetainedGradientItem),
     Material(RetainedMaterialItem),
     Node(RetainedNodeItem),
     Glyphs(Box<[RetainedGlyph]>),
     TextureSlice(RetainedTextureSliceItem),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RetainedBoundaryItem {
+    pub(crate) surface: Entity,
+    size: [FloatBits; 2],
+    opacity: FloatBits,
+}
+
+impl RetainedBoundaryItem {
+    pub(crate) fn new(surface: Entity, size: Vec2, opacity: f32) -> Self {
+        let opacity = if opacity.is_nan() {
+            1.0
+        } else {
+            opacity.clamp(0.0, 1.0)
+        };
+        Self {
+            surface,
+            size: size.to_array().map(FloatBits::new),
+            opacity: FloatBits::new(opacity),
+        }
+    }
+
+    pub(crate) fn size(&self) -> Vec2 {
+        Vec2::new(self.size[0].get(), self.size[1].get())
+    }
+
+    pub(crate) fn opacity(&self) -> f32 {
+        self.opacity.get()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -620,6 +657,11 @@ fn prepare_core(draw: &RetainedDraw) -> Option<PreparedCore> {
 
 fn draw_coverage(draw: &RetainedDraw, previous: &PaintCoverage) -> PaintCoverage {
     match &draw.item {
+        RetainedDrawItem::Boundary(boundary) => {
+            coverage(boundary.size(), draw.transform, draw.clip)
+                .into_iter()
+                .collect()
+        }
         RetainedDrawItem::BoxShadow(shadow) => coverage(shadow.bounds(), draw.transform, draw.clip)
             .into_iter()
             .collect(),
@@ -755,6 +797,7 @@ fn retained_node_merge_eq(left: &RetainedNodeItem, right: &RetainedNodeItem) -> 
 
 fn retained_item_eq(left: &RetainedDrawItem, right: &RetainedDrawItem) -> bool {
     match (left, right) {
+        (RetainedDrawItem::Boundary(left), RetainedDrawItem::Boundary(right)) => left == right,
         (RetainedDrawItem::BoxShadow(left), RetainedDrawItem::BoxShadow(right)) => left == right,
         (RetainedDrawItem::Gradient(left), RetainedDrawItem::Gradient(right)) => left == right,
         (RetainedDrawItem::Material(left), RetainedDrawItem::Material(right)) => left == right,
@@ -832,12 +875,16 @@ pub(crate) struct RetainedUiSurfaces {
     paint: HashMap<Entity, RetainedPaint<PaintId, RetainedRecord>>,
     owners: HashMap<PaintId, PaintOwner>,
     by_main_entity: HashMap<MainEntity, SmallVec<[PaintId; 8]>>,
+    surface_by_main_entity: HashMap<MainEntity, Entity>,
+    dirty_surfaces: HashSet<Entity>,
+    touched_surfaces: HashSet<Entity>,
+    propagated_epochs: HashMap<Entity, u64>,
     order: HashMap<Entity, PaintOrder>,
 }
 
 struct PaintOwner {
     camera: Entity,
-    main_entity: MainEntity,
+    main_entity: Option<MainEntity>,
     render_entity: Entity,
     order: (FloatBits, u32),
     group: Option<usize>,
@@ -896,6 +943,59 @@ impl PaintOrder {
 }
 
 impl RetainedUiSurfaces {
+    fn set_entity_surface(&mut self, entity: MainEntity, surface: Option<Entity>, camera: Entity) {
+        let target = surface.unwrap_or(camera);
+        match surface {
+            Some(surface) => {
+                self.surface_by_main_entity.insert(entity, surface);
+            }
+            None => {
+                self.surface_by_main_entity.remove(&entity);
+            }
+        }
+        let Some(ids) = self.by_main_entity.get(&entity).cloned() else {
+            return;
+        };
+        for id in ids {
+            let old_camera = self.owners[&id].camera;
+            if old_camera == target {
+                continue;
+            }
+            let mut record = self
+                .paint
+                .get_mut(&old_camera)
+                .expect("owned retained paint camera must exist")
+                .take(&id)
+                .expect("owned retained paint must exist");
+            record.value.draw.camera = target;
+            self.paint.entry(target).or_default().upsert(id, record);
+            self.dirty_surfaces.extend([old_camera, target]);
+            self.touched_surfaces.extend([old_camera, target]);
+            let owner = self
+                .owners
+                .get_mut(&id)
+                .expect("main-entity index must contain an owner");
+            owner.camera = target;
+            owner.group = None;
+            for camera in [old_camera, target] {
+                let order = self.order.entry(camera).or_default();
+                order.order_dirty = true;
+                order.spatial = None;
+            }
+        }
+    }
+
+    fn remove_main_entity(&mut self, commands: &mut Commands, entity: MainEntity) {
+        let Some(ids) = self.by_main_entity.get(&entity).cloned() else {
+            self.surface_by_main_entity.remove(&entity);
+            return;
+        };
+        for id in ids {
+            self.remove(commands, id);
+        }
+        self.surface_by_main_entity.remove(&entity);
+    }
+
     pub(crate) fn core_draw(&self, id: PaintId) -> Option<&RetainedDraw> {
         let camera = self.owners.get(&id)?.camera;
         let record = self.paint.get(&camera)?.get(&id)?;
@@ -904,45 +1004,32 @@ impl RetainedUiSurfaces {
 
     pub(crate) fn retint_text(
         &mut self,
-        camera: Entity,
         paints: impl IntoIterator<Item = PaintId>,
         section: Entity,
         color: bevy::color::LinearRgba,
     ) {
-        let Some(paint) = self.paint.get_mut(&camera) else {
-            return;
-        };
         for id in paints {
             if id.entity != section || id.family != PaintFamily::Text {
                 continue;
             }
+            let Some(owner) = self.owners.get(&id) else {
+                continue;
+            };
+            let camera = owner.camera;
+            let group = owner.group;
+            let paint = self
+                .paint
+                .get_mut(&camera)
+                .expect("owned text camera must exist");
+            self.touched_surfaces.insert(camera);
             let outcome = paint.update_in_place(&id, |record| record.retint_glyphs(color));
             if outcome.is_some_and(|outcome| outcome != crate::UpdateOutcome::Unchanged) {
                 let epoch = paint.latest_damage_epoch();
-                let group = self.owners.get(&id).and_then(|owner| owner.group);
                 self.order
                     .entry(camera)
                     .or_default()
                     .note_direct(group, epoch);
-            }
-        }
-    }
-
-    pub(crate) fn retint_node(
-        &mut self,
-        camera: Entity,
-        id: PaintId,
-        color: bevy::color::LinearRgba,
-    ) {
-        if let Some(paint) = self.paint.get_mut(&camera) {
-            let outcome = paint.update_in_place(&id, |record| record.retint_node(color));
-            if outcome.is_some_and(|outcome| outcome != crate::UpdateOutcome::Unchanged) {
-                let epoch = paint.latest_damage_epoch();
-                let group = self.owners.get(&id).and_then(|owner| owner.group);
-                self.order
-                    .entry(camera)
-                    .or_default()
-                    .note_direct(group, epoch);
+                self.dirty_surfaces.insert(camera);
             }
         }
     }
@@ -959,6 +1046,7 @@ impl RetainedUiSurfaces {
             .paint
             .get_mut(&owner.camera)
             .and_then(|paint| paint.update_in_place(&id, |record| record.retint_node(color)));
+        self.touched_surfaces.insert(owner.camera);
         if outcome.is_some_and(|outcome| outcome != crate::UpdateOutcome::Unchanged) {
             let camera = owner.camera;
             let group = owner.group;
@@ -967,6 +1055,7 @@ impl RetainedUiSurfaces {
                 .entry(camera)
                 .or_default()
                 .note_direct(group, epoch);
+            self.dirty_surfaces.insert(camera);
         }
         outcome.is_some()
     }
@@ -980,7 +1069,9 @@ impl RetainedUiSurfaces {
             .paint
             .get_mut(&camera)
             .expect("owned paint camera must exist");
+        self.touched_surfaces.insert(camera);
         let order = self.order.entry(camera).or_default();
+        let mut changed = false;
         for id in ids {
             let owner = self
                 .owners
@@ -1000,6 +1091,7 @@ impl RetainedUiSurfaces {
                 continue;
             };
             let epoch = paint.latest_damage_epoch();
+            changed = true;
             order.note_direct(group, epoch);
             if visibility_changed {
                 order.order_dirty = true;
@@ -1016,6 +1108,9 @@ impl RetainedUiSurfaces {
                 }
             }
         }
+        if changed {
+            self.dirty_surfaces.insert(camera);
+        }
     }
 
     pub(crate) fn remove(&mut self, commands: &mut Commands, id: PaintId) {
@@ -1025,6 +1120,8 @@ impl RetainedUiSurfaces {
 
         let paint = self.paint.get_mut(&owner.camera).unwrap();
         paint.remove(&id);
+        self.dirty_surfaces.insert(owner.camera);
+        self.touched_surfaces.insert(owner.camera);
         let index = self.order.entry(owner.camera).or_default();
         index.order_dirty = true;
         index.spatial = None;
@@ -1035,10 +1132,12 @@ impl RetainedUiSurfaces {
 
     fn detach_owner(&mut self, id: PaintId) -> Option<PaintOwner> {
         let owner = self.owners.remove(&id)?;
-        if let Some(ids) = self.by_main_entity.get_mut(&owner.main_entity) {
+        if let Some(main_entity) = owner.main_entity
+            && let Some(ids) = self.by_main_entity.get_mut(&main_entity)
+        {
             ids.retain(|candidate| *candidate != id);
             if ids.is_empty() {
-                self.by_main_entity.remove(&owner.main_entity);
+                self.by_main_entity.remove(&main_entity);
             }
         }
         Some(owner)
@@ -1058,9 +1157,61 @@ impl RetainedUiSurfaces {
             self.remove(commands, id);
             return;
         }
-        let new_order = (FloatBits::new(draw.z_order), draw.paint_order);
+        let camera = self
+            .surface_by_main_entity
+            .get(&draw.main_entity)
+            .copied()
+            .unwrap_or(camera);
+        draw.camera = camera;
         let main_entity = draw.main_entity;
-        let (old_camera, render_entity, old_order, old_main_entity) = match self.owners.entry(id) {
+        self.upsert_at(
+            commands,
+            id,
+            camera,
+            draw,
+            resource,
+            coverage,
+            Some(main_entity),
+        );
+    }
+
+    pub(crate) fn upsert_boundary(
+        &mut self,
+        commands: &mut Commands,
+        id: PaintId,
+        camera: Entity,
+        mut draw: RetainedDraw,
+        coverage: PaintCoverage,
+    ) {
+        draw.camera = camera;
+        self.upsert_at(
+            commands,
+            id,
+            camera,
+            draw,
+            ResourceFingerprint::None,
+            coverage,
+            None,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one canonical record has independent identity, target, draw, and coverage"
+    )]
+    fn upsert_at(
+        &mut self,
+        commands: &mut Commands,
+        id: PaintId,
+        camera: Entity,
+        mut draw: RetainedDraw,
+        resource: ResourceFingerprint,
+        coverage: PaintCoverage,
+        index_owner: Option<MainEntity>,
+    ) {
+        self.touched_surfaces.insert(camera);
+        let new_order = (FloatBits::new(draw.z_order), draw.paint_order);
+        let (old_camera, render_entity, old_order, old_index_owner) = match self.owners.entry(id) {
             Entry::Occupied(mut owner) => {
                 let old_camera = owner.get().camera;
                 let previous = (
@@ -1070,7 +1221,7 @@ impl RetainedUiSurfaces {
                     Some(owner.get().main_entity),
                 );
                 owner.get_mut().camera = camera;
-                owner.get_mut().main_entity = main_entity;
+                owner.get_mut().main_entity = index_owner;
                 owner.get_mut().order = new_order;
                 if old_camera != camera || previous.2 != Some(new_order) {
                     owner.get_mut().group = None;
@@ -1081,7 +1232,7 @@ impl RetainedUiSurfaces {
                 let render_entity = commands.spawn_empty().id();
                 owner.insert(PaintOwner {
                     camera,
-                    main_entity,
+                    main_entity: index_owner,
                     render_entity,
                     order: new_order,
                     group: None,
@@ -1089,8 +1240,8 @@ impl RetainedUiSurfaces {
                 (None, render_entity, None, None)
             }
         };
-        if old_main_entity != Some(main_entity) {
-            if let Some(old_main_entity) = old_main_entity
+        if old_index_owner != Some(index_owner) {
+            if let Some(Some(old_main_entity)) = old_index_owner
                 && let Some(ids) = self.by_main_entity.get_mut(&old_main_entity)
             {
                 ids.retain(|candidate| *candidate != id);
@@ -1098,7 +1249,9 @@ impl RetainedUiSurfaces {
                     self.by_main_entity.remove(&old_main_entity);
                 }
             }
-            self.by_main_entity.entry(main_entity).or_default().push(id);
+            if let Some(index_owner) = index_owner {
+                self.by_main_entity.entry(index_owner).or_default().push(id);
+            }
         }
         draw.render_entity = render_entity;
 
@@ -1106,10 +1259,18 @@ impl RetainedUiSurfaces {
             && old_camera != camera
         {
             self.paint.get_mut(&old_camera).unwrap().remove(&id);
+            self.dirty_surfaces.insert(old_camera);
+            self.touched_surfaces.insert(old_camera);
             let index = self.order.entry(old_camera).or_default();
             index.order_dirty = true;
             index.spatial = None;
         }
+        let visibility_changed = old_camera == Some(camera)
+            && self
+                .paint
+                .get(&camera)
+                .and_then(|paint| paint.get(&id))
+                .is_some_and(|record| record.coverage.is_empty() != coverage.is_empty());
         let outcome = self.paint.entry(camera).or_default().upsert(
             id,
             PaintRecord {
@@ -1118,6 +1279,7 @@ impl RetainedUiSurfaces {
             },
         );
         if outcome != crate::UpdateOutcome::Unchanged {
+            self.dirty_surfaces.insert(camera);
             let epoch = self.paint[&camera].latest_damage_epoch();
             let group = self.owners[&id].group;
             self.order
@@ -1126,7 +1288,7 @@ impl RetainedUiSurfaces {
                 .note_direct(group, epoch);
         }
         let coverage_changed = old_camera != Some(camera) || outcome.coverage_changed();
-        if old_camera != Some(camera) || old_order != Some(new_order) {
+        if old_camera != Some(camera) || old_order != Some(new_order) || visibility_changed {
             let index = self.order.entry(camera).or_default();
             index.order_dirty = true;
             index.spatial = None;
@@ -1199,11 +1361,15 @@ impl RetainedUiScene {
             return;
         };
         paint.acknowledge(plan);
+        let clean = !paint.has_damage();
         surfaces
             .order
             .entry(camera)
             .or_default()
             .acknowledge(plan.through_epoch());
+        if clean {
+            surfaces.dirty_surfaces.remove(&camera);
+        }
     }
 
     pub(crate) fn has_visible_records(&self, camera: Entity, target: PhysicalRect) -> bool {
@@ -1218,8 +1384,113 @@ impl RetainedUiScene {
     }
 
     pub(crate) fn invalidate(&self, camera: Entity, coverage: PhysicalRect) {
-        if let Some(paint) = self.lock().paint.get_mut(&camera) {
+        let mut surfaces = self.lock();
+        if let Some(paint) = surfaces.paint.get_mut(&camera) {
             paint.invalidate(coverage);
+            surfaces.dirty_surfaces.insert(camera);
+            surfaces.touched_surfaces.insert(camera);
+        }
+    }
+
+    pub(crate) fn invalidate_volatile(&self, camera: Entity, coverage: PhysicalRect) {
+        let mut surfaces = self.lock();
+        let paint = surfaces.paint.entry(camera).or_default();
+        paint.invalidate(coverage);
+        surfaces.dirty_surfaces.insert(camera);
+        surfaces.touched_surfaces.insert(camera);
+    }
+
+    pub(crate) fn dirty_surfaces(&self) -> Vec<Entity> {
+        self.lock().dirty_surfaces.iter().copied().collect()
+    }
+
+    pub(crate) fn discard_damage(&self, camera: Entity) {
+        let mut surfaces = self.lock();
+        let Some(paint) = surfaces.paint.get_mut(&camera) else {
+            return;
+        };
+        if let Some(plan) = paint.repair_plan() {
+            paint.acknowledge(&plan);
+        }
+        if !paint.has_damage() {
+            surfaces.dirty_surfaces.remove(&camera);
+        }
+    }
+
+    pub(crate) fn propagate_boundaries(&self, boundaries: &[(Entity, PaintId, PhysicalRect)]) {
+        let mut surfaces = self.lock();
+        for &(source, id, source_bounds) in boundaries {
+            let Some(source_plan) = surfaces
+                .paint
+                .get_mut(&source)
+                .and_then(RetainedPaint::repair_plan)
+            else {
+                continue;
+            };
+            let source_epoch = source_plan.through_epoch();
+            if surfaces.propagated_epochs.get(&source) == Some(&source_epoch) {
+                continue;
+            }
+            surfaces.propagated_epochs.insert(source, source_epoch);
+            let Some(owner) = surfaces.owners.get(&id) else {
+                continue;
+            };
+            let parent = owner.camera;
+            let group = owner.group;
+            let boundary_draw = &surfaces.paint[&parent]
+                .get(&id)
+                .expect("owned boundary paint must exist")
+                .value
+                .draw;
+            let RetainedDrawItem::Boundary(boundary) = &boundary_draw.item else {
+                unreachable!("boundary ownership must point to a boundary draw");
+            };
+            if boundary.opacity() == 0.0 {
+                continue;
+            }
+            let source_size = Vec2::new(
+                (source_bounds.max_x() - source_bounds.min_x()) as f32,
+                (source_bounds.max_y() - source_bounds.min_y()) as f32,
+            );
+            let output_size = boundary.size();
+            let mapped: Vec<_> = source_plan
+                .regions()
+                .iter()
+                .filter_map(|region| region.intersection(source_bounds))
+                .filter_map(|region| {
+                    let local_min = Vec2::new(
+                        (region.min_x() - source_bounds.min_x()) as f32,
+                        (region.min_y() - source_bounds.min_y()) as f32,
+                    );
+                    let local_max = Vec2::new(
+                        (region.max_x() - source_bounds.min_x()) as f32,
+                        (region.max_y() - source_bounds.min_y()) as f32,
+                    );
+                    let rect = Rect::from_corners(
+                        (local_min / source_size - Vec2::splat(0.5)) * output_size,
+                        (local_max / source_size - Vec2::splat(0.5)) * output_size,
+                    );
+                    coverage_rect(rect, boundary_draw.transform, boundary_draw.clip)
+                })
+                .collect();
+            if mapped.is_empty() {
+                continue;
+            }
+            let paint = surfaces
+                .paint
+                .get_mut(&parent)
+                .expect("owned boundary paint target must exist");
+            for region in mapped {
+                paint.invalidate(region);
+            }
+            let epoch = paint.latest_damage_epoch();
+            surfaces
+                .order
+                .entry(parent)
+                .or_default()
+                .note_direct(group, epoch);
+            surfaces.touched_surfaces.insert(parent);
+            surfaces.dirty_surfaces.insert(parent);
         }
     }
 }
@@ -1228,12 +1499,27 @@ impl RetainedUiScene {
 pub(crate) struct RetainedRepairPlans(pub(crate) HashMap<Entity, RepairPlan>);
 
 #[derive(bevy::prelude::Resource, Default)]
-pub(crate) struct RetainedItems(pub(crate) Mutex<HashMap<Entity, RetainedItem>>);
+pub(crate) struct RetainedItems {
+    pub(crate) items: Mutex<HashMap<Entity, RetainedItem>>,
+    pub(crate) boundaries: Mutex<HashMap<Entity, RetainedBoundaryDraw>>,
+}
 
 #[derive(Clone)]
 pub(crate) struct RetainedItem {
     pub(crate) coverage: PaintCoverage,
     pub(crate) sampled_images: Box<[AssetId<Image>]>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RetainedBoundaryDraw {
+    pub(crate) render_entity: Entity,
+    pub(crate) main_entity: MainEntity,
+    pub(crate) camera: Entity,
+    pub(crate) z_order: f32,
+    pub(crate) surface: Entity,
+    pub(crate) transform: Affine2,
+    pub(crate) size: Vec2,
+    pub(crate) opacity: f32,
 }
 
 #[derive(Clone)]
@@ -1314,7 +1600,54 @@ pub(crate) fn cleanup_retained_ui(
                 debug_assert_eq!(owner.camera, camera);
             }
         }
+        surfaces.dirty_surfaces.remove(&camera);
+        surfaces.touched_surfaces.remove(&camera);
+        surfaces.propagated_epochs.remove(&camera);
         surfaces.order.remove(&camera);
+    }
+}
+
+pub(crate) fn extract_boundary_ownership(
+    mut commands: Commands,
+    state: Res<RetainedUiScene>,
+    changed: Extract<
+        Query<
+            (
+                Entity,
+                &'static Inherited<ComputedUiPaintTarget>,
+                &'static ComputedUiTargetCamera,
+            ),
+            Changed<Inherited<ComputedUiPaintTarget>>,
+        >,
+    >,
+    targets: Extract<Query<&'static ComputedUiTargetCamera, With<Node>>>,
+    boundary_entities: Extract<Query<&'static RenderEntity, With<RepaintBoundary>>>,
+    camera_map: Extract<bevy::ui_render::UiCameraMap>,
+    mut removed: Extract<RemovedComponents<Inherited<ComputedUiPaintTarget>>>,
+) {
+    let mut camera_mapper = camera_map.get_mapper();
+    let mut surfaces = state.lock();
+    for (entity, owner, target) in &changed {
+        let Some(camera) = camera_mapper.map(target) else {
+            surfaces.remove_main_entity(&mut commands, entity.into());
+            continue;
+        };
+        let surface = boundary_entities
+            .get(owner.0 .0)
+            .expect("repaint boundaries must be synchronized to the render world")
+            .id();
+        surfaces.set_entity_surface(entity.into(), Some(surface), camera);
+    }
+    for entity in removed.read() {
+        let Ok(target) = targets.get(entity) else {
+            surfaces.remove_main_entity(&mut commands, entity.into());
+            continue;
+        };
+        let Some(camera) = camera_mapper.map(target) else {
+            surfaces.remove_main_entity(&mut commands, entity.into());
+            continue;
+        };
+        surfaces.set_entity_surface(entity.into(), None, camera);
     }
 }
 
@@ -1326,6 +1659,7 @@ pub(crate) fn extract_retained_placements(
                 Entity,
                 &'static UiGlobalTransform,
                 Option<&'static CalculatedClip>,
+                Option<&'static Inherited<ComputedUiPaintTarget>>,
                 &'static ComputedNode,
                 Option<&'static TextScroll>,
             ),
@@ -1334,7 +1668,8 @@ pub(crate) fn extract_retained_placements(
     >,
 ) {
     let mut surfaces = state.lock();
-    for (entity, transform, clip, node, scroll) in &changed {
+    for (entity, transform, clip, owner, node, scroll) in &changed {
+        let clip = retained_clip(entity, node, transform, clip, owner);
         let transform = transform.affine();
         let clip = if scroll.is_some() {
             let content_box = node.content_box();
@@ -1342,9 +1677,9 @@ pub(crate) fn extract_retained_placements(
                 transform.translation + content_box.center(),
                 content_box.size(),
             );
-            Some(clip.map_or(text_clip, |clip| clip.clip.intersect(text_clip)))
+            Some(clip.map_or(text_clip, |clip| clip.intersect(text_clip)))
         } else {
-            clip.map(|clip| clip.clip)
+            clip
         };
         surfaces.reposition(entity.into(), transform, clip);
     }
@@ -1384,7 +1719,7 @@ pub(crate) fn replay_retained_ui(
     mut core_runs: ResMut<RetainedCoreRuns>,
     mut gradient_runs: ResMut<RetainedGradientRuns>,
     mut shadow_runs: ResMut<RetainedShadowRuns>,
-    items: Res<RetainedItems>,
+    retained_items: Res<RetainedItems>,
     mut extracted_slices: ResMut<ExtractedUiTextureSlices>,
     mut extracted_materials: ResMut<RetainedMaterialReplays>,
     pending_materials: Res<RetainedPendingMaterials>,
@@ -1394,8 +1729,16 @@ pub(crate) fn replay_retained_ui(
     core_runs.clear();
     gradient_runs.clear();
     shadow_runs.clear();
-    let mut items = items.0.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut items = retained_items
+        .items
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     items.clear();
+    let mut boundary_draws = retained_items
+        .boundaries
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    boundary_draws.clear();
     extracted_materials.0.clear();
     pending_materials.clear();
     repair_plans.0.clear();
@@ -1404,17 +1747,28 @@ pub(crate) fn replay_retained_ui(
         materials: &mut extracted_materials,
     };
 
-    for paint in surfaces.paint.values_mut() {
-        counters.add(paint.take_counters());
+    let touched_surfaces = core::mem::take(&mut surfaces.touched_surfaces);
+    for camera in touched_surfaces {
+        if let Some(paint) = surfaces.paint.get_mut(&camera) {
+            counters.add(paint.take_counters());
+        }
     }
+    let dirty_surfaces: Vec<_> = surfaces.dirty_surfaces.iter().copied().collect();
 
     let RetainedUiSurfaces {
         paint,
         owners,
         by_main_entity: _,
+        surface_by_main_entity: _,
+        dirty_surfaces: _,
+        touched_surfaces: _,
+        propagated_epochs: _,
         order,
     } = &mut *surfaces;
-    for (&camera, paint) in paint.iter_mut() {
+    for camera in dirty_surfaces {
+        let paint = paint
+            .get_mut(&camera)
+            .expect("dirty retained surface must have paint state");
         let Some(repair) = paint.repair_plan() else {
             continue;
         };
@@ -1576,6 +1930,40 @@ pub(crate) fn replay_retained_ui(
             let record = paint
                 .get(&id)
                 .expect("spatial index only contains retained records");
+            if let RetainedDrawItem::Boundary(boundary) = &record.value.draw.item {
+                core_run = None;
+                gradient_run = None;
+                shadow_run = None;
+                boundary_draws.insert(
+                    record.value.draw.render_entity,
+                    RetainedBoundaryDraw {
+                        render_entity: record.value.draw.render_entity,
+                        main_entity: record.value.draw.main_entity,
+                        camera: record.value.draw.camera,
+                        z_order: record.value.draw.z_order,
+                        surface: boundary.surface,
+                        transform: record.value.draw.transform,
+                        size: boundary.size(),
+                        opacity: boundary.opacity(),
+                    },
+                );
+                let coverage = PaintCoverage::from_regions(positions.flat_map(|position| {
+                    paint
+                        .get(&order.ids[position])
+                        .expect("paint group only contains retained records")
+                        .coverage
+                        .iter()
+                        .copied()
+                }));
+                items.insert(
+                    record.value.draw.render_entity,
+                    RetainedItem {
+                        coverage,
+                        sampled_images: Box::default(),
+                    },
+                );
+                continue;
+            }
             let border_flags = (id.family == PaintFamily::Border).then(|| {
                 positions
                     .clone()
@@ -1664,6 +2052,7 @@ fn push_replayed(
     coverage: PaintCoverage,
 ) {
     match &draw.item {
+        RetainedDrawItem::Boundary(_) => unreachable!("boundaries use retained composition runs"),
         RetainedDrawItem::BoxShadow(_) => unreachable!("box shadows use retained instancing"),
         RetainedDrawItem::Gradient(_) => unreachable!("gradients use retained instancing"),
         RetainedDrawItem::Material(item) => {

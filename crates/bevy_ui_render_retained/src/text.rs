@@ -1,11 +1,15 @@
 //! Change-driven retained extraction for ordinary UI text glyphs.
 
-use crate::sampled_image::{ImageReader, ImageSample, RetainedSampledImages, SampledImageState};
-use crate::scene::{
-    coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
-    RetainedGlyph, RetainedUiScene, RetainedUiSurfaces,
+use crate::{
+    boundary::retained_clip,
+    sampled_image::{ImageReader, ImageSample, RetainedSampledImages, SampledImageState},
+    scene::{
+        coverage, PaintFamily, PaintId, ResourceFingerprint, RetainedDraw, RetainedDrawItem,
+        RetainedGlyph, RetainedUiScene, RetainedUiSurfaces,
+    },
 };
 use bevy::{
+    app::Inherited,
     asset::{AssetId, Assets},
     camera::visibility::InheritedVisibility,
     color::{Alpha, LinearRgba},
@@ -27,8 +31,9 @@ use bevy::{
     },
     ui::{
         widget::{Text, TextScroll, TextShadow},
-        CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiRenderTargetInfo,
-        ComputedUiTargetCamera, Node, ResolvedBorderRadius, UiGlobalTransform,
+        CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiPaintTarget,
+        ComputedUiRenderTargetInfo, ComputedUiTargetCamera, Node, ResolvedBorderRadius,
+        UiGlobalTransform,
     },
     ui_render::{stack_z_offsets, UiCameraMap},
 };
@@ -258,6 +263,7 @@ pub(crate) fn extract_retained_text(
         )>,
     >,
     camera_map: Extract<UiCameraMap>,
+    owners: Extract<Query<&'static Inherited<ComputedUiPaintTarget>>>,
     input_focus: Extract<Option<Res<InputFocus>>>,
     mut removed: Extract<RemovedTextInputs>,
 ) {
@@ -343,9 +349,8 @@ pub(crate) fn extract_retained_text(
             && !extra_candidates.contains(&section)
         {
             if root_dependencies.fast_color {
-                if let Some(camera) = root_dependencies.camera {
+                if root_dependencies.camera.is_some() {
                     surfaces.retint_text(
-                        camera,
                         root_dependencies.text_paints.iter().copied(),
                         section,
                         color,
@@ -364,9 +369,8 @@ pub(crate) fn extract_retained_text(
                     continue;
                 };
                 if root_dependencies.fast_color {
-                    if let Some(camera) = root_dependencies.camera {
+                    if root_dependencies.camera.is_some() {
                         surfaces.retint_text(
-                            camera,
                             root_dependencies.text_paints.iter().copied(),
                             section,
                             color,
@@ -401,6 +405,7 @@ pub(crate) fn extract_retained_text(
             .into_iter()
             .filter_map(|root| all.get(root).ok()),
     ) {
+        let owner = owners.get(root).ok();
         let content_translation =
             node.content_box().min - scroll.map_or(Vec2::ZERO, |scroll| scroll.0);
         let transform = global_transform.affine() * Affine2::from_translation(content_translation);
@@ -410,15 +415,16 @@ pub(crate) fn extract_retained_text(
         });
         let shadow_transform = shadow_translation
             .map(|translation| global_transform.affine() * Affine2::from_translation(translation));
+        let clip = retained_clip(root, node, global_transform, clip, owner);
         let clip = if scroll.is_some() {
             let content_box = node.content_box();
             let text_clip = Rect::from_center_size(
                 global_transform.affine().translation + content_box.center(),
                 content_box.size(),
             );
-            Some(clip.map_or(text_clip, |clip| clip.clip.intersect(text_clip)))
+            Some(clip.map_or(text_clip, |clip| clip.intersect(text_clip)))
         } else {
-            clip.map(|clip| clip.clip)
+            clip
         };
         let camera = camera_mapper.map(target_camera);
         let visible = camera.is_some() && visibility.get() && !node.is_empty();

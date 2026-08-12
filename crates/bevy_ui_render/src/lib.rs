@@ -44,7 +44,7 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_ecs::system::SystemParam;
 use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
-use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec4, Vec2};
+use bevy_math::{Affine2, FloatOrd, Mat4, Rect, UVec2, UVec4, Vec2};
 use bevy_render::{
     render_asset::RenderAssets,
     render_phase::{
@@ -73,6 +73,7 @@ use bevy_transform::components::GlobalTransform;
 use box_shadow::BoxShadowPlugin;
 use bytemuck::{Pod, Zeroable};
 use core::ops::Range;
+use std::sync::{Mutex, PoisonError};
 
 pub use pipeline::*;
 pub use render_pass::*;
@@ -134,6 +135,36 @@ pub enum RenderUiSystems {
     ExtractCursor,
     ExtractDebug,
     ExtractGradient,
+}
+
+/// Render targets containing immediate-mode UI paint that must be rebuilt this frame.
+#[derive(Resource, Default)]
+pub struct VolatileUiPaintTargets(Mutex<HashMap<Entity, UVec2>>);
+
+impl VolatileUiPaintTargets {
+    pub fn extend(&self, targets: impl IntoIterator<Item = (Entity, UVec2)>) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(targets);
+    }
+
+    pub fn targets(&self) -> Vec<(Entity, UVec2)> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(&target, &size)| (target, size))
+            .collect()
+    }
+}
+
+fn clear_volatile_ui_paint_targets(targets: Res<VolatileUiPaintTargets>) {
+    targets
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
@@ -265,6 +296,7 @@ impl Plugin for UiRenderInfrastructurePlugin {
             .init_gpu_resource::<ImageNodeBindGroups>()
             .init_gpu_resource::<UiMeta>()
             .init_resource::<ExtractedUiNodes>()
+            .init_resource::<VolatileUiPaintTargets>()
             .allow_ambiguous_resource::<ExtractedUiNodes>()
             .init_resource::<DrawFunctions<TransparentUi>>()
             .init_resource::<ViewSortedRenderPhases<TransparentUi>>()
@@ -291,8 +323,11 @@ impl Plugin for UiRenderInfrastructurePlugin {
             .add_systems(RenderStartup, init_ui_pipeline)
             .add_systems(
                 ExtractSchedule,
-                extract_ui_camera_view
-                    .after(extract_cameras)
+                (
+                    clear_volatile_ui_paint_targets,
+                    extract_ui_camera_view.after(extract_cameras),
+                )
+                    .chain()
                     .in_set(RenderUiSystems::ExtractCameraViews),
             )
             .add_systems(
@@ -770,11 +805,13 @@ pub fn extract_uinode_borders(
 /// as ui elements are "stacked on top of each other", they are within the camera's view
 /// and have room to grow.
 // TODO: Consider computing this value at runtime based on the maximum z-value.
-const UI_CAMERA_FAR: f32 = 1000.0;
+/// Far plane used by the top-left-origin UI projection.
+pub const UI_CAMERA_FAR: f32 = 1000.0;
 
 // This value is subtracted from the far distance for the camera's z-position to ensure nodes at z == 0.0 are rendered
 // TODO: Evaluate if we still need this.
-const UI_CAMERA_TRANSFORM_OFFSET: f32 = -0.1;
+/// Offset that keeps zero-stack UI inside the UI projection.
+pub const UI_CAMERA_TRANSFORM_OFFSET: f32 = -0.1;
 
 /// The ID of the subview associated with a camera on which UI is to be drawn.
 ///

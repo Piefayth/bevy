@@ -7,7 +7,7 @@ use bevy_math::UVec2;
 use bevy_text::TextPlugin;
 use bevy_time::TimePlugin;
 use bevy_ui::{BorderRadius, LayoutContainment, Node, PositionType, UiPlugin, UiTransform, Val};
-use bevy_ui_render_retained::RetainedUiMainWorldPlugin;
+use bevy_ui_render_retained::{RepaintBoundary, RetainedUiMainWorldPlugin};
 use criterion::{
     criterion_group, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
 };
@@ -319,6 +319,78 @@ fn bench_scene(
         );
     }
     if let Some(containment_size) = shape.containment_size() {
+        group.bench_with_input(
+            BenchmarkId::new("one_boundary_compositor_change", node_count),
+            &node_count,
+            |bencher, _| {
+                let mut compositor = layout_app(node_count, retained, shape);
+                let entity = *compositor.boundaries.last().unwrap();
+                if retained {
+                    compositor
+                        .app
+                        .world_mut()
+                        .entity_mut(entity)
+                        .insert(RepaintBoundary::default());
+                    compositor.app.world_mut().run_schedule(PostUpdate);
+                }
+                let mut x = 0.0;
+                bencher.iter_custom(|iterations| {
+                    measure_updates(&mut compositor.app, iterations, |world| {
+                        x = if x == 0.0 { 1.0 } else { 0.0 };
+                        if retained {
+                            world
+                                .get_mut::<RepaintBoundary>(entity)
+                                .unwrap()
+                                .transform
+                                .translation
+                                .x = Val::Px(x);
+                        } else {
+                            world.get_mut::<UiTransform>(entity).unwrap().translation.x =
+                                Val::Px(x);
+                        }
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("all_boundary_compositor_changes", node_count),
+            &node_count,
+            |bencher, _| {
+                let mut compositor = layout_app(node_count, retained, shape);
+                let boundaries = compositor.boundaries.clone();
+                if retained {
+                    for &entity in &boundaries {
+                        compositor
+                            .app
+                            .world_mut()
+                            .entity_mut(entity)
+                            .insert(RepaintBoundary::default());
+                    }
+                    compositor.app.world_mut().run_schedule(PostUpdate);
+                }
+                let mut x = 0.0;
+                bencher.iter_custom(|iterations| {
+                    measure_updates(&mut compositor.app, iterations, |world| {
+                        x = if x == 0.0 { 1.0 } else { 0.0 };
+                        for &entity in &boundaries {
+                            if retained {
+                                world
+                                    .get_mut::<RepaintBoundary>(entity)
+                                    .unwrap()
+                                    .transform
+                                    .translation
+                                    .x = Val::Px(x);
+                            } else {
+                                world.get_mut::<UiTransform>(entity).unwrap().translation.x =
+                                    Val::Px(x);
+                            }
+                        }
+                    })
+                });
+            },
+        );
+
         group.bench_with_input(
             BenchmarkId::new("one_boundary_layout_change", node_count),
             &node_count,
