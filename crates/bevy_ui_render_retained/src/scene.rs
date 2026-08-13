@@ -2603,6 +2603,18 @@ pub(crate) fn replay_retained_ui(
         repair_plans.0.insert(camera, repair.clone());
         let order = order.entry(camera).or_default();
         if order.order_dirty {
+            // Every record on this camera surrenders its group BEFORE the
+            // new ordering assigns them: a record excluded below (empty
+            // coverage this frame) would otherwise keep an index into the
+            // PREVIOUS ordering, and when it comes back, `note_direct` /
+            // `note_bounds_dirty` index past the rebuilt per-group vectors
+            // (observed live: len 273, index 274, from
+            // `extract_retained_text`) — or worse, alias a live group.
+            for owned in records.slots.iter_mut().flatten() {
+                if owned.camera == camera {
+                    owned.group = None;
+                }
+            }
             order.slots.clear();
             order.slots.extend(
                 records

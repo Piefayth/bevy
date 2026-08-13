@@ -5908,3 +5908,107 @@ fn removing_a_custom_material_repairs_its_previous_pixels() {
         assert_eq!(after.records_removed, before.records_removed + 1);
     });
 }
+
+/// A record whose coverage is EMPTY across an ordering rebuild must not
+/// keep its group index from the PREVIOUS ordering. Regression:
+/// `owned.group` was only reassigned for records included in the rebuild
+/// (non-empty coverage), and a TEXT record persists with empty coverage
+/// when its string empties — so a readout cleared to "" while the
+/// ordering shrank came back holding a group index past the rebuilt
+/// per-group vectors, and `note_direct` panicked with `index out of
+/// bounds` in `direct_epochs` (observed live from
+/// `extract_retained_text`, len 273 / index 274).
+#[test]
+fn text_emptied_across_a_shrinking_reorder_refills_safely() {
+    with_gpu_lock(|| {
+        let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
+            | TextureUsages::RENDER_ATTACHMENT;
+        let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                Camera {
+                    clear_color: ClearColorConfig::Custom(Color::BLACK),
+                    ..default()
+                },
+                RenderTarget::Image(image.clone().into()),
+            ))
+            .id();
+
+        // A population whose ordering has several groups; the victim
+        // spawns LAST so it lands in the highest group.
+        let world = app.world_mut();
+        let root = spawn_full_background(world, camera, Color::srgb_u8(10, 10, 30));
+        let mut crowd = Vec::new();
+        for i in 0..6 {
+            crowd.push(
+                world
+                    .spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(2 + 8 * i),
+                            top: px(4),
+                            width: px(6),
+                            height: px(6),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb_u8(40 + 20 * i as u8, 120, 60)),
+                        ChildOf(root),
+                    ))
+                    .id(),
+            );
+        }
+        let victim = world
+            .spawn((
+                Text::new("live readout"),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(2),
+                    top: px(30),
+                    ..default()
+                },
+                ChildOf(root),
+            ))
+            .id();
+
+        app.finish();
+        app.cleanup();
+        for _ in 0..20 {
+            step_and_wait(&mut app);
+        }
+
+        // Empty the readout (empty coverage, record persists, EXCLUDED
+        // from the next ordering) and shrink the ordering under it.
+        let world = app.world_mut();
+        *world.get_mut::<Text>(victim).unwrap() = Text::new("");
+        for node in crowd {
+            world.entity_mut(node).despawn();
+        }
+        for _ in 0..8 {
+            step_and_wait(&mut app);
+        }
+
+        // The readout refills. Its old group index now points past the
+        // rebuilt (smaller) per-group vectors.
+        *app.world_mut().get_mut::<Text>(victim).unwrap() = Text::new("back");
+        for _ in 0..8 {
+            step_and_wait(&mut app);
+        }
+    });
+}
