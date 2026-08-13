@@ -57,7 +57,7 @@ pub fn upscaling(
         if let (Some(overlay), Some(pipeline_id)) = (overlay.as_ref(), upscaling_target.overlay) {
             let bind_group = match &mut cache.overlay {
                 Some((main_id, overlay_id, bind_group))
-                    if main_texture_view.id() == *main_id && overlay.id() == *overlay_id =>
+                    if main_texture_view.id() == *main_id && overlay.view.id() == *overlay_id =>
                 {
                     bind_group
                 }
@@ -65,11 +65,11 @@ pub fn upscaling(
                     let bind_group = blit_pipeline.create_overlay_bind_group(
                         ctx.render_device(),
                         main_texture_view,
-                        overlay,
+                        &overlay.view,
                         &pipeline_cache,
                     );
                     let (_, _, bind_group) =
-                        cached.insert((main_texture_view.id(), overlay.id(), bind_group));
+                        cached.insert((main_texture_view.id(), overlay.view.id(), bind_group));
                     bind_group
                 }
             };
@@ -117,7 +117,12 @@ pub fn upscaling(
     {
         let mut render_pass = ctx.command_encoder().begin_render_pass(&pass_descriptor);
 
-        if let Some(camera) = camera
+        // A full-target overlay must not be scissored to the camera's
+        // viewport — the interface owns the whole output even when the
+        // world renders letterboxed.
+        let full_target_overlay = overlay.as_ref().is_some_and(|overlay| overlay.fills_target);
+        if !full_target_overlay
+            && let Some(camera) = camera
             && let Some(viewport) = &camera.viewport
         {
             let size = viewport.physical_size;

@@ -330,13 +330,22 @@ pub fn propagate_ui_target_cameras(
     mut commands: Commands,
     default_ui_camera: DefaultUiCamera,
     ui_scale: Res<UiScale>,
-    camera_query: Query<&Camera>,
+    camera_query: Query<(&Camera, Has<crate::UiFillsTarget>)>,
     target_camera_query: Query<&UiTargetCamera>,
     ui_root_nodes: UiRootNodes,
+    propagate_sources: Query<
+        Entity,
+        Or<(
+            With<Propagate<ComputedUiTargetCamera>>,
+            With<Propagate<ComputedUiRenderTargetInfo>>,
+        )>,
+    >,
 ) {
     let default_camera_entity = default_ui_camera.get();
 
+    let mut roots = EntityHashSet::default();
     for root_entity in ui_root_nodes.iter() {
+        roots.insert(root_entity);
         let camera = target_camera_query
             .get(root_entity)
             .ok()
@@ -351,10 +360,16 @@ pub fn propagate_ui_target_cameras(
         let (scale_factor, physical_size) = camera_query
             .get(camera)
             .ok()
-            .map(|camera| {
+            .map(|(camera, fills_target)| {
                 (
                     camera.target_scaling_factor().unwrap_or(1.) * ui_scale.0,
-                    camera.physical_viewport_size().unwrap_or(UVec2::ZERO),
+                    // A `UiFillsTarget` camera's interface ignores the
+                    // viewport and lays out to the whole target.
+                    if fills_target {
+                        camera.physical_target_size().unwrap_or(UVec2::ZERO)
+                    } else {
+                        camera.physical_viewport_size().unwrap_or(UVec2::ZERO)
+                    },
                 )
             })
             .unwrap_or((1., UVec2::ZERO));
@@ -365,6 +380,20 @@ pub fn propagate_ui_target_cameras(
                 scale_factor,
                 physical_size,
             }));
+    }
+
+    // An EX-ROOT keeps its `Propagate` stamps when reparented under another
+    // root, and a `Propagate` holder is a propagation SOURCE — the node
+    // (and its subtree) stays pinned to the camera it had as a root.
+    // Strip the stamps from anything no longer a root; removal re-triggers
+    // inheritance from the new parent chain.
+    for entity in &propagate_sources {
+        if !roots.contains(&entity) {
+            commands.entity(entity).remove::<(
+                Propagate<ComputedUiTargetCamera>,
+                Propagate<ComputedUiRenderTargetInfo>,
+            )>();
+        }
     }
 }
 

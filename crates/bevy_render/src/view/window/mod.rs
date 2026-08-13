@@ -388,7 +388,10 @@ fn ios_main_thread_scoped<R, F: FnOnce() -> R>(f: F) -> R {
         // SAFETY: `ctx` is the `&mut cell` below, alive for the whole call —
         // the dispatching thread is blocked until this returns.
         let cell = unsafe { &mut *ctx.cast::<Cell<F, R>>() };
-        let f = cell.0.take().expect("dispatch_sync runs its work exactly once");
+        let f = cell
+            .0
+            .take()
+            .expect("dispatch_sync runs its work exactly once");
         cell.1 = Some(f());
     }
     let mut cell = Cell::<F, R>(Some(f), None);

@@ -3018,6 +3018,20 @@ impl UiTargetCamera {
 #[reflect(Component, Default)]
 pub struct IsDefaultUiCamera;
 
+/// The interface on this camera covers the whole RENDER TARGET, ignoring the
+/// camera's viewport.
+///
+/// A letterboxed world camera renders — and pays for — only its viewport,
+/// but the interface layered over it still owns the full window: layout,
+/// pointer hit-testing and the UI projection all read the TARGET size for a
+/// camera carrying this marker, and the retained composite places the layer
+/// across the whole output. This is what lets one camera carry both a
+/// shrunken world and a full-screen interface, instead of a second camera
+/// existing only to disagree about the viewport.
+#[derive(Component, Default, Clone, Copy, Reflect)]
+#[reflect(Component, Default)]
+pub struct UiFillsTarget;
+
 #[derive(SystemParam)]
 pub struct DefaultUiCamera<'w, 's> {
     cameras: Query<'w, 's, (Entity, &'static Camera, &'static RenderTarget)>,

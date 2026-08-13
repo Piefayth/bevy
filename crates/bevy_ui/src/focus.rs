@@ -4,6 +4,7 @@ use crate::{
 };
 use bevy_camera::{visibility::InheritedVisibility, Camera, NormalizedRenderTarget, RenderTarget};
 use bevy_ecs::{
+    query::Has,
     change_detection::DetectChangesMut,
     entity::{ContainsEntity, Entity, EntityHashMap},
     hierarchy::ChildOf,
@@ -148,7 +149,7 @@ pub struct NodeQuery {
 pub fn ui_focus_system(
     mut hovered_nodes: Local<Vec<Entity>>,
     mut state: Local<State>,
-    camera_query: Query<(Entity, &Camera, &RenderTarget)>,
+    camera_query: Query<(Entity, &Camera, &RenderTarget, Has<crate::UiFillsTarget>)>,
     primary_window: Query<Entity, With<PrimaryWindow>>,
     windows: Query<&Window>,
     mouse_button_input: Res<ButtonInput<MouseButton>>,
@@ -188,7 +189,7 @@ pub fn ui_focus_system(
 
     let camera_cursor_positions: EntityHashMap<Vec2> = camera_query
         .iter()
-        .filter_map(|(entity, camera, render_target)| {
+        .filter_map(|(entity, camera, render_target, fills_target)| {
             // Interactions are only supported for cameras rendering to a window.
             let Some(NormalizedRenderTarget::Window(window_ref)) =
                 render_target.normalize(primary_window)
@@ -197,10 +198,16 @@ pub fn ui_focus_system(
             };
             let window = windows.get(window_ref.entity()).ok()?;
 
-            let viewport_position = camera
-                .physical_viewport_rect()
-                .map(|rect| rect.min.as_vec2())
-                .unwrap_or_default();
+            // A `UiFillsTarget` camera's interface is in TARGET
+            // coordinates; the cursor already is too.
+            let viewport_position = if fills_target {
+                Vec2::ZERO
+            } else {
+                camera
+                    .physical_viewport_rect()
+                    .map(|rect| rect.min.as_vec2())
+                    .unwrap_or_default()
+            };
             window
                 .physical_cursor_position()
                 .or_else(|| {

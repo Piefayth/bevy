@@ -100,7 +100,13 @@ pub struct NodeQuery {
 /// we need for determining picking.
 pub fn ui_picking(
     pointers: Query<(&PointerId, &PointerLocation)>,
-    camera_query: Query<(Entity, &Camera, &RenderTarget, Has<UiPickingCamera>)>,
+    camera_query: Query<(
+        Entity,
+        &Camera,
+        &RenderTarget,
+        Has<UiPickingCamera>,
+        Has<crate::UiFillsTarget>,
+    )>,
     primary_window: Query<Entity, With<PrimaryWindow>>,
     settings: Res<UiPickingSettings>,
     ui_stack: Res<UiStack>,
@@ -120,10 +126,10 @@ pub fn ui_picking(
     {
         // This pointer is associated with a render target, which could be used by multiple
         // cameras. We want to ensure we return all cameras with a matching target.
-        for (entity, camera, _, _) in
+        for (entity, camera, _, _, fills_target) in
             camera_query
                 .iter()
-                .filter(|(_, _, render_target, cam_can_pick)| {
+                .filter(|(_, _, render_target, cam_can_pick, _)| {
                     (!settings.require_markers || *cam_can_pick)
                         && render_target
                             .normalize(primary_window.single().ok())
@@ -132,7 +138,9 @@ pub fn ui_picking(
         {
             let mut pointer_pos =
                 pointer_location.position * camera.target_scaling_factor().unwrap_or(1.);
-            if let Some(viewport) = camera.physical_viewport_rect() {
+            // A `UiFillsTarget` camera's interface covers the whole target:
+            // no viewport gate, no offset.
+            if !fills_target && let Some(viewport) = camera.physical_viewport_rect() {
                 if !viewport.as_rect().contains(pointer_pos) {
                     // The pointer is outside the viewport, skip it
                     continue;
@@ -271,7 +279,7 @@ pub fn ui_picking(
 
         let order = camera_query
             .get(*camera)
-            .map(|(_, cam, _, _)| cam.order)
+            .map(|(_, cam, _, _, _)| cam.order)
             .unwrap_or_default() as f32
             + 0.5; // bevy ui can run on any camera, it's a special case
 

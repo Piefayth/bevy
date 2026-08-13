@@ -861,6 +861,7 @@ pub fn extract_ui_camera_view(
                 &Camera,
                 Option<&UiAntiAlias>,
                 Option<&BoxShadowSamples>,
+                Has<bevy_ui::UiFillsTarget>,
             ),
             Or<(With<Camera2d>, With<Camera3d>)>,
         >,
@@ -870,7 +871,7 @@ pub fn extract_ui_camera_view(
 ) {
     live_entities.clear();
 
-    for (main_entity, render_entity, camera, ui_anti_alias, shadow_samples) in &query {
+    for (main_entity, render_entity, camera, ui_anti_alias, shadow_samples, fills_target) in &query {
         // ignore inactive cameras
         if !camera.is_active {
             commands
@@ -895,11 +896,20 @@ pub fn extract_ui_camera_view(
                 continue;
             };
 
+            // A `UiFillsTarget` camera's interface ignores the viewport:
+            // its layout, its layer and this projection all speak
+            // whole-target coordinates, and the retained composite places
+            // the layer across the whole output.
+            let ui_rect = if fills_target {
+                bevy_math::URect::from_corners(bevy_math::UVec2::ZERO, target_size)
+            } else {
+                physical_viewport_rect
+            };
             // use a projection matrix with the origin in the top left instead of the bottom left that comes with OrthographicProjection
             let projection_matrix = Mat4::orthographic_rh(
                 0.0,
-                physical_viewport_rect.width() as f32,
-                physical_viewport_rect.height() as f32,
+                ui_rect.width() as f32,
+                ui_rect.height() as f32,
                 0.0,
                 0.0,
                 UI_CAMERA_FAR,
@@ -921,10 +931,7 @@ pub fn extract_ui_camera_view(
                         ),
                         clip_from_world: None,
                         target_format,
-                        viewport: UVec4::from((
-                            physical_viewport_rect.min,
-                            physical_viewport_rect.size(),
-                        )),
+                        viewport: UVec4::from((ui_rect.min, ui_rect.size())),
                         color_grading: Default::default(),
                         invert_culling: false,
                     },
@@ -933,6 +940,14 @@ pub fn extract_ui_camera_view(
                     TemporaryRenderEntity,
                 ))
                 .id();
+            // The render-world half of the marker, so the retained layer
+            // and its composite can size to the target.
+            if fills_target {
+                commands
+                    .get_entity(render_entity)
+                    .expect("Camera entity wasn't synced.")
+                    .insert(bevy_ui::UiFillsTarget);
+            }
 
             let mut entity_commands = commands
                 .get_entity(render_entity)

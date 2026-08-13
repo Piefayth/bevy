@@ -41,11 +41,22 @@ pub struct ViewUpscalingPipeline {
     key: BlitPipelineKey,
 }
 
+/// One view's overlay for the current frame.
+#[derive(Clone)]
+pub struct ViewOutputOverlay {
+    /// The premultiplied-alpha layer to fold into the final blit.
+    pub view: TextureView,
+    /// The overlay covers the whole render target: the blit must not
+    /// scissor it to the camera's viewport (a `UiFillsTarget` interface
+    /// over a letterboxed camera).
+    pub fills_target: bool,
+}
+
 /// Optional premultiplied-alpha layers folded into the existing final blit.
 #[derive(Resource, Default)]
 pub struct ViewOutputOverlays {
     enabled: bool,
-    views: Mutex<EntityHashMap<TextureView>>,
+    views: Mutex<EntityHashMap<ViewOutputOverlay>>,
 }
 
 impl ViewOutputOverlays {
@@ -55,7 +66,7 @@ impl ViewOutputOverlays {
     }
 
     /// Selects the layer to composite for one view's current frame.
-    pub fn set(&self, view: Entity, overlay: Option<TextureView>) {
+    pub fn set(&self, view: Entity, overlay: Option<ViewOutputOverlay>) {
         let mut views = self.views.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(overlay) = overlay {
             views.insert(view, overlay);
@@ -64,7 +75,7 @@ impl ViewOutputOverlays {
         }
     }
 
-    fn get(&self, view: Entity) -> Option<TextureView> {
+    fn get(&self, view: Entity) -> Option<ViewOutputOverlay> {
         self.views
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

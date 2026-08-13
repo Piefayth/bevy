@@ -6012,3 +6012,101 @@ fn text_emptied_across_a_shrinking_reorder_refills_safely() {
         }
     });
 }
+
+/// A `UiFillsTarget` camera's interface covers the whole render target,
+/// not the camera's viewport: layout sizes to the target, and the layer
+/// composites across the full output. Without the marker, the same node
+/// lays out inside the viewport band. Both halves are asserted so the
+/// marker is proven to be the discriminator.
+#[test]
+fn a_fills_target_camera_lays_its_interface_over_the_whole_target() {
+    with_gpu_lock(|| {
+        for fills in [false, true] {
+            let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+
+            let mut image = Image::new_fill(
+                Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                &[0, 0, 0, 0],
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            );
+            image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_DST
+                | TextureUsages::COPY_SRC
+                | TextureUsages::RENDER_ATTACHMENT;
+            let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+            // The camera renders only the TOP HALF of the target.
+            let mut camera = app.world_mut().spawn((
+                Camera2d,
+                Camera {
+                    clear_color: ClearColorConfig::Custom(Color::BLACK),
+                    viewport: Some(Viewport {
+                        physical_position: UVec2::ZERO,
+                        physical_size: UVec2::new(WIDTH, HEIGHT / 2),
+                        depth: 0.0..1.0,
+                    }),
+                    ..default()
+                },
+                RenderTarget::Image(image.clone().into()),
+            ));
+            if fills {
+                camera.insert(bevy::ui::UiFillsTarget);
+            }
+            let camera = camera.id();
+
+            // A node in the BOTTOM half of the TARGET — outside the
+            // viewport, inside the target.
+            app.world_mut().spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(8),
+                    top: px((HEIGHT * 3 / 4) as i32),
+                    width: px(16),
+                    height: px(10),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.0, 1.0, 0.0)),
+                bevy::ui::UiTargetCamera(camera),
+            ));
+
+            let pixels = Arc::new(Mutex::new(None));
+            let observer_pixels = Arc::clone(&pixels);
+            app.world_mut()
+                .spawn(Readback::texture(image))
+                .observe(move |event: On<ReadbackComplete>| {
+                    *observer_pixels
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
+                });
+            app.finish();
+            app.cleanup();
+            for _ in 0..20 {
+                step_and_wait(&mut app);
+            }
+            let frame = capture_fresh(&mut app, &pixels);
+            // Sample inside the node's target-space rect.
+            let x = 12u32;
+            let y = HEIGHT * 3 / 4 + 4;
+            let i = ((y * WIDTH + x) * BYTES_PER_PIXEL as u32) as usize;
+            let px_val = &frame[i..i + 3];
+            if fills {
+                assert!(
+                    px_val[1] > 200,
+                    "fills-target: the node should paint at its TARGET position \
+                     below the viewport (got {px_val:?})"
+                );
+            } else {
+                assert!(
+                    px_val[1] < 50,
+                    "without the marker the interface is viewport-bound; green \
+                     below the viewport means the default changed (got {px_val:?})"
+                );
+            }
+        }
+    });
+}

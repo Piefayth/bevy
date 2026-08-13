@@ -156,10 +156,8 @@ impl Plugin for PipelinedRenderingPlugin {
             #[cfg(target_os = "ios")]
             {
                 unsafe extern "C" {
-                    fn pthread_set_qos_class_self_np(
-                        qos_class: u32,
-                        relative_priority: i32,
-                    ) -> i32;
+                    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32)
+                        -> i32;
                 }
                 // qos_class_t QOS_CLASS_USER_INTERACTIVE
                 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;

@@ -1640,7 +1640,12 @@ fn rebuild_surface(
 )]
 fn retained_ui_pass(
     world: &World,
-    view: ViewQuery<(Entity, &UiCameraView, &ExtractedCamera)>,
+    view: ViewQuery<(
+        Entity,
+        &UiCameraView,
+        &ExtractedCamera,
+        bevy::ecs::query::Has<bevy::ui::UiFillsTarget>,
+    )>,
     ui_view_query: Query<(&ExtractedView, &UiViewTarget)>,
     transparent_render_phases: Res<ViewSortedRenderPhases<TransparentUi>>,
     pipelines: Res<RetainedUiPipelines>,
@@ -1654,7 +1659,7 @@ fn retained_ui_pass(
     repair_plans: Res<RetainedRepairPlans>,
     mut ctx: RenderContext,
 ) {
-    let (main_view_entity, ui_camera_view, camera) = view.into_inner();
+    let (main_view_entity, ui_camera_view, camera, fills_target) = view.into_inner();
     overlays.set(main_view_entity, None);
     if matches!(camera.output_mode, bevy::camera::CameraOutputMode::Skip) {
         return;
@@ -1663,7 +1668,13 @@ fn retained_ui_pass(
     let Ok((extracted_view, ui_view_target)) = ui_view_query.get(ui_view_entity) else {
         return;
     };
-    let Some(size) = camera.physical_viewport_size else {
+    // A `UiFillsTarget` camera's layer covers the whole target (the blit
+    // samples the overlay across the full output), not the viewport.
+    let Some(size) = (if fills_target {
+        camera.physical_target_size
+    } else {
+        camera.physical_viewport_size
+    }) else {
         return;
     };
 
@@ -1731,7 +1742,10 @@ fn retained_ui_pass(
     if surface.has_content {
         overlays.set(
             main_view_entity,
-            Some(surface.slots[surface.active].view.clone()),
+            Some(bevy::core_pipeline::upscaling::ViewOutputOverlay {
+                view: surface.slots[surface.active].view.clone(),
+                fills_target,
+            }),
         );
         counters.composites.fetch_add(1, Ordering::Relaxed);
         counters
