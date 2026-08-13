@@ -1,7 +1,4 @@
-use crate::{
-    core_3d::Opaque3d,
-    skybox::{SkyboxBindGroup, SkyboxPipelineId},
-};
+use crate::core_3d::Opaque3d;
 use bevy_camera::{MainPassResolutionOverride, Viewport};
 use bevy_ecs::prelude::*;
 use bevy_log::error;
@@ -11,9 +8,9 @@ use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
     render_phase::ViewBinnedRenderPhases,
-    render_resource::{PipelineCache, RenderPassDescriptor, StoreOp},
+    render_resource::{RenderPassDescriptor, StoreOp},
     renderer::{RenderContext, ViewQuery},
-    view::{ExtractedView, ViewDepthTexture, ViewTarget, ViewUniformOffset},
+    view::{ExtractedView, ViewDepthTexture, ViewTarget},
 };
 
 use super::AlphaMask3d;
@@ -25,28 +22,15 @@ pub fn main_opaque_pass_3d(
         &ExtractedView,
         &ViewTarget,
         &ViewDepthTexture,
-        Option<&SkyboxPipelineId>,
-        Option<&SkyboxBindGroup>,
-        &ViewUniformOffset,
         Option<&MainPassResolutionOverride>,
     )>,
     opaque_phases: Res<ViewBinnedRenderPhases<Opaque3d>>,
     alpha_mask_phases: Res<ViewBinnedRenderPhases<AlphaMask3d>>,
-    pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
     let view_entity = view.entity();
 
-    let (
-        camera,
-        extracted_view,
-        target,
-        depth,
-        skybox_pipeline,
-        skybox_bind_group,
-        view_uniform_offset,
-        resolution_override,
-    ) = view.into_inner();
+    let (camera, extracted_view, target, depth, resolution_override) = view.into_inner();
 
     let (Some(opaque_phase), Some(alpha_mask_phase)) = (
         opaque_phases.get(&extracted_view.retained_view_entity),
@@ -54,6 +38,16 @@ pub fn main_opaque_pass_3d(
     ) else {
         return;
     };
+
+    // VENDORED CHANGE: nothing binned means nothing to do — return BEFORE
+    // touching the attachments, so the first-use clear (color and depth)
+    // shifts to the transparent pass, which now owns the skybox too and runs
+    // unconditionally. The flat pipeline queues everything transparent-phase,
+    // so in this game the opaque pass never runs at all: one less full
+    // load/store of the tile memory per frame.
+    if opaque_phase.is_empty() && alpha_mask_phase.is_empty() {
+        return;
+    }
 
     #[cfg(feature = "trace")]
     let _main_opaque_pass_3d_span = info_span!("main_opaque_pass_3d").entered();
@@ -94,19 +88,6 @@ pub fn main_opaque_pass_3d(
         if let Err(err) = alpha_mask_phase.render(&mut render_pass, world, view_entity) {
             error!("Error encountered while rendering the alpha mask phase {err:?}");
         }
-    }
-
-    if let (Some(skybox_pipeline), Some(SkyboxBindGroup(skybox_bind_group))) =
-        (skybox_pipeline, skybox_bind_group)
-        && let Some(pipeline) = pipeline_cache.get_render_pipeline(skybox_pipeline.0)
-    {
-        render_pass.set_render_pipeline(pipeline);
-        render_pass.set_bind_group(
-            0,
-            &skybox_bind_group.0,
-            &[view_uniform_offset.offset, skybox_bind_group.1],
-        );
-        render_pass.draw(0..3, 0..1);
     }
 
     pass_span.end(&mut render_pass);

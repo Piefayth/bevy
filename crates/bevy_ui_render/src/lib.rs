@@ -871,7 +871,8 @@ pub fn extract_ui_camera_view(
 ) {
     live_entities.clear();
 
-    for (main_entity, render_entity, camera, ui_anti_alias, shadow_samples, fills_target) in &query {
+    for (main_entity, render_entity, camera, ui_anti_alias, shadow_samples, fills_target) in &query
+    {
         // ignore inactive cameras
         if !camera.is_active {
             commands

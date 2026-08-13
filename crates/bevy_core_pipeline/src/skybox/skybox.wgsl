@@ -1,5 +1,14 @@
 #import bevy_render::view::View
-#import bevy_pbr::utils::coords_to_viewport_uv
+
+// VENDORED CHANGE: upstream imports this one helper from bevy_pbr::utils —
+// a shader library only PbrPlugin registers. This game deleted bevy_pbr
+// (unlit by design), which left the import forever unresolvable and the
+// skybox pipeline silently QUEUED: a grey sky and not one error. The sky
+// must not depend on a renderer that doesn't exist; the helper is inlined
+// (verbatim from bevy_pbr 0.19's utils.wgsl).
+fn coords_to_viewport_uv(position: vec2<f32>, viewport: vec4<f32>) -> vec2<f32> {
+    return (position - viewport.xy) / viewport.zw;
+}
 
 struct SkyboxUniforms {
 	brightness: f32,

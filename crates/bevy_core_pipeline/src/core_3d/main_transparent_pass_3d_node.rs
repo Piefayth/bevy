@@ -1,6 +1,7 @@
 use crate::{
     core_3d::Transparent3d,
     oit::{resolve::OitResolvePipelineId, OrderIndependentTransparencySettings},
+    skybox::{SkyboxBindGroup, SkyboxPipelineId},
 };
 use bevy_camera::{MainPassResolutionOverride, Viewport};
 use bevy_ecs::prelude::*;
@@ -13,7 +14,7 @@ use bevy_render::{
     render_phase::ViewSortedRenderPhases,
     render_resource::{PipelineCache, RenderPassDescriptor, StoreOp},
     renderer::{RenderContext, ViewQuery},
-    view::{ExtractedView, ViewDepthTexture, ViewTarget},
+    view::{ExtractedView, ViewDepthTexture, ViewTarget, ViewUniformOffset},
 };
 
 pub fn main_transparent_pass_3d(
@@ -26,6 +27,9 @@ pub fn main_transparent_pass_3d(
         Option<&MainPassResolutionOverride>,
         Has<OrderIndependentTransparencySettings>,
         Option<&OitResolvePipelineId>,
+        Option<&SkyboxPipelineId>,
+        Option<&SkyboxBindGroup>,
+        &ViewUniformOffset,
     )>,
     transparent_phases: Res<ViewSortedRenderPhases<Transparent3d>>,
     mut ctx: RenderContext,
@@ -40,6 +44,9 @@ pub fn main_transparent_pass_3d(
         resolution_override,
         has_oit,
         oit_resolve_pipeline_id,
+        skybox_pipeline,
+        skybox_bind_group,
+        view_uniform_offset,
     ) = view.into_inner();
 
     let Some(transparent_phase) = transparent_phases.get(&extracted_view.retained_view_entity)
@@ -47,38 +54,39 @@ pub fn main_transparent_pass_3d(
         return;
     };
 
-    if !transparent_phase.items.is_empty() {
+    // VENDORED CHANGE: this is THE main pass now. The opaque/alpha-mask pass
+    // skips itself when it has nothing to draw (in this game: always — the
+    // flat pipeline queues everything transparent-phase), so this pass runs
+    // unconditionally: it owns the first-use CLEAR of the color and depth
+    // attachments, and it draws the skybox first, where the opaque pass used
+    // to. One pass over the tile memory instead of two.
+    {
         #[cfg(feature = "trace")]
         let _main_transparent_pass_3d_span = info_span!("main_transparent_pass_3d").entered();
 
         let diagnostics = ctx.diagnostic_recorder();
         let diagnostics = diagnostics.as_deref();
 
-        if has_oit {
-            // We can't run transparent phase if OitResolvePipelineId is not ready
-            // Otherwise we will write to `oit_atomic_counter` and `oit_heads` buffer without resetting them
-            // which causes corrupted linked list(can have circular references) on the next pass
-            let Some(oit_resolve_pipeline_id) = oit_resolve_pipeline_id else {
-                return;
-            };
-            let pipeline_cache = world.resource::<PipelineCache>();
-            if pipeline_cache
-                .get_render_pipeline(oit_resolve_pipeline_id.0)
-                .is_none()
-            {
-                return;
-            }
-        }
+        // We can't run the transparent phase if OitResolvePipelineId is not
+        // ready — we'd write `oit_atomic_counter`/`oit_heads` without
+        // resetting them, corrupting the linked list on the next pass. But
+        // the PASS itself must still begin: it owns the frame's only clear
+        // (and the skybox), so warmup skips the phase draws, never the pass.
+        let oit_blocked = has_oit
+            && !transparent_phase.items.is_empty()
+            && !oit_resolve_pipeline_id.is_some_and(|id| {
+                world
+                    .resource::<PipelineCache>()
+                    .get_render_pipeline(id.0)
+                    .is_some()
+            });
 
         let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("main_transparent_pass_3d"),
             color_attachments: &[Some(target.get_color_attachment())],
-            // NOTE: For the transparent pass we load the depth buffer. There should be no
-            // need to write to it, but store is set to `true` as a workaround for issue #3776,
+            // NOTE: store is set to `true` as a workaround for issue #3776,
             // https://github.com/bevyengine/bevy/issues/3776
             // so that wgpu does not clear the depth buffer.
-            // As the opaque and alpha mask passes run first, opaque meshes can occlude
-            // transparent ones.
             depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -92,7 +100,28 @@ pub fn main_transparent_pass_3d(
             render_pass.set_camera_viewport(&viewport);
         }
 
-        if let Err(err) = transparent_phase.render(&mut render_pass, world, view_entity) {
+        // The sky first, under everything: fullscreen at the far plane, no
+        // depth write — phase items paint over it in sorted order exactly as
+        // they painted over the opaque pass's skybox before.
+        if let (Some(skybox_pipeline), Some(SkyboxBindGroup(skybox_bind_group))) =
+            (skybox_pipeline, skybox_bind_group)
+        {
+            let pipeline_cache = world.resource::<PipelineCache>();
+            if let Some(pipeline) = pipeline_cache.get_render_pipeline(skybox_pipeline.0) {
+                render_pass.set_render_pipeline(pipeline);
+                render_pass.set_bind_group(
+                    0,
+                    &skybox_bind_group.0,
+                    &[view_uniform_offset.offset, skybox_bind_group.1],
+                );
+                render_pass.draw(0..3, 0..1);
+            }
+        }
+
+        if !transparent_phase.items.is_empty()
+            && !oit_blocked
+            && let Err(err) = transparent_phase.render(&mut render_pass, world, view_entity)
+        {
             error!("Error encountered while rendering the transparent phase {err:?}");
         }
 

@@ -4,11 +4,11 @@ use crate::{
 };
 use bevy_camera::{visibility::InheritedVisibility, Camera, NormalizedRenderTarget, RenderTarget};
 use bevy_ecs::{
-    query::Has,
     change_detection::DetectChangesMut,
     entity::{ContainsEntity, Entity, EntityHashMap},
     hierarchy::ChildOf,
     prelude::{Component, With},
+    query::Has,
     query::{QueryData, Without},
     reflect::ReflectComponent,
     system::{Local, Query, Res},

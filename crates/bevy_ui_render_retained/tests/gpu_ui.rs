@@ -6076,13 +6076,13 @@ fn a_fills_target_camera_lays_its_interface_over_the_whole_target() {
 
             let pixels = Arc::new(Mutex::new(None));
             let observer_pixels = Arc::clone(&pixels);
-            app.world_mut()
-                .spawn(Readback::texture(image))
-                .observe(move |event: On<ReadbackComplete>| {
+            app.world_mut().spawn(Readback::texture(image)).observe(
+                move |event: On<ReadbackComplete>| {
                     *observer_pixels
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
-                });
+                },
+            );
             app.finish();
             app.cleanup();
             for _ in 0..20 {
