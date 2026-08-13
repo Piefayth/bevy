@@ -358,6 +358,57 @@ pub fn need_surface_configuration(
 // has to wait for the cpu to finish to start on the next frame.
 const DEFAULT_DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 2;
 
+/// VENDORED ADDITION (iOS): run `f` on the OS main thread, synchronously,
+/// and hand back its result. Inline when this already IS the main thread.
+///
+/// Exists for exactly one caller: surface creation from a `UIView` handle,
+/// which UIKit requires to happen on the main thread while the app (and
+/// therefore this system, via `NonSendMarker`) may be driven by a dedicated
+/// frame thread. Deadlock note: safe so long as the main thread never
+/// blocks indefinitely on the frame thread — the game's pause handshake is
+/// deliberately time-bounded for this reason.
+#[cfg(target_os = "ios")]
+fn ios_main_thread_scoped<R, F: FnOnce() -> R>(f: F) -> R {
+    unsafe extern "C" {
+        fn pthread_main_np() -> core::ffi::c_int;
+        fn dispatch_sync_f(
+            queue: *mut core::ffi::c_void,
+            context: *mut core::ffi::c_void,
+            work: extern "C" fn(*mut core::ffi::c_void),
+        );
+        /// `dispatch_get_main_queue()` is a C macro over the address of
+        /// this libdispatch static.
+        static _dispatch_main_q: core::ffi::c_void;
+    }
+    if unsafe { pthread_main_np() } != 0 {
+        return f();
+    }
+    struct Cell<F, R>(Option<F>, Option<R>);
+    extern "C" fn run<F: FnOnce() -> R, R>(ctx: *mut core::ffi::c_void) {
+        // SAFETY: `ctx` is the `&mut cell` below, alive for the whole call —
+        // the dispatching thread is blocked until this returns.
+        let cell = unsafe { &mut *ctx.cast::<Cell<F, R>>() };
+        let f = cell.0.take().expect("dispatch_sync runs its work exactly once");
+        cell.1 = Some(f());
+    }
+    let mut cell = Cell::<F, R>(Some(f), None);
+    // SAFETY: `dispatch_sync_f` blocks this thread until `run` completes on
+    // the main queue, so the closure and its captures are BORROWED across
+    // the call, never shared concurrently — the same discipline as
+    // `std::thread::scope`, without the `Send` bound. The non-`Send`
+    // captures are raw UIKit/window pointers whose thread affinity is TO
+    // the main thread; moving their use there is the entire point.
+    unsafe {
+        dispatch_sync_f(
+            (&raw const _dispatch_main_q).cast_mut(),
+            (&raw mut cell).cast(),
+            run::<F, R>,
+        );
+    }
+    cell.1
+        .expect("dispatch_sync_f returned without running its work fn")
+}
+
 /// Creates window surfaces.
 pub fn create_surfaces(
     // By accessing a NonSend resource, we tell the scheduler to put this system on the main thread,
@@ -379,6 +430,22 @@ pub fn create_surfaces(
                     raw_window_handle: window.handle.get_window_handle(),
                 };
                 // SAFETY: The window handles in ExtractedWindows will always be valid objects to create surfaces on
+                // VENDORED CHANGE (iOS): this system's NonSendMarker pins it to
+                // whichever thread DRIVES the app — with the app driven by a
+                // dedicated frame thread (mobile-client), that is not the OS
+                // main thread, and wgpu's UiKit path (raw-window-metal
+                // `from_ui_view`) asserts the OS main thread because reading
+                // `view.layer` is a UIKit call. Creation is a one-time event
+                // per window: hop exactly this wgpu call onto the main queue,
+                // synchronously. On the OS main thread already (winit-driven
+                // apps, simulators), it runs inline — byte-identical behavior.
+                #[cfg(target_os = "ios")]
+                let surface = ios_main_thread_scoped(|| unsafe {
+                    render_instance
+                        .create_surface_unsafe(surface_target)
+                        .expect("Failed to create wgpu surface")
+                });
+                #[cfg(not(target_os = "ios"))]
                 let surface = unsafe {
                     // NOTE: On some OSes this MUST be called from the main thread.
                     // As of wgpu 0.15, only fallible if the given window is a HTML canvas and obtaining a WebGPU or WebGL2 context fails.

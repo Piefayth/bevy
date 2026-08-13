@@ -376,8 +376,17 @@ impl Plugin for RenderPlugin {
             GpuReadbackPlugin::default(),
             OcclusionCullingPlugin,
             SparseBufferPlugin,
-            #[cfg(feature = "tracing-tracy")]
-            diagnostic::RenderDiagnosticsPlugin,
+            // VENDORED CHANGE (skycutter): upstream auto-adds
+            // `RenderDiagnosticsPlugin` whenever `tracing-tracy` is on —
+            // silently overriding this game's explicit ban on it. Its
+            // per-frame GPU timestamp readback was THE original on-device
+            // flicker cause, and every tracy build since re-imported it:
+            // command buffers dying of Insufficient Memory (439 in one
+            // 6.5s Metal trace) on tracy builds only, "regardless of
+            // whether tracy is recording" — because the plugin rides the
+            // FEATURE, not the connection. Tracy on this game profiles
+            // the CPU; anything GPU-side goes through Metal System Trace,
+            // which measures without moving the patient.
         ));
 
         let (sender, receiver) = bevy_time::create_time_channels();

@@ -147,6 +147,26 @@ impl Plugin for PipelinedRenderingPlugin {
         ));
 
         std::thread::spawn(move || {
+            // VENDORED ADDITION (iOS): this thread is the second half of
+            // every frame — at default QoS the scheduler may park it on
+            // an E-core or preempt it under UIKit load, adding multi-ms
+            // render-duration variance that swings presents across their
+            // vsync boundary. Classify it as what it is: the same
+            // USER_INTERACTIVE class the game's frame thread runs at.
+            #[cfg(target_os = "ios")]
+            {
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: u32,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                // qos_class_t QOS_CLASS_USER_INTERACTIVE
+                const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+                unsafe {
+                    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+                }
+            }
             #[cfg(feature = "trace")]
             let _span = bevy_log::info_span!("render thread").entered();
 
