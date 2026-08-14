@@ -6110,3 +6110,242 @@ fn a_fills_target_camera_lays_its_interface_over_the_whole_target() {
         }
     });
 }
+
+/// A repaint boundary that MOVES (layout reflow after a sibling despawns)
+/// must reposition its cached surface without billing any repair: the
+/// survivors' content is byte-identical, only placement changed. This is
+/// the contract a toast rack leans on — an expiring toast reflows the
+/// stack every few seconds, and if reposition billed paint, every reflow
+/// would re-shade whatever heavy materials sit under the rack.
+#[test]
+#[ignore = "FORK GAP: boundary placement is cached-content but not \
+compositor-free — a layout reflow repositions correctly (both pixel \
+asserts pass) yet bills one cached-blit repair per survivor in the parent \
+layer. Remove this ignore for the red repro of true placement independence."]
+fn a_boundary_reflow_repositions_without_repair() {
+    with_gpu_lock(|| {
+        let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
+            | TextureUsages::RENDER_ATTACHMENT;
+        let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                Camera {
+                    clear_color: ClearColorConfig::Custom(Color::BLACK),
+                    ..default()
+                },
+                RenderTarget::Image(image.clone().into()),
+            ))
+            .id();
+
+        // A column rack of three boundary "toasts", distinct colors.
+        let world = app.world_mut();
+        let rack = world
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(4),
+                    top: px(4),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(2),
+                    ..default()
+                },
+                bevy::ui::UiTargetCamera(camera),
+            ))
+            .id();
+        let mut toasts = Vec::new();
+        for (r, g, b) in [(255, 0, 0), (0, 255, 0), (0, 0, 255)] {
+            toasts.push(
+                world
+                    .spawn((
+                        RepaintBoundary::IDENTITY,
+                        Node {
+                            width: px(24),
+                            height: px(10),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb_u8(r, g, b)),
+                        ChildOf(rack),
+                    ))
+                    .id(),
+            );
+        }
+
+        let pixels = Arc::new(Mutex::new(None));
+        let observer_pixels = Arc::clone(&pixels);
+        app.world_mut()
+            .spawn(Readback::texture(image))
+            .observe(move |event: On<ReadbackComplete>| {
+                *observer_pixels
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
+            });
+        app.finish();
+        app.cleanup();
+        for _ in 0..20 {
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        // Baseline: red at row 0, green at row 1 (rows at y=4.. and y=16..).
+        let at = |f: &Vec<u8>, x: u32, y: u32| {
+            let i = ((y * WIDTH + x) * BYTES_PER_PIXEL as u32) as usize;
+            [f[i], f[i + 1], f[i + 2]]
+        };
+        assert_eq!(at(&frame, 8, 8), [255, 0, 0], "baseline row 0 is red");
+        assert_eq!(at(&frame, 8, 20), [0, 255, 0], "baseline row 1 is green");
+        let before = layer_work(&app).expect("layer counters");
+
+        // The oldest toast expires; the rack reflows.
+        app.world_mut().entity_mut(toasts[0]).despawn();
+        for _ in 0..6 {
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        let after = layer_work(&app).expect("layer counters");
+
+        // The survivors moved up (green now in row-0 position)...
+        assert_eq!(
+            at(&frame, 8, 8),
+            [0, 255, 0],
+            "after the reflow the green toast should occupy the first slot"
+        );
+        assert_eq!(
+            at(&frame, 8, 20),
+            [0, 0, 255],
+            "and blue the second"
+        );
+        // ...and the move billed NO repair: cached surfaces recomposited
+        // at new offsets, no pixels repainted.
+        assert_eq!(
+            after.repair_pixels, before.repair_pixels,
+            "a boundary reflow must not repaint pixels (repairs {} -> {}, \
+             repair_pixels {} -> {})",
+            before.repairs, after.repairs, before.repair_pixels, after.repair_pixels
+        );
+    });
+}
+
+/// Animating a boundary's OWN transform (the compositor-placement lane)
+/// must bill zero repair across every frame of the motion — this is the
+/// slide-in a toast rides, and the whole point of driving it through the
+/// boundary instead of layout.
+#[test]
+#[ignore = "FORK GAP: animating RepaintBoundary.transform repositions \
+correctly but bills a quad-area cached-blit repair in the parent layer \
+EVERY moved frame (repairs +1/frame). The blit is cheap (no content \
+shaders re-run) so islands still pay off — but placement should cost \
+zero. Remove this ignore for the red repro."]
+fn a_boundary_transform_slide_bills_no_repair() {
+    with_gpu_lock(|| {
+        let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
+            | TextureUsages::RENDER_ATTACHMENT;
+        let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                Camera {
+                    clear_color: ClearColorConfig::Custom(Color::BLACK),
+                    ..default()
+                },
+                RenderTarget::Image(image.clone().into()),
+            ))
+            .id();
+        let world = app.world_mut();
+        let toast = world
+            .spawn((
+                RepaintBoundary::IDENTITY,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(4),
+                    top: px(4),
+                    width: px(20),
+                    height: px(10),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb_u8(255, 0, 0)),
+                bevy::ui::UiTargetCamera(camera),
+            ))
+            .id();
+
+        let pixels = Arc::new(Mutex::new(None));
+        let observer_pixels = Arc::clone(&pixels);
+        app.world_mut()
+            .spawn(Readback::texture(image))
+            .observe(move |event: On<ReadbackComplete>| {
+                *observer_pixels
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
+            });
+        app.finish();
+        app.cleanup();
+        for _ in 0..20 {
+            step_and_wait(&mut app);
+        }
+        capture_fresh(&mut app, &pixels);
+        let before = layer_work(&app).expect("layer counters");
+
+        // Slide 24px right, 2px per frame — every frame is a move.
+        for step in 1..=12 {
+            app.world_mut()
+                .entity_mut(toast)
+                .get_mut::<RepaintBoundary>()
+                .unwrap()
+                .transform = bevy::ui::UiTransform::from_translation(
+                bevy::ui::Val2::px(step as f32 * 2.0, 0.0),
+            );
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        let after = layer_work(&app).expect("layer counters");
+
+        let at = |f: &Vec<u8>, x: u32, y: u32| {
+            let i = ((y * WIDTH + x) * BYTES_PER_PIXEL as u32) as usize;
+            [f[i], f[i + 1], f[i + 2]]
+        };
+        // It moved: the old spot is bare, the slid-to spot is red.
+        assert_eq!(at(&frame, 6, 8), [0, 0, 0], "the origin should be vacated");
+        assert_eq!(
+            at(&frame, 30, 8),
+            [255, 0, 0],
+            "the toast should sit 24px right of where it started"
+        );
+        assert_eq!(
+            after.repair_pixels, before.repair_pixels,
+            "a transform slide must not repaint pixels (repairs {} -> {}, \
+             repair_pixels {} -> {})",
+            before.repairs, after.repairs, before.repair_pixels, after.repair_pixels
+        );
+    });
+}
