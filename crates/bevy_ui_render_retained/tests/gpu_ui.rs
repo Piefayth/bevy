@@ -6786,13 +6786,6 @@ fn a_boundary_stowed_offscreen_appears_when_slid_in() {
 /// appears; the minimal stowed case above passes — this test carries
 /// the extra ingredients to find the discriminator.
 #[test]
-#[ignore = "FORK DEFECT: a RetainedUiMaterial child INSIDE a boundary that \
-wakes from stowed (coverage empty at birth) suppresses the boundary's \
-ENTIRE surface content — the cart body never paints. Bisected: cart body \
-paints fine without the material child (coverage-wake fix); \
-mark_pending_materials never fires (probed empty), so the pending path is \
-innocent. Game symptom: notice carts with their Screened material never \
-appear. Remove this ignore for the red repro."]
 fn a_mid_run_stowed_cart_with_material_child_appears() {
     with_gpu_lock(|| {
         let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
