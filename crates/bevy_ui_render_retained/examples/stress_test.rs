@@ -91,6 +91,7 @@ struct Config {
     workload: Workload,
     nodes: usize,
     layout_group: Option<usize>,
+    repaint_boundaries: bool,
     frames: Option<u32>,
     warmup_frames: u32,
 }
@@ -104,6 +105,7 @@ impl Default for Config {
             workload: Workload::Quiet,
             nodes: 10_000,
             layout_group: None,
+            repaint_boundaries: false,
             frames: None,
             warmup_frames: 120,
         }
@@ -166,6 +168,7 @@ impl Config {
                     config.layout_group =
                         Some(value().parse().expect("--layout-group must be an integer"));
                 }
+                "--repaint-boundaries" => config.repaint_boundaries = true,
                 "--frames" => {
                     config.frames = Some(value().parse().expect("--frames must be an integer"));
                 }
@@ -178,7 +181,7 @@ impl Config {
                          --family background|text|image|effects|mixed \
                          --workload quiet|one-paint|all-paint|one-placement|all-placement|\
                          one-layout|all-layout|one-boundary-placement|all-boundary-placement|\
-                         one-churn --nodes N [--layout-group N] [--frames N] \
+                         one-churn --nodes N [--layout-group N] [--repaint-boundaries] [--frames N] \
                          [--warmup N]"
                     );
                     std::process::exit(0);
@@ -192,6 +195,10 @@ impl Config {
             "--layout-group must be nonzero"
         );
         assert!(
+            !config.repaint_boundaries || config.layout_group.is_some(),
+            "--repaint-boundaries requires --layout-group"
+        );
+        assert!(
             config
                 .frames
                 .is_none_or(|frames| frames > config.warmup_frames),
@@ -201,8 +208,8 @@ impl Config {
             !matches!(
                 config.workload,
                 Workload::OneBoundaryPlacement | Workload::AllBoundaryPlacement
-            ) || config.layout_group.is_some(),
-            "boundary placement workloads require --layout-group"
+            ) || (config.layout_group.is_some() && config.repaint_boundaries),
+            "boundary placement workloads require --layout-group and --repaint-boundaries"
         );
         assert!(
             !matches!(
@@ -346,6 +353,7 @@ fn setup(mut commands: Commands, config: Res<Config>, mut images: ResMut<Assets<
         config.workload,
         Workload::OneBoundaryPlacement | Workload::AllBoundaryPlacement
     );
+    let island_topology = boundary_workload || config.repaint_boundaries;
     let group_size = config.layout_group.unwrap_or(config.nodes);
     let group_columns = (group_size as f32).sqrt().ceil() as usize;
     let group_count = config.nodes.div_ceil(group_size);
@@ -364,22 +372,22 @@ fn setup(mut commands: Commands, config: Res<Config>, mut images: ResMut<Assets<
             let mut boundary = commands.spawn((
                 Node {
                     position_type: PositionType::Absolute,
-                    left: if boundary_workload {
+                    left: if island_topology {
                         px((group % boundary_columns * group_columns) as f32 * 7.0)
                     } else {
                         px(0)
                     },
-                    top: if boundary_workload {
+                    top: if island_topology {
                         px((group / boundary_columns * group_columns) as f32 * 7.0)
                     } else {
                         px(0)
                     },
-                    width: if boundary_workload {
+                    width: if island_topology {
                         px(group_columns as f32 * 7.0)
                     } else {
                         percent(100)
                     },
-                    height: if boundary_workload {
+                    height: if island_topology {
                         px(rows as f32 * 7.0)
                     } else {
                         percent(100)
@@ -389,19 +397,14 @@ fn setup(mut commands: Commands, config: Res<Config>, mut images: ResMut<Assets<
                 LayoutContainment,
                 ChildOf(root),
             ));
-            if config.renderer == Renderer::Retained
-                && matches!(
-                    config.workload,
-                    Workload::OneBoundaryPlacement | Workload::AllBoundaryPlacement
-                )
-            {
+            if config.renderer == Renderer::Retained && config.repaint_boundaries {
                 boundary.insert(RepaintBoundary::default());
             }
             parent = boundary.id();
             boundaries.push(parent);
         }
         let family = config.family.item(index);
-        let item_index = if boundary_workload {
+        let item_index = if island_topology {
             index % group_size
         } else {
             index
@@ -412,7 +415,7 @@ fn setup(mut commands: Commands, config: Res<Config>, mut images: ResMut<Assets<
             family,
             config.geometry,
             item_index,
-            if boundary_workload {
+            if island_topology {
                 group_columns
             } else {
                 columns

@@ -52,7 +52,8 @@ system set and gives the shared gradient shader a public import path. The
 replacement can therefore install persistent node preparation and reuse Bevy's
 gradient functions without keeping an unused transient upload. Repaint
 boundaries also propagate a generic `ComputedUiPaintTarget`; the stock generic
-`UiMaterial` extractor honors it and records immediate-mode target volatility.
+`UiMaterial` extractor honors it, localizes transform and clip into that
+target's coordinate space, and records immediate-mode target volatility.
 That small cross-crate hook is necessary because an arbitrary material plugin is
 monomorphized outside the replacement crate: without it, a material below a
 boundary would queue onto the camera phase and bypass the cached surface.
@@ -594,16 +595,117 @@ portable platform partial-present behavior cannot currently be promised.
 A general subtree repaint boundary cannot be implemented by cutting a hole in
 one cached parent texture and compositing the subtree afterward. A later sibling
 may paint above the boundary; flattening all non-boundary paint into one texture
-loses the ordering point at which the boundary layer must be inserted.
+loses the ordering point at which the boundary layer must be inserted. A
+topmost-only compositor is therefore not the general primitive and is rejected.
 
-The implemented representation is a compositor display list alternating paint
-runs with boundary-surface records at their exact `ComputedStackIndex`. A
-boundary owns a tightly sized double-buffered texture. Its subtree rasterizes in
-global physical coordinates through a synthetic UI view whose projection maps
-the boundary box to that texture. The parent replays the boundary texture at the
-same ordering point as the replaced subtree. Nested boundaries repair deepest
-first and recurse through the same representation; every boundary is an atomic
-stacking context.
+The implemented representation is an ordered retained compositor. A parent
+containing declared boundaries stores each nonempty contiguous ordinary-paint
+run between boundaries in a tightly bounded retained source, and alternates
+those sources with boundary sources in exact paint order. It damage-composes
+that list into one flat presentation surface. This gives the required
+contracts:
+
+- a parent with no boundary collapses to the existing single retained surface;
+- a quiet parent executes no paint or compositor pass and presents one cached
+  texture, independent of its historical boundary count;
+- boundary placement changes rasterize no paint record and compose only the
+  exact old/new output damage from cached sources;
+- arbitrary sibling interleaving and nested atomic stacking contexts remain
+  exact.
+
+The boundary source has its own paint-local translation and stack origin.
+Reflow that uniformly moves or renumbers the subtree therefore changes only the
+parent composite record; surviving source pixels and their local order remain
+unchanged. A three-toast removal/reflow proof moves both survivors, erases the
+departed source, and rasterizes zero paint.
+
+Ordinary run surfaces keep a stable physical coordinate space. If paint moves
+past a run's old crop, the allocation grows to enclose the new coverage, copies
+the shared old pixels into both replacement slots, and repairs only the paint's
+exact old/new damage. It neither clips the move nor rerasterizes an unchanged
+sibling. Run allocations never shrink while their ordered run survives, so the
+cost is explicit and bounded by the parent target. `resize_copy_pixels` reports
+the two-slot copy separately from paint.
+
+The parent display list has one persistent exact spatial index. A changed
+parent queries it for currently intersecting groups, unions directly changed
+groups in an O(changes) hash set, and sorts only the selected compositor
+entries back into display-list order. It does not allocate or clear an array
+sized to all historical entries. Composition writes an exact R8 damage mask and
+draws each selected cached source once through that mask; disjoint repair
+regions therefore do not create a regions-times-sources loop. Moving one item
+in a 64-boundary grid selects one source, not 64; a quiet grid performs no paint,
+candidate planning, or composition.
+
+Empty paint runs do not allocate textures. A parent with ordinary paint both
+below and above a boundary pays exactly two additional tightly bounded run
+surfaces. The memory tax is explicit: two RGBA textures plus one R8 damage mask,
+nine bytes per pixel of each run's rectangular allocation, in addition to the
+parent presentation and boundary surfaces.
+
+Immediate-mode third-party paint has no retained identity, coverage, or stable
+ordering contract, so it cannot be placed in an ordered cached run. A target
+containing such paint uses the same flat retained-surface representation as a
+target without boundaries while that paint exists. It remains volatile and
+fully correct; boundary placement on that target is not compositor-only. When
+the last volatile writer disappears, its old coverage is invalidated and the
+target atomically returns to ordered sources. Implementing
+`RetainedUiMaterial` supplies the missing contract and keeps ordered
+composition active. GPU tests cover both the coexistence and departure
+transitions.
+
+Paint routed into a boundary must also use the boundary's local coordinate
+space. Stock `UiMaterial` extraction now derives that space from the declared
+paint target and localizes both its transform and clip. The ordered compositor
+exposed the previous mismatch because the baked path happened to draw the
+global transform into its parent. The nested unretained-material test proves
+the local target contract independently of retention support.
+
+The flat presentation cache is deliberate. Replaying every source directly
+into the window would avoid updating that cache during motion, but would make a
+static UI pay one draw per source forever. Conversely, arbitrary interleaving
+cannot be reconstructed from one flat ordinary-paint texture. Ordered retained
+sources plus damage composition are the only representation here that keeps
+both arbitrary order and the one-texture quiet path.
+
+### Does ordered-source management pay for itself?
+
+It is not free, and the boundary count is intentionally an API-level resource
+decision rather than an inferred promotion heuristic. With `B` declared
+boundaries, the renderer owns `B` boundary surfaces plus at most `B + 1`
+ordinary runs, their canonical boundary records, and ECS change-detection
+scans. A boundary should therefore describe a stable subtree whose placement
+can move independently, not decorate every leaf.
+
+The steady and changed contracts are different:
+
+- without a boundary, none of the ordered-source structures or passes exist;
+- with quiet boundaries, extraction still pays Bevy's `Changed<T>` archetype
+  scans, but the render world performs no candidate plan, paint pass, or
+  composition pass;
+- one change queries the persistent display-list index, stores only actual
+  hits/direct changes, sorts only those hits, and submits every selected source
+  once through the damage mask;
+- source allocation and payload bytes, exact resize copies, paint pixels,
+  composition pixels, admitted source-scissor pixels, and unique source
+  submissions have separate counters.
+
+The stress executable accepts `--layout-group 1 --repaint-boundaries`, so the
+deliberately excessive case of 10,000 one-node boundaries is reproducible
+beside the intended 10/100/1,000-node subtree sizes. An unoptimized diagnostic
+run on 2026-08-14 found that moving one boundary added about 0.08 ms over the
+otherwise identical quiet 10,000-boundary topology, while the topology itself
+was very expensive in debug builds. That number is not an optimized baseline;
+it is evidence that the changed planner no longer walks or clears all 10,000
+entries. The fresh optimized and physical-device sweeps remain required before
+choosing a product boundary granularity.
+
+"Zero paint" must not be reported as "zero output pixels." Moving a visible
+boundary changes the parent's old and new pixels, so those pixels must either be
+composed into the presentation cache or regenerated in the final output every
+frame. Counters and tests distinguish paint repairs from cached-source
+composition. The placement contract is zero extracted child paint, zero child
+raster, and exact old/new compositor damage; it is not zero GPU writes.
 
 Boundary content damage is mapped from source pixels through the boundary's
 affine UV transform into exact conservative parent rectangles. A scaled proof
@@ -695,8 +797,8 @@ allows it:
   full redraw, followed by an exact pixel comparison;
 - counters asserted by tests: entities extracted, paint records changed,
   canonical records staged, items and prepared quads replayed, damaged pixels,
-  surfaces repaired, retained texture bytes, fused composites, and physical UI
-  texture samples.
+  paint repairs, retained texture bytes, cached-source composition, final
+  presentations, and physical UI texture samples.
 
 Every regression test must first fail with the named defect reintroduced.
 The production GPU harness also builds both `ExtractSchedule` and `Render` with
@@ -718,8 +820,8 @@ The current matrix is exact about what it includes:
 | `Changed<T>` nomination | 100, 1,000, 10,000 entities | one archetype | quiet, one changed, all changed; one input and an eight-input `Or` | canonical extraction and rendering |
 | Main-world UI work | 100, 1,000, 10,000 nodes | flat, four-way balanced, 100-node independent roots, explicit containment groups of 10/100/1,000; a 256-deep chain | quiet, equal `Node` write, one/all layout, one local node-geometry change, one placement, one/all compositor-boundary placement, one change per layout boundary, all contained leaves; one reparent for the forest; 64 consecutive contained-layout frames | render extraction and GPU work |
 | Canonical paint and exact damage | 100, 1,000, 10,000 records | adjacent tiles, separated pixels, full overlap | quiet, one paint change, all paint changes; indexed intersection and area against 10,000 separated regions | Bevy extraction and rasterization |
-| GPU acceptance | small 64-by-64 scenes | disjoint and translucent overlap across every integrated family; arbitrary and nested repaint boundaries | quiet, targeted changes, compositor transform/opacity, boundary content animation, boundary removal | stable wall-clock timing |
-| Windowed stress executable | configurable, 10,000 by default | grid, full overlap, alternating overlap; background, text, image, gradients/shadows/borders, or mixed | quiet, one/all paint, one/all placement, one/all layout, one/all boundary placement, one churn | automated pass/fail timing thresholds |
+| GPU acceptance | small 64-by-64 scenes, including 64 independent boundaries | disjoint and translucent overlap across every integrated family; arbitrary and nested repaint boundaries; ordinary paint on both sides of a boundary | quiet, targeted run/content changes, run growth with preserved siblings, one-of-many compositor placement, transform/opacity, reflow, removal, immediate-mode fallback transitions | stable wall-clock timing |
+| Windowed stress executable | configurable, 10,000 by default | grid, full overlap, alternating overlap; background, text, image, gradients/shadows/borders, or mixed; optional independent repaint groups | quiet, one/all paint, one/all placement, one/all layout, one/all boundary placement, one churn | automated pass/fail timing thresholds |
 
 Layout topology and paint overlap are orthogonal inputs: overlap does not alter
 Taffy's dependency graph, so the layout Criterion cases do not duplicate every
@@ -733,7 +835,8 @@ exactly 10,000 candidates, and one remove/reinsert performs constant record
 work. Exact damage-index tests compare every indexed result with exhaustive
 intersection and area calculations, including a 10,000-region separated case.
 GPU tests separately assert staged records, records and quads replayed, damaged
-pixels, surface repairs, fused composites, and physical UI texture samples.
+pixels, paint repairs, cached-source composition, final presentations, and
+physical UI texture samples.
 Main-world counters prove that quiet and paint-only frames execute no Taffy,
 recursive geometry, stack, or clipping walk. Layout-scope unit tests assert exact Taffy
 computation and geometry-visit counts for multiple roots, nested containment,
@@ -784,7 +887,7 @@ are local end-to-end samples, not cross-device claims:
 | stock, 100 transforms each containing 100 nodes | 3.212 ms | 3.583 ms | 4.530 ms | 3 | 2 |
 | retained, 100 repaint boundaries each containing 100 nodes | 1.564 ms | 1.693 ms | 2.559 ms | 0 | 0 |
 
-The retained runs allocate each source surface once. Thereafter boundary motion
+The retained boundary sources allocate each surface once. Thereafter boundary motion
 changes only 1 or 100 parent display records per frame; none of the 10,000 child
 paint records are compared or rerasterized. The parent still repairs the exact
 old/new composite coverage and the final fused blit still samples the visible UI
@@ -1128,7 +1231,7 @@ early implementation emitted one texture-copy command per rectangle and the
 instance buffer wipes every current damage rectangle before repaint. Failed or
 not-yet-compiled work remains owed. On a quiet
 background-only frame, GPU counters prove zero additional repairs, repair
-pixels, and replayed items while composition continues. An equal component
+pixels, and replayed items while the final presentation sample continues. An equal component
 replacement nominates and compares exactly one record but changes zero records
 and causes zero repairs; a real color change repairs exactly that record's old
 and new physical coverage.
@@ -1188,9 +1291,11 @@ Run the same command with `--renderer stock` for the A/B. Geometry accepts
 `image`, `effects`, and `mixed`; workload accepts `quiet`, `one-paint`, `all-paint`,
 `one-placement`, `all-placement`, `one-layout`, `all-layout`,
 `one-boundary-placement`, `all-boundary-placement`, and `one-churn`. Boundary
-placement requires grid geometry plus `--layout-group`; retained mode moves
-`RepaintBoundary::transform`, while stock moves the equivalent group
-`UiTransform`.
+placement requires grid geometry plus `--layout-group` and
+`--repaint-boundaries`; retained mode moves `RepaintBoundary::transform`, while
+stock moves the equivalent group `UiTransform`. The repaint flag is independent
+of workload, so the same boundary topology can be measured while quiet, while
+one boundary moves, and while every boundary moves.
 Omitting `--layout-group` creates one coupled root; supplying a positive size
 partitions the nodes into explicit `LayoutContainment` widgets of that size.
 The 10/100/1,000 sweep used by Criterion can therefore be repeated on physical
@@ -1212,9 +1317,10 @@ the same command is the measurement instrument, while the acceptable budget is
 chosen for the game's target hardware and frame rate.
 
 The same development machine's fat-LTO `stress-test` Vulkan runs on 2026-08-12
-measure the current persistent-instance and exact-mask implementation. Every
-row contains 120 consecutive measured frames after 60 warmup frames and uses
-the same executable for stock and retained:
+measured the flat-parent implementation immediately before ordered source runs.
+They are retained as historical comparison data, not current compositor
+results. Every row contains 120 consecutive measured frames after 60 warmup
+frames and used the same executable for stock and retained:
 
 | 10,000-node end-to-end windowed workload | Stock | Retained |
 |---|---:|---:|
@@ -1234,7 +1340,8 @@ the same executable for stock and retained:
 | grid mixed, all 100 declared repaint boundaries move | 17.754 ms | 1.655 ms |
 
 The quiet, localized paint, contained layout, and declared-boundary placement
-retained rows had no frame at or above 4 ms. The overlapping one-change row is
+retained rows had no frame at or above 4 ms in that implementation. The
+overlapping one-change row is
 deliberately adversarial: one changed translucent node intersects all 10,000
 contributors, yet retained still wins because unchanged canonical preparation
 remains resident. Effect-heavy and mixed scenes also win under complete paint
@@ -1263,7 +1370,7 @@ layout containment bounds semantic layout coupling; repaint boundaries make
 stable-content placement compositor-only; genuinely global paint/layout pays
 for genuinely global work and remains reported rather than hidden.
 
-The mixed global-placement result illustrates the same API boundary. A node
+The historical mixed global-placement result illustrates the same API boundary. A node
 transform on one monolithic cached surface changes pixels, so every affected
 mixed-family record moves and repaints. The declared repaint-boundary case
 instead moves 100 cached chunks, changes zero child pixels, and measures 1.655
@@ -1315,15 +1422,21 @@ The external scope probes, serialized GPU harness, canonical paint records,
 persistent atomic surface, exact mask repair, old/new coverage, two-dimensional
 candidate index, sampled-image propagation, persistent prepared instances,
 main-world dirty domains, layout containment, fused final composition, and the
-runtime A/B stress matrix are implemented. The compositor display list and
-declared repaint-boundary API are also implemented with arbitrary sibling
-stacking, nesting, clips, post-flatten opacity, transform-only placement,
-hidden-subtree suspension, exact memory counters, sustained animation
-differentials, and placement benchmarks.
+runtime A/B stress matrix are implemented. The ordered retained compositor has
+executable proofs for arbitrary sibling stacking, nesting, clips, post-flatten
+opacity, hidden-subtree suspension, exact run memory accounting, sustained
+animation, cached child paint, reflow without surviving-source raster, one
+moving source among 64 static boundaries, coordinate-preserving run growth,
+one masked submission per selected source across disjoint damage, target-local
+stock material extraction, and immediate-mode material fallback and departure.
+A boundary-free target allocates no run source; an all-boundary target allocates
+no empty runs.
 
-The remaining validation increment is physical-device architecture and energy
-sweeps. Desktop Vulkan numbers cannot establish tile-memory traffic, Metal and
-mobile driver behavior, or battery impact.
+The remaining validation increment is a fresh optimized end-to-end sweep of the
+ordered implementation followed by physical-device architecture and energy
+sweeps. The 2026-08-12 timings above predate ordered sources. Desktop Vulkan
+numbers cannot establish tile-memory traffic, Metal and mobile driver behavior,
+or battery impact.
 
 Cleanup is part of every increment: superseded paths, flags, thresholds, and
 comments are removed before the next capability is added.

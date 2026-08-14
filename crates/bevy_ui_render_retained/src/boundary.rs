@@ -16,7 +16,7 @@ use bevy::{
         observer::On,
         query::{Changed, Or, With},
         reflect::ReflectComponent,
-        system::{Commands, Query, Res, ResMut},
+        system::{Commands, Local, Query, Res, ResMut},
     },
     math::{Mat4, Rect, UVec2, UVec4, Vec2},
     platform::collections::{HashMap, HashSet},
@@ -289,13 +289,8 @@ pub(crate) fn extract_boundaries(
             surfaces.remove(&mut commands, boundary_id(entity));
             continue;
         };
-        let rect = Rect::from_center_size(transform.translation, node.size());
-        let Some(rect) = PhysicalRect::from_min_max(
-            rect.min.x.floor() as i32,
-            rect.min.y.floor() as i32,
-            rect.max.x.ceil() as i32,
-            rect.max.y.ceil() as i32,
-        ) else {
+        let size = node.size().ceil().as_ivec2();
+        let Some(rect) = PhysicalRect::from_min_max(0, 0, size.x, size.y) else {
             views.remove_surface(surface.id());
             surfaces.remove(&mut commands, boundary_id(entity));
             continue;
@@ -307,24 +302,27 @@ pub(crate) fn extract_boundaries(
         let source_main = target
             .get()
             .expect("a mapped UI target camera must have a main-world entity");
+        if let Some(target_bounds) = PhysicalRect::from_min_max(
+            0,
+            0,
+            target_info.physical_size().x as i32,
+            target_info.physical_size().y as i32,
+        ) {
+            surfaces.set_target_bounds(source_camera, target_bounds);
+        }
         let anti_alias = cameras.get(source_main).ok().flatten().copied();
         let size = Vec2::new(
             (rect.max_x() - rect.min_x()) as f32,
             (rect.max_y() - rect.min_y()) as f32,
         );
         let node_center = transform.translation;
-        let surface_center = Vec2::new(
-            (rect.min_x() + rect.max_x()) as f32 * 0.5,
-            (rect.min_y() + rect.max_y()) as f32 * 0.5,
-        );
+        surfaces.set_surface_space(surface.id(), node_center - size * 0.5, stack.0 as f32, rect);
         let placement = boundary.transform.compute_affine(
             target_info.scale_factor(),
             node.size(),
             target_info.physical_size().as_vec2(),
         );
-        let composite_transform = Affine2::from_translation(node_center)
-            * placement
-            * Affine2::from_translation(surface_center - node_center);
+        let composite_transform = Affine2::from_translation(node_center) * placement;
         let composite_clip = clip.map(|clip| {
             if parent_owner.is_some() {
                 clip.paint_clip
@@ -457,7 +455,9 @@ pub(crate) fn invalidate_volatile_paint_targets(
     scene: Res<RetainedUiScene>,
     views: Res<BoundaryViews>,
     volatile: Res<VolatileUiPaintTargets>,
+    mut previous: Local<HashMap<Entity, PhysicalRect>>,
 ) {
+    let mut current = HashMap::new();
     for (target, size) in volatile.targets() {
         let coverage = views
             .views
@@ -466,8 +466,15 @@ pub(crate) fn invalidate_volatile_paint_targets(
             .or_else(|| PhysicalRect::from_min_max(0, 0, size.x as i32, size.y as i32));
         if let Some(coverage) = coverage {
             scene.invalidate_volatile(target, coverage);
+            current.insert(target, coverage);
         }
     }
+    for (target, coverage) in previous.drain() {
+        if !current.contains_key(&target) {
+            scene.invalidate_departed_volatile(target, coverage);
+        }
+    }
+    *previous = current;
 }
 
 pub(crate) fn propagate_boundary_damage(scene: Res<RetainedUiScene>, views: Res<BoundaryViews>) {

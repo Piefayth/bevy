@@ -130,11 +130,18 @@ fn paint_work(app: &App) -> Option<WorkCounters> {
         .map(RetainedUiPaintCounters::snapshot)
 }
 
-fn assert_no_layer_repair(before: RetainedUiLayerWork, after: RetainedUiLayerWork) {
-    assert_eq!(after.repairs, before.repairs);
-    assert_eq!(after.repair_pixels, before.repair_pixels);
-    assert_eq!(after.items_replayed, before.items_replayed);
-    assert_eq!(after.quads_replayed, before.quads_replayed);
+fn assert_no_surface_work(before: RetainedUiLayerWork, after: RetainedUiLayerWork) {
+    assert_eq!(after.paint_repairs, before.paint_repairs);
+    assert_eq!(after.paint_pixels, before.paint_pixels);
+    assert_eq!(after.paint_items, before.paint_items);
+    assert_eq!(after.paint_quads, before.paint_quads);
+    assert_eq!(after.composition_repairs, before.composition_repairs);
+    assert_eq!(after.composition_pixels, before.composition_pixels);
+    assert_eq!(
+        after.composition_scissor_pixels,
+        before.composition_scissor_pixels
+    );
+    assert_eq!(after.composition_sources, before.composition_sources);
 }
 
 fn render_scene<S>(
@@ -665,20 +672,22 @@ fn identity_repaint_boundary_matches_direct_rasterization() {
     });
 }
 
-fn spawn_ordered_boundary_scene(world: &mut World, camera: Entity, retained: bool) {
+fn spawn_ordered_boundary_scene(world: &mut World, camera: Entity, retained: bool) -> Entity {
     let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
-    world.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(7),
-            top: px(9),
-            width: px(30),
-            height: px(28),
-            ..default()
-        },
-        BackgroundColor(Color::srgba_u8(235, 180, 30, 170)),
-        ChildOf(root),
-    ));
+    let below = world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(7),
+                top: px(9),
+                width: px(30),
+                height: px(28),
+                ..default()
+            },
+            BackgroundColor(Color::srgba_u8(235, 180, 30, 170)),
+            ChildOf(root),
+        ))
+        .id();
     let mut boundary = world.spawn((
         Node {
             position_type: PositionType::Absolute,
@@ -719,6 +728,7 @@ fn spawn_ordered_boundary_scene(world: &mut World, camera: Entity, retained: boo
         BackgroundColor(Color::srgba_u8(45, 95, 225, 175)),
         ChildOf(root),
     ));
+    below
 }
 
 #[test]
@@ -737,6 +747,134 @@ fn repaint_boundary_preserves_arbitrary_sibling_paint_order() {
             |_, _| {},
         );
         assert_pixels_within(&retained.pixels, &stock.pixels, 1);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_no_surface_work(before, after);
+        assert_eq!(after.surfaces_created, 4);
+        assert_eq!(
+            after.surface_bytes,
+            u64::from(WIDTH * HEIGHT + WIDTH * HEIGHT + 34 * 31 + 27 * 25) * 9
+        );
+    });
+}
+
+#[test]
+fn changing_one_ordered_paint_run_repairs_only_that_run() {
+    with_gpu_lock(|| {
+        let mutate = |world: &mut World, below: Entity| {
+            world.get_mut::<BackgroundColor>(below).unwrap().0 = Color::srgba_u8(120, 225, 45, 170);
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_ordered_boundary_scene(world, camera, false),
+            mutate,
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_ordered_boundary_scene(world, camera, true),
+            mutate,
+        );
+        assert_pixels_within(&retained.pixels, &stock.pixels, 1);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.paint_repairs - before.paint_repairs, 1);
+        assert_eq!(after.paint_pixels - before.paint_pixels, 30 * 28);
+        assert_eq!(after.paint_items - before.paint_items, 2);
+        assert_eq!(after.paint_quads - before.paint_quads, 2);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 1);
+        assert_eq!(
+            after.composition_pixels - before.composition_pixels,
+            30 * 28
+        );
+        assert_eq!(after.composition_sources - before.composition_sources, 3);
+    });
+}
+
+fn spawn_moving_ordered_paint_scene(world: &mut World, camera: Entity, retained: bool) -> Entity {
+    let root = spawn_full_background(world, camera, Color::srgb_u8(18, 32, 76));
+    let mut boundary = world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(4),
+            top: px(4),
+            width: px(12),
+            height: px(12),
+            ..default()
+        },
+        BackgroundColor(Color::srgb_u8(220, 40, 30)),
+        ChildOf(root),
+    ));
+    if retained {
+        boundary.insert(RepaintBoundary::IDENTITY);
+    }
+    world.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(32),
+            top: px(20),
+            width: px(6),
+            height: px(10),
+            ..default()
+        },
+        BackgroundColor(Color::srgb_u8(35, 80, 220)),
+        ChildOf(root),
+    ));
+    world
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(20),
+                top: px(20),
+                width: px(10),
+                height: px(10),
+                ..default()
+            },
+            BackgroundColor(Color::srgb_u8(30, 210, 80)),
+            ChildOf(root),
+        ))
+        .id()
+}
+
+#[test]
+fn ordered_paint_run_grows_without_clipping_moving_content() {
+    with_gpu_lock(|| {
+        let mutate = |world: &mut World, moving: Entity| {
+            world.get_mut::<Node>(moving).unwrap().left = px(42);
+        };
+        let stock = render_scene(
+            UiRenderer::Stock,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_moving_ordered_paint_scene(world, camera, false),
+            mutate,
+        );
+        let retained = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            |world, camera| spawn_moving_ordered_paint_scene(world, camera, true),
+            mutate,
+        );
+        assert_pixels_within(&retained.pixels, &stock.pixels, 1);
+        let before = retained.before_mutation.unwrap();
+        let after = retained.after_mutation.unwrap();
+        assert_eq!(after.surfaces_created - before.surfaces_created, 1);
+        assert_eq!(
+            after.resize_copy_pixels - before.resize_copy_pixels,
+            2 * 18 * 10
+        );
+        assert_eq!(after.paint_repairs - before.paint_repairs, 1);
+        assert_eq!(after.paint_pixels - before.paint_pixels, 2 * 10 * 10);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 1);
+        assert_eq!(
+            after.composition_pixels - before.composition_pixels,
+            2 * 10 * 10
+        );
+        assert_eq!(
+            after.composition_scissor_pixels - before.composition_scissor_pixels,
+            32 * 10 + 10 * 10
+        );
+        assert_eq!(after.composition_sources - before.composition_sources, 2);
     });
 }
 
@@ -980,7 +1118,7 @@ fn spawn_moving_boundary_scene(
 }
 
 #[test]
-fn boundary_translation_repairs_only_the_parent_surface() {
+fn boundary_translation_rasterizes_nothing_and_composes_exact_output_damage() {
     with_gpu_lock(|| {
         let final_translation = Val2::px(18, 0);
         let direct = render_scene(
@@ -1009,10 +1147,16 @@ fn boundary_translation_repairs_only_the_parent_surface() {
         let after = moved.after_mutation.unwrap();
         assert_eq!(after.surfaces_created, before.surfaces_created);
         assert_eq!(after.surface_bytes, before.surface_bytes);
-        assert_eq!(after.repairs - before.repairs, 1);
-        assert_eq!(after.repair_pixels - before.repair_pixels, 46 * 24);
-        assert_eq!(after.items_replayed - before.items_replayed, 2);
-        assert_eq!(after.quads_replayed - before.quads_replayed, 2);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
+        assert_eq!(after.paint_items, before.paint_items);
+        assert_eq!(after.paint_quads, before.paint_quads);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 1);
+        assert_eq!(
+            after.composition_pixels - before.composition_pixels,
+            46 * 24
+        );
+        assert_eq!(after.composition_sources - before.composition_sources, 2);
 
         let paint_before = moved.paint_before_mutation.unwrap();
         let paint_after = moved.paint_after_mutation.unwrap();
@@ -1025,7 +1169,7 @@ fn boundary_translation_repairs_only_the_parent_surface() {
 }
 
 #[test]
-fn boundary_opacity_repairs_only_the_parent_surface() {
+fn boundary_opacity_rasterizes_nothing_and_composes_exact_output_damage() {
     with_gpu_lock(|| {
         let output = render_scene(
             UiRenderer::Retained,
@@ -1060,10 +1204,20 @@ fn boundary_opacity_repairs_only_the_parent_surface() {
         let after = output.after_mutation.unwrap();
         assert_eq!(after.surfaces_created, before.surfaces_created);
         assert_eq!(after.surface_bytes, before.surface_bytes);
-        assert_eq!(after.repairs - before.repairs, 1);
-        assert_eq!(after.repair_pixels - before.repair_pixels, 28 * 24);
-        assert_eq!(after.items_replayed - before.items_replayed, 2);
-        assert_eq!(after.quads_replayed - before.quads_replayed, 2);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
+        assert_eq!(after.paint_items, before.paint_items);
+        assert_eq!(after.paint_quads, before.paint_quads);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 1);
+        assert_eq!(
+            after.composition_pixels - before.composition_pixels,
+            28 * 24
+        );
+        assert_eq!(
+            after.composition_scissor_pixels - before.composition_scissor_pixels,
+            2 * 28 * 24
+        );
+        assert_eq!(after.composition_sources - before.composition_sources, 2);
     });
 }
 
@@ -1091,13 +1245,20 @@ fn boundary_content_change_repairs_only_its_mapped_pixels() {
         );
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs - before.repairs, 2);
+        assert_eq!(after.paint_repairs - before.paint_repairs, 1);
+        assert_eq!(after.paint_pixels - before.paint_pixels, 21 * 16);
+        assert_eq!(after.paint_items - before.paint_items, 1);
+        assert_eq!(after.paint_quads - before.paint_quads, 1);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 1);
         assert_eq!(
-            after.repair_pixels - before.repair_pixels,
-            21 * 16 + 42 * 32
+            after.composition_pixels - before.composition_pixels,
+            42 * 32
         );
-        assert_eq!(after.items_replayed - before.items_replayed, 3);
-        assert_eq!(after.quads_replayed - before.quads_replayed, 3);
+        assert_eq!(
+            after.composition_scissor_pixels - before.composition_scissor_pixels,
+            2 * 42 * 32
+        );
+        assert_eq!(after.composition_sources - before.composition_sources, 2);
     });
 }
 
@@ -1120,7 +1281,7 @@ fn invisible_boundary_content_changes_do_no_raster_or_parent_work() {
                 world.get_mut::<BackgroundColor>(content).unwrap().0 = batched_flicker_color(1);
             },
         );
-        assert_no_layer_repair(
+        assert_no_surface_work(
             output.before_mutation.unwrap(),
             output.after_mutation.unwrap(),
         );
@@ -1161,11 +1322,23 @@ fn revealing_an_invisible_boundary_rebuilds_its_source_before_composition() {
         assert_pixels_eq(&revealed.pixels, &direct.pixels);
         let before = revealed.before_mutation.unwrap();
         let after = revealed.after_mutation.unwrap();
-        assert_eq!(after.surfaces_created - before.surfaces_created, 1);
-        assert_eq!(after.surface_bytes - before.surface_bytes, 36 * 30 * 9);
-        assert_eq!(after.repairs - before.repairs, 2);
-        assert_eq!(after.repair_pixels - before.repair_pixels, 2 * 36 * 30);
-        assert_eq!(after.items_replayed - before.items_replayed, 3);
+        assert_eq!(after.surfaces_created - before.surfaces_created, 2);
+        assert_eq!(
+            after.surface_bytes - before.surface_bytes,
+            (36 * 30 + u64::from(WIDTH * HEIGHT)) * 9
+        );
+        assert_eq!(after.paint_repairs - before.paint_repairs, 2);
+        assert_eq!(
+            after.paint_pixels - before.paint_pixels,
+            36 * 30 + u64::from(WIDTH * HEIGHT)
+        );
+        assert_eq!(after.paint_items - before.paint_items, 2);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 1);
+        assert_eq!(
+            after.composition_pixels - before.composition_pixels,
+            36 * 30
+        );
+        assert_eq!(after.composition_sources - before.composition_sources, 2);
     });
 }
 
@@ -1180,7 +1353,7 @@ fn hidden_ancestor_suppresses_nested_boundary_raster_work() {
                 world.get_mut::<BackgroundColor>(content).unwrap().0 = batched_flicker_color(1);
             },
         );
-        assert_no_layer_repair(
+        assert_no_surface_work(
             output.before_mutation.unwrap(),
             output.after_mutation.unwrap(),
         );
@@ -1207,17 +1380,23 @@ fn revealing_a_hidden_ancestor_rebuilds_nested_sources_deepest_first() {
         assert_pixels_eq(&revealed.pixels, &direct.pixels);
         let before = revealed.before_mutation.unwrap();
         let after = revealed.after_mutation.unwrap();
-        assert_eq!(after.surfaces_created - before.surfaces_created, 2);
+        assert_eq!(after.surfaces_created - before.surfaces_created, 3);
         assert_eq!(
             after.surface_bytes - before.surface_bytes,
-            (40 * 36 + 24 * 20) * 9
+            (40 * 36 + 24 * 20 + u64::from(WIDTH * HEIGHT)) * 9
         );
-        assert_eq!(after.repairs - before.repairs, 3);
+        assert_eq!(after.paint_repairs - before.paint_repairs, 2);
         assert_eq!(
-            after.repair_pixels - before.repair_pixels,
-            40 * 36 * 2 + 24 * 20
+            after.paint_pixels - before.paint_pixels,
+            24 * 20 + u64::from(WIDTH * HEIGHT)
         );
-        assert_eq!(after.items_replayed - before.items_replayed, 4);
+        assert_eq!(after.paint_items - before.paint_items, 2);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 2);
+        assert_eq!(
+            after.composition_pixels - before.composition_pixels,
+            40 * 36 * 2
+        );
+        assert_eq!(after.composition_sources - before.composition_sources, 3);
     });
 }
 
@@ -1248,7 +1427,10 @@ fn removing_a_boundary_releases_its_surface_and_preserves_pixels() {
         let before = removed.before_mutation.unwrap();
         let after = removed.after_mutation.unwrap();
         assert_eq!(after.surfaces_created, before.surfaces_created);
-        assert_eq!(before.surface_bytes - after.surface_bytes, 28 * 24 * 9);
+        assert_eq!(
+            before.surface_bytes - after.surface_bytes,
+            (28 * 24 + u64::from(WIDTH * HEIGHT)) * 9
+        );
     });
 }
 
@@ -1308,9 +1490,9 @@ fn render_layout_motion(contained: bool) -> RenderOutput {
 fn assert_layout_motion(output: RenderOutput) {
     let before = output.before_mutation.unwrap();
     let after = output.after_mutation.unwrap();
-    assert_eq!(after.repairs, before.repairs + 1);
-    assert_eq!(after.repair_pixels, before.repair_pixels + 200);
-    assert_eq!(after.items_replayed, before.items_replayed + 2);
+    assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+    assert_eq!(after.paint_pixels, before.paint_pixels + 200);
+    assert_eq!(after.paint_items, before.paint_items + 2);
     let paint_before = output.paint_before_mutation.unwrap();
     let paint_after = output.paint_after_mutation.unwrap();
     assert_eq!(paint_after.candidates, paint_before.candidates + 1);
@@ -1871,8 +2053,8 @@ fn a_camera_without_ui_uses_the_stock_final_blit_without_a_retained_surface() {
         let work = retained.after_mutation.unwrap();
         assert_eq!(work.surfaces_created, 0);
         assert_eq!(work.surface_bytes, 0);
-        assert_eq!(work.repairs, 0);
-        assert_eq!(work.composites, 0);
+        assert_eq!(work.paint_repairs, 0);
+        assert_eq!(work.presentations, 0);
     });
 }
 
@@ -1935,7 +2117,7 @@ fn fused_final_writer_preserves_camera_output_skip() {
             |_, _| {},
         );
         assert_pixels_eq(&retained.pixels, &stock.pixels);
-        assert_eq!(retained.after_mutation.unwrap().composites, 0);
+        assert_eq!(retained.after_mutation.unwrap().presentations, 0);
     });
 }
 
@@ -1969,7 +2151,7 @@ fn moving_an_unpainted_node_does_no_paint_work() {
         assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(after.surfaces_created, 0);
     });
 }
@@ -2009,7 +2191,7 @@ fn quiet_image_pixels_match_stock_without_another_repair() {
             u64::from(WIDTH) * u64::from(HEIGHT) * (BYTES_PER_PIXEL as u64 * 2 + 1);
         assert_eq!(before.surface_bytes, expected_surface_bytes);
         assert_eq!(after.surface_bytes, expected_surface_bytes);
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
@@ -2039,7 +2221,7 @@ fn quiet_viewport_node_matches_stock_without_another_repair() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
@@ -2076,10 +2258,10 @@ fn modified_viewport_image_repairs_only_its_node() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 20 * 20);
+        assert_eq!(after.paint_items, before.paint_items + 1);
+        assert_eq!(after.paint_quads, before.paint_quads + 1);
     });
 }
 
@@ -2109,8 +2291,8 @@ fn switching_viewport_render_target_repairs_the_node() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 20 * 20);
     });
 }
 
@@ -2139,12 +2321,9 @@ fn active_viewport_camera_repaints_only_its_reader() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        let repairs = after.repairs - before.repairs;
+        let repairs = after.paint_repairs - before.paint_repairs;
         assert!(repairs > 0);
-        assert_eq!(
-            after.repair_pixels - before.repair_pixels,
-            repairs * 20 * 20
-        );
+        assert_eq!(after.paint_pixels - before.paint_pixels, repairs * 20 * 20);
     });
 }
 
@@ -2176,7 +2355,7 @@ fn skip_output_viewport_camera_is_quiet() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
@@ -2210,12 +2389,9 @@ fn ordinary_image_node_tracks_active_camera_target_writes() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        let repairs = after.repairs - before.repairs;
+        let repairs = after.paint_repairs - before.paint_repairs;
         assert!(repairs > 0);
-        assert_eq!(
-            after.repair_pixels - before.repair_pixels,
-            repairs * 10 * 10
-        );
+        assert_eq!(after.paint_pixels - before.paint_pixels, repairs * 10 * 10);
     });
 }
 
@@ -2244,8 +2420,8 @@ fn clearing_viewport_camera_repairs_its_vacated_pixels() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 20 * 20);
     });
 }
 
@@ -2270,8 +2446,8 @@ fn removing_viewport_source_camera_repairs_its_vacated_pixels() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 20 * 20);
     });
 }
 
@@ -2294,7 +2470,7 @@ fn equal_viewport_replacement_compares_without_repair() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         let paint_before = output.paint_before_mutation.unwrap();
         let paint_after = output.paint_after_mutation.unwrap();
         assert_eq!(paint_after.candidates, paint_before.candidates + 1);
@@ -2328,7 +2504,7 @@ fn quiet_sliced_image_matches_stock_without_another_repair() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
@@ -2366,7 +2542,7 @@ fn quiet_linear_gradient_matches_stock_without_another_repair() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
@@ -2406,7 +2582,7 @@ fn quiet_box_shadow_matches_stock_without_another_repair() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
@@ -2444,10 +2620,10 @@ fn changed_box_shadow_repairs_its_exact_possible_pixels_and_one_quad() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 36 * 36);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 36 * 36);
+        assert_eq!(after.paint_items, before.paint_items + 1);
+        assert_eq!(after.paint_quads, before.paint_quads + 1);
     });
 }
 
@@ -2485,8 +2661,8 @@ fn changed_box_shadow_offset_repairs_exact_old_union_new_bounds() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 40 * 36);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 40 * 36);
     });
 }
 
@@ -2534,8 +2710,8 @@ fn removing_box_shadow_repairs_its_vacated_pixels() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 36 * 36);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 36 * 36);
     });
 }
 
@@ -2619,10 +2795,10 @@ fn changed_camera_shadow_samples_repairs_only_that_cameras_shadow() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 54 * 53);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 54 * 53);
+        assert_eq!(after.paint_items, before.paint_items + 1);
+        assert_eq!(after.paint_quads, before.paint_quads + 1);
     });
 }
 
@@ -2653,7 +2829,7 @@ fn equal_box_shadow_replacement_compares_without_repair() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         let paint_before = output.paint_before_mutation.unwrap();
         let paint_after = output.paint_after_mutation.unwrap();
         assert_eq!(paint_after.candidates, paint_before.candidates + 1);
@@ -2698,9 +2874,9 @@ fn box_shadow_damage_replays_the_background_above_it() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repair_pixels, before.repair_pixels + 36 * 36);
-        assert_eq!(after.items_replayed, before.items_replayed + 2);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 2);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 36 * 36);
+        assert_eq!(after.paint_items, before.paint_items + 2);
+        assert_eq!(after.paint_quads, before.paint_quads + 2);
     });
 }
 
@@ -2728,7 +2904,7 @@ fn transparent_box_shadow_does_no_paint_work() {
         assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(after.surfaces_created, 0);
     });
 }
@@ -2773,10 +2949,10 @@ fn changed_gradient_stop_repairs_one_item_and_two_segment_quads() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 24 * 20);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 2);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 24 * 20);
+        assert_eq!(after.paint_items, before.paint_items + 1);
+        assert_eq!(after.paint_quads, before.paint_quads + 2);
     });
 }
 
@@ -2860,11 +3036,11 @@ fn changed_border_gradient_repairs_only_border_pixels() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 340);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 340);
+        assert_eq!(after.paint_items, before.paint_items + 1);
         // Both gradient segments carry the exact four-rectangle border damage list.
-        assert_eq!(after.quads_replayed, before.quads_replayed + 2);
+        assert_eq!(after.paint_quads, before.paint_quads + 2);
     });
 }
 
@@ -3004,8 +3180,8 @@ fn removing_background_gradient_repairs_its_vacated_pixels() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 24 * 20);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 24 * 20);
     });
 }
 
@@ -3038,7 +3214,7 @@ fn equal_gradient_replacement_compares_without_repair() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         let paint_before = output.paint_before_mutation.unwrap();
         let paint_after = output.paint_after_mutation.unwrap();
         assert_eq!(paint_after.candidates, paint_before.candidates + 1);
@@ -3076,9 +3252,9 @@ fn sliced_image_tint_change_repairs_only_its_pixels() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 24 * 20);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 24 * 20);
+        assert_eq!(after.paint_items, before.paint_items + 1);
     });
 }
 
@@ -3108,9 +3284,9 @@ fn sliced_image_repair_submits_one_quad_from_a_shared_texture() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 20 * 20);
+        assert_eq!(after.paint_items, before.paint_items + 1);
+        assert_eq!(after.paint_quads, before.paint_quads + 1);
     });
 }
 
@@ -3139,8 +3315,8 @@ fn switching_from_stretched_to_sliced_image_replaces_the_draw_family() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_quads, before.paint_quads + 1);
     });
 }
 
@@ -3203,7 +3379,7 @@ fn quiet_equal_color_border_matches_stock_grouping() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
@@ -3232,7 +3408,7 @@ fn quiet_text_pixels_match_stock_without_another_repair() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
@@ -3262,8 +3438,8 @@ fn text_width_change_that_preserves_glyph_pixels_does_no_render_work() {
 
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         assert_eq!(
-            retained.after_mutation.unwrap().repairs,
-            retained.before_mutation.unwrap().repairs
+            retained.after_mutation.unwrap().paint_repairs,
+            retained.before_mutation.unwrap().paint_repairs
         );
         assert_eq!(
             retained.paint_after_mutation,
@@ -3305,7 +3481,7 @@ fn quiet_text_shadow_matches_stock_without_main_glyph_paint() {
         );
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
     });
 }
 
@@ -3346,8 +3522,8 @@ fn changed_text_shadow_offset_repairs_old_and_new_glyph_coverage() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert!(after.paint_pixels - before.paint_pixels < 56 * 24);
     });
 }
 
@@ -3373,7 +3549,7 @@ fn quiet_text_decorations_and_their_shadows_match_stock() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
     });
 }
 
@@ -3403,8 +3579,8 @@ fn changed_underline_color_repairs_its_text_root() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert!(after.paint_pixels - before.paint_pixels < 56 * 24);
     });
 }
 
@@ -3434,7 +3610,7 @@ fn removing_text_background_repairs_its_vacated_run_bounds() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
     });
 }
 
@@ -3464,7 +3640,7 @@ fn selected_editable_text_and_cursor_match_stock() {
         );
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
     });
 }
 
@@ -3487,8 +3663,8 @@ fn changing_editable_text_focus_repairs_selection_color() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert!(after.repair_pixels - before.repair_pixels < u64::from(WIDTH * HEIGHT));
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert!(after.paint_pixels - before.paint_pixels < u64::from(WIDTH * HEIGHT));
     });
 }
 
@@ -3521,7 +3697,7 @@ fn editable_preedit_underline_matches_stock() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
     });
 }
 
@@ -3548,13 +3724,13 @@ fn changed_text_color_repairs_only_glyph_coverage() {
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
         assert_eq!(
-            after.repairs,
-            before.repairs + 1,
+            after.paint_repairs,
+            before.paint_repairs + 1,
             "layer {before:?} -> {after:?}; paint {:?} -> {:?}",
             retained.paint_before_mutation,
             retained.paint_after_mutation
         );
-        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+        assert!(after.paint_pixels - before.paint_pixels < 56 * 24);
     });
 }
 
@@ -3581,8 +3757,8 @@ fn changed_text_content_erases_vacated_glyphs() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert!(after.paint_pixels - before.paint_pixels < 56 * 24);
     });
 }
 
@@ -3608,8 +3784,8 @@ fn changed_span_color_nominates_its_text_root() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert!(after.repair_pixels - before.repair_pixels < 56 * 24);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert!(after.paint_pixels - before.paint_pixels < 56 * 24);
         let paint_before = retained.paint_before_mutation.unwrap();
         let paint_after = retained.paint_after_mutation.unwrap();
         assert_eq!(
@@ -3652,7 +3828,7 @@ fn pending_font_atlas_upload_keeps_old_text_and_damage_owed() {
         );
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         let paint_before = output.paint_before_mutation.unwrap();
         let paint_after = output.paint_after_mutation.unwrap();
         assert_eq!(
@@ -3686,7 +3862,7 @@ fn unsampled_font_atlas_change_does_not_repaint_text() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
     });
 }
@@ -3710,7 +3886,7 @@ fn changed_sampled_font_atlas_pixel_repairs_text() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
         let paint_before = retained.paint_before_mutation.unwrap();
         let paint_after = retained.paint_after_mutation.unwrap();
         assert_eq!(
@@ -3757,10 +3933,10 @@ fn one_border_edge_change_repairs_only_its_antialiased_corner_reach() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 140);
-        assert_eq!(after.items_replayed, before.items_replayed + 2);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 3);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 140);
+        assert_eq!(after.paint_items, before.paint_items + 2);
+        assert_eq!(after.paint_quads, before.paint_quads + 3);
     });
 }
 
@@ -3824,8 +4000,8 @@ fn removing_border_color_repairs_all_vacated_edge_regions() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 364);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 364);
     });
 }
 
@@ -3875,9 +4051,9 @@ fn image_damage_replays_the_background_beneath_it() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 100);
-        assert_eq!(after.items_replayed, before.items_replayed + 2);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 100);
+        assert_eq!(after.paint_items, before.paint_items + 2);
     });
 }
 
@@ -3906,8 +4082,8 @@ fn modified_image_asset_repairs_only_its_readers() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 100);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 100);
         let center = ((14 * WIDTH + 13) as usize) * BYTES_PER_PIXEL;
         assert_eq!(
             &output.pixels[center..center + BYTES_PER_PIXEL],
@@ -3935,9 +4111,9 @@ fn unsampled_image_pixel_change_does_no_retained_work() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
-        assert_eq!(after.repair_pixels, before.repair_pixels);
-        assert_eq!(after.items_replayed, before.items_replayed);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
+        assert_eq!(after.paint_items, before.paint_items);
         assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
     });
 }
@@ -3970,8 +4146,8 @@ fn sampled_image_pixel_change_repairs_its_node() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 200);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 200);
         let paint_before = retained.paint_before_mutation.unwrap();
         let paint_after = retained.paint_after_mutation.unwrap();
         assert_eq!(
@@ -4001,9 +4177,9 @@ fn equal_image_asset_write_does_not_repaint() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
-        assert_eq!(after.repair_pixels, before.repair_pixels);
-        assert_eq!(after.items_replayed, before.items_replayed);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
+        assert_eq!(after.paint_items, before.paint_items);
         assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
     });
 }
@@ -4033,9 +4209,9 @@ fn transparent_image_does_not_subscribe_to_asset_changes() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
-        assert_eq!(after.repair_pixels, before.repair_pixels);
-        assert_eq!(after.items_replayed, before.items_replayed);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
+        assert_eq!(after.paint_items, before.paint_items);
         assert_eq!(output.paint_after_mutation, output.paint_before_mutation);
     });
 }
@@ -4066,7 +4242,7 @@ fn pending_image_upload_keeps_old_pixels_and_damage_owed() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         let center = ((14 * WIDTH + 13) as usize) * BYTES_PER_PIXEL;
         assert_eq!(
             &output.pixels[center..center + BYTES_PER_PIXEL],
@@ -4099,7 +4275,7 @@ fn removing_main_world_image_keeps_its_live_render_asset() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         let center = ((14 * WIDTH + 13) as usize) * BYTES_PER_PIXEL;
         assert_eq!(
             &output.pixels[center..center + BYTES_PER_PIXEL],
@@ -4131,8 +4307,8 @@ fn switching_to_an_unavailable_image_keeps_old_pixels_without_flicker() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
-        assert_eq!(after.repair_pixels, before.repair_pixels);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
         let center = ((14 * WIDTH + 13) as usize) * BYTES_PER_PIXEL;
         assert_eq!(
             &output.pixels[center..center + BYTES_PER_PIXEL],
@@ -4198,8 +4374,8 @@ fn changed_atlas_rect_repairs_its_image() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 100);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 100);
         let center = ((14 * WIDTH + 13) as usize) * BYTES_PER_PIXEL;
         assert_eq!(
             &output.pixels[center..center + BYTES_PER_PIXEL],
@@ -4226,7 +4402,7 @@ fn irrelevant_atlas_edit_is_compared_without_repaint() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
         let paint_before = output.paint_before_mutation.unwrap();
         let paint_after = output.paint_after_mutation.unwrap();
         assert_eq!(paint_after.candidates, paint_before.candidates + 1);
@@ -4331,9 +4507,9 @@ fn quiet_backgrounds_retain_pixels_without_another_repair() {
         );
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
-        assert_eq!(after.repair_pixels, before.repair_pixels);
-        assert!(after.composites > before.composites);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
+        assert!(after.presentations > before.presentations);
         assert_eq!(
             output.paint_after_mutation, output.paint_before_mutation,
             "quiet Changed<T> scans must not nominate paint records"
@@ -4365,10 +4541,10 @@ fn quiet_composition_rides_the_existing_full_view_final_blit() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        let composites = after.composites - before.composites;
+        let composites = after.presentations - before.presentations;
         assert!(composites > 0);
         assert_eq!(
-            after.ui_sample_pixels - before.ui_sample_pixels,
+            after.presented_pixels - before.presented_pixels,
             composites * u64::from(WIDTH) * u64::from(HEIGHT)
         );
     });
@@ -4430,10 +4606,10 @@ fn fused_composite_preserves_disjoint_pixels_and_the_gap_between_them() {
         assert_ne!(pixel(45, 32), [0, 0, 0, 255]);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        let composites = after.composites - before.composites;
+        let composites = after.presentations - before.presentations;
         assert!(composites > 0);
         assert_eq!(
-            after.ui_sample_pixels - before.ui_sample_pixels,
+            after.presented_pixels - before.presented_pixels,
             composites * u64::from(WIDTH) * u64::from(HEIGHT)
         );
     });
@@ -4455,8 +4631,8 @@ fn equal_background_write_is_nominated_but_does_not_repair() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
-        assert_eq!(after.repair_pixels, before.repair_pixels);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
         let paint_before = output.paint_before_mutation.unwrap();
         let paint_after = output.paint_after_mutation.unwrap();
         assert_eq!(paint_after.candidates, paint_before.candidates + 1);
@@ -4484,10 +4660,10 @@ fn changed_background_encodes_exactly_one_full_repair() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
         assert_eq!(
-            after.repair_pixels,
-            before.repair_pixels + u64::from(WIDTH) * u64::from(HEIGHT)
+            after.paint_pixels,
+            before.paint_pixels + u64::from(WIDTH) * u64::from(HEIGHT)
         );
         let paint_before = output.paint_before_mutation.unwrap();
         let paint_after = output.paint_after_mutation.unwrap();
@@ -4547,10 +4723,10 @@ fn fully_damaged_nodes_report_each_logical_item_and_quad() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 200);
-        assert_eq!(after.items_replayed, before.items_replayed + 2);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 2);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 200);
+        assert_eq!(after.paint_items, before.paint_items + 2);
+        assert_eq!(after.paint_quads, before.paint_quads + 2);
     });
 }
 
@@ -4709,9 +4885,9 @@ fn ui_transform_motion_nominates_only_the_moved_leaf() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 200);
-        assert_eq!(after.items_replayed, before.items_replayed + 2);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 200);
+        assert_eq!(after.paint_items, before.paint_items + 2);
         let paint_before = output.paint_before_mutation.unwrap();
         let paint_after = output.paint_after_mutation.unwrap();
         assert_eq!(paint_after.candidates, paint_before.candidates + 1);
@@ -4902,9 +5078,9 @@ fn inherited_visibility_removes_only_the_hidden_leaf_pixels() {
 
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 100);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 100);
+        assert_eq!(after.paint_items, before.paint_items + 1);
         let hidden_center = ((13 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
         assert_eq!(
             &output.pixels[hidden_center..hidden_center + BYTES_PER_PIXEL],
@@ -5214,9 +5390,9 @@ fn losing_a_renderable_target_removes_pixels_from_the_previous_camera() {
         );
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
         assert_eq!(
-            after.composites, before.composites,
+            after.presentations, before.presentations,
             "an empty retained layer must stop compositing"
         );
     });
@@ -5241,8 +5417,8 @@ fn removing_node_ends_ui_participation_even_if_computed_components_remain() {
         );
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.composites, before.composites);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.presentations, before.presentations);
     });
 }
 
@@ -5323,8 +5499,8 @@ fn moving_a_camera_viewport_is_composite_only() {
         assert_eq!(moved.paint_after_mutation, moved.paint_before_mutation);
         let before = moved.before_mutation.unwrap();
         let after = moved.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs);
-        assert!(after.composites > before.composites);
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert!(after.presentations > before.presentations);
     });
 }
 
@@ -5371,7 +5547,7 @@ fn resizing_a_viewport_reconstructs_its_retained_surface() {
             after.surface_bytes,
             40_u64 * 40 * (BYTES_PER_PIXEL as u64 * 2 + 1)
         );
-        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
     });
 }
 
@@ -5571,8 +5747,8 @@ fn exact_custom_material_is_quiet_after_its_first_paint() {
         );
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_no_layer_repair(before, after);
-        assert!(after.composites > before.composites);
+        assert_no_surface_work(before, after);
+        assert!(after.presentations > before.presentations);
         assert_eq!(
             retained.paint_after_mutation,
             retained.paint_before_mutation
@@ -5603,8 +5779,8 @@ fn unretained_custom_material_uses_the_safe_full_repaint_fallback() {
         );
         let before = output.before_mutation.unwrap();
         let after = output.after_mutation.unwrap();
-        assert!(after.repairs > before.repairs);
-        assert!(after.repair_pixels >= before.repair_pixels + u64::from(WIDTH * HEIGHT));
+        assert!(after.paint_repairs > before.paint_repairs);
+        assert!(after.paint_pixels >= before.paint_pixels + u64::from(WIDTH * HEIGHT));
     });
 }
 
@@ -5666,8 +5842,90 @@ fn unretained_custom_material_routes_through_its_repaint_boundary() {
         assert_pixels_within(&retained.pixels, &stock.pixels, 1);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert!(after.repairs >= before.repairs + 2);
-        assert!(after.repair_pixels >= before.repair_pixels + 800);
+        assert!(after.paint_repairs >= before.paint_repairs + 2);
+        assert!(after.paint_pixels >= before.paint_pixels + 800);
+    });
+}
+
+fn spawn_unretained_material_beside_boundary(
+    world: &mut World,
+    camera: Entity,
+) -> TestMaterialScene {
+    let material = spawn_test_ui_material(world, camera, Color::srgb_u8(220, 45, 28), false, false);
+    world.spawn((
+        RepaintBoundary::IDENTITY,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(38),
+            top: px(35),
+            width: px(18),
+            height: px(16),
+            ..default()
+        },
+        BackgroundColor(Color::srgb_u8(30, 190, 90)),
+        UiTargetCamera(camera),
+    ));
+    material
+}
+
+#[test]
+fn unretained_material_keeps_a_boundary_bearing_target_flat() {
+    with_gpu_lock(|| {
+        let output = render_scene_configured(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            configure_unretained_test_ui_material,
+            spawn_unretained_material_beside_boundary,
+            |world, scene| {
+                world
+                    .resource_mut::<Assets<TestUiMaterial>>()
+                    .get_mut(&scene.material)
+                    .unwrap()
+                    .color = Color::srgb_u8(45, 205, 90).to_linear().to_vec4();
+            },
+        );
+        let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &output.pixels[sample..sample + BYTES_PER_PIXEL],
+            &[45, 205, 90, 255]
+        );
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert!(after.paint_repairs > before.paint_repairs);
+        assert_eq!(after.composition_repairs, before.composition_repairs);
+    });
+}
+
+#[test]
+fn removing_the_last_unretained_material_reenables_ordered_composition() {
+    with_gpu_lock(|| {
+        let output = render_scene_configured(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            configure_unretained_test_ui_material,
+            spawn_unretained_material_beside_boundary,
+            |world, scene| {
+                world.entity_mut(scene.entity).despawn();
+            },
+        );
+        let sample = ((10 * WIDTH + 10) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &output.pixels[sample..sample + BYTES_PER_PIXEL],
+            &[0, 0, 0, 255]
+        );
+        let boundary_sample = ((40 * WIDTH + 40) as usize) * BYTES_PER_PIXEL;
+        assert_eq!(
+            &output.pixels[boundary_sample..boundary_sample + BYTES_PER_PIXEL],
+            &[30, 190, 90, 255]
+        );
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.composition_repairs - before.composition_repairs, 1);
+        assert_eq!(
+            after.composition_pixels - before.composition_pixels,
+            u64::from(WIDTH * HEIGHT)
+        );
+        assert_eq!(after.composition_sources - before.composition_sources, 1);
     });
 }
 
@@ -5704,10 +5962,10 @@ fn exact_custom_material_change_repairs_only_its_node() {
         );
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
-        assert_eq!(after.quads_replayed, before.quads_replayed + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 20 * 20);
+        assert_eq!(after.paint_items, before.paint_items + 1);
+        assert_eq!(after.paint_quads, before.paint_quads + 1);
     });
 }
 
@@ -5726,7 +5984,7 @@ fn equal_custom_material_asset_write_does_no_paint_work() {
             },
         );
 
-        assert_no_layer_repair(
+        assert_no_surface_work(
             retained.before_mutation.unwrap(),
             retained.after_mutation.unwrap(),
         );
@@ -5758,8 +6016,8 @@ fn volatile_custom_material_repaints_while_visible() {
         assert_pixels_eq(&retained.pixels, &stock.pixels);
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert!(after.repairs > before.repairs);
-        assert!(after.items_replayed > before.items_replayed);
+        assert!(after.paint_repairs > before.paint_repairs);
+        assert!(after.paint_items > before.paint_items);
     });
 }
 
@@ -5782,10 +6040,10 @@ fn target_coverage_custom_material_repairs_the_declared_target() {
 
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
         assert_eq!(
-            after.repair_pixels,
-            before.repair_pixels + u64::from(WIDTH * HEIGHT)
+            after.paint_pixels,
+            before.paint_pixels + u64::from(WIDTH * HEIGHT)
         );
     });
 }
@@ -5815,9 +6073,9 @@ fn custom_material_sample_change_repairs_only_its_reader() {
         );
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
-        assert_eq!(after.items_replayed, before.items_replayed + 1);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 20 * 20);
+        assert_eq!(after.paint_items, before.paint_items + 1);
     });
 }
 
@@ -5844,8 +6102,8 @@ fn custom_material_waits_for_a_changed_image_binding() {
         );
         let before = retained.before_mutation.unwrap();
         let after = retained.after_mutation.unwrap();
-        assert_eq!(after.repairs, before.repairs + 1);
-        assert_eq!(after.repair_pixels, before.repair_pixels + 20 * 20);
+        assert_eq!(after.paint_repairs, before.paint_repairs + 1);
+        assert_eq!(after.paint_pixels, before.paint_pixels + 20 * 20);
     });
 }
 
@@ -5873,7 +6131,7 @@ fn unprepared_custom_material_binding_keeps_old_pixels_and_damage_owed() {
             &retained.pixels[sample..sample + BYTES_PER_PIXEL],
             &[255, 255, 255, 255]
         );
-        assert_no_layer_repair(
+        assert_no_surface_work(
             retained.before_mutation.unwrap(),
             retained.after_mutation.unwrap(),
         );
@@ -6055,7 +6313,7 @@ fn a_fills_target_camera_lays_its_interface_over_the_whole_target() {
                 RenderTarget::Image(image.clone().into()),
             ));
             if fills {
-                camera.insert(bevy::ui::UiFillsTarget);
+                camera.insert(UiFillsTarget);
             }
             let camera = camera.id();
 
@@ -6071,7 +6329,7 @@ fn a_fills_target_camera_lays_its_interface_over_the_whole_target() {
                     ..default()
                 },
                 BackgroundColor(Color::srgb(0.0, 1.0, 0.0)),
-                bevy::ui::UiTargetCamera(camera),
+                UiTargetCamera(camera),
             ));
 
             let pixels = Arc::new(Mutex::new(None));
@@ -6111,18 +6369,10 @@ fn a_fills_target_camera_lays_its_interface_over_the_whole_target() {
     });
 }
 
-/// A repaint boundary that MOVES (layout reflow after a sibling despawns)
-/// must reposition its cached surface without billing any repair: the
-/// survivors' content is byte-identical, only placement changed. This is
-/// the contract a toast rack leans on — an expiring toast reflows the
-/// stack every few seconds, and if reposition billed paint, every reflow
-/// would re-shade whatever heavy materials sit under the rack.
+/// A layout reflow after a sibling despawns must not rasterize any survivor.
+/// Only the three old/new toast boxes are rebuilt from cached sources.
 #[test]
-#[ignore = "FORK GAP: boundary placement is cached-content but not \
-compositor-free — a layout reflow repositions correctly (both pixel \
-asserts pass) yet bills one cached-blit repair per survivor in the parent \
-layer. Remove this ignore for the red repro of true placement independence."]
-fn a_boundary_reflow_repositions_without_repair() {
+fn boundary_reflow_repositions_without_rasterizing_survivors() {
     with_gpu_lock(|| {
         let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
 
@@ -6166,7 +6416,7 @@ fn a_boundary_reflow_repositions_without_repair() {
                     row_gap: px(2),
                     ..default()
                 },
-                bevy::ui::UiTargetCamera(camera),
+                UiTargetCamera(camera),
             ))
             .id();
         let mut toasts = Vec::new();
@@ -6210,6 +6460,11 @@ fn a_boundary_reflow_repositions_without_repair() {
         assert_eq!(at(&frame, 8, 8), [255, 0, 0], "baseline row 0 is red");
         assert_eq!(at(&frame, 8, 20), [0, 255, 0], "baseline row 1 is green");
         let before = layer_work(&app).expect("layer counters");
+        assert_eq!(before.surfaces_created, 4);
+        assert_eq!(
+            before.surface_bytes,
+            u64::from(WIDTH * HEIGHT + 3 * 24 * 10) * 9
+        );
 
         // The oldest toast expires; the rack reflows.
         app.world_mut().entity_mut(toasts[0]).despawn();
@@ -6226,28 +6481,103 @@ fn a_boundary_reflow_repositions_without_repair() {
             "after the reflow the green toast should occupy the first slot"
         );
         assert_eq!(at(&frame, 8, 20), [0, 0, 255], "and blue the second");
-        // ...and the move billed NO repair: cached surfaces recomposited
-        // at new offsets, no pixels repainted.
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
+        assert_eq!(after.paint_items, before.paint_items);
+        assert_eq!(after.paint_quads, before.paint_quads);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 1);
         assert_eq!(
-            after.repair_pixels, before.repair_pixels,
-            "a boundary reflow must not repaint pixels (repairs {} -> {}, \
-             repair_pixels {} -> {})",
-            before.repairs, after.repairs, before.repair_pixels, after.repair_pixels
+            after.composition_pixels - before.composition_pixels,
+            3 * 24 * 10
         );
+        assert_eq!(after.composition_sources - before.composition_sources, 2);
+        assert_eq!(before.surface_bytes - after.surface_bytes, 24 * 10 * 9);
     });
 }
 
-/// Animating a boundary's OWN transform (the compositor-placement lane)
-/// must bill zero repair across every frame of the motion — this is the
-/// slide-in a toast rides, and the whole point of driving it through the
-/// boundary instead of layout.
+fn spawn_boundary_grid(world: &mut World, camera: Entity) -> Vec<Entity> {
+    let root = world
+        .spawn((
+            Node {
+                width: percent(100),
+                height: percent(100),
+                ..default()
+            },
+            UiTargetCamera(camera),
+        ))
+        .id();
+    (0..64)
+        .map(|index| {
+            world
+                .spawn((
+                    RepaintBoundary::IDENTITY,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(2 + (index % 8) * 7),
+                        top: px(2 + (index / 8) * 7),
+                        width: px(5),
+                        height: px(5),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb_u8(20, 80, 210)),
+                    ChildOf(root),
+                ))
+                .id()
+        })
+        .collect()
+}
+
 #[test]
-#[ignore = "FORK GAP: animating RepaintBoundary.transform repositions \
-correctly but bills a quad-area cached-blit repair in the parent layer \
-EVERY moved frame (repairs +1/frame). The blit is cheap (no content \
-shaders re-run) so islands still pay off — but placement should cost \
-zero. Remove this ignore for the red repro."]
-fn a_boundary_transform_slide_bills_no_repair() {
+fn sixty_four_static_boundaries_have_zero_steady_state_surface_work() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            spawn_boundary_grid,
+            |_, _| {},
+        );
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_no_surface_work(before, after);
+        assert_eq!(after.surfaces_created, 65);
+        assert_eq!(
+            after.surface_bytes,
+            u64::from(WIDTH * HEIGHT + 64 * 5 * 5) * 9
+        );
+        assert!(after.presentations > before.presentations);
+    });
+}
+
+#[test]
+fn moving_one_of_sixty_four_boundaries_touches_one_compositor_source() {
+    with_gpu_lock(|| {
+        let output = render_scene(
+            UiRenderer::Retained,
+            PaintSchedule::EveryFrame,
+            spawn_boundary_grid,
+            |world, boundaries| {
+                world
+                    .get_mut::<RepaintBoundary>(boundaries[0])
+                    .unwrap()
+                    .transform = UiTransform::from_translation(Val2::px(1, 0));
+            },
+        );
+        let before = output.before_mutation.unwrap();
+        let after = output.after_mutation.unwrap();
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
+        assert_eq!(after.paint_items, before.paint_items);
+        assert_eq!(after.paint_quads, before.paint_quads);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 1);
+        assert_eq!(after.composition_pixels - before.composition_pixels, 6 * 5);
+        assert_eq!(after.composition_sources - before.composition_sources, 1);
+    });
+}
+
+/// Animating a boundary's own transform rasterizes no paint. Each frame
+/// composes only the exact old/new output union from the cached boundary.
+#[test]
+fn boundary_transform_slide_rasterizes_nothing_across_every_frame() {
     with_gpu_lock(|| {
         let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
 
@@ -6291,7 +6621,7 @@ fn a_boundary_transform_slide_bills_no_repair() {
                     ..default()
                 },
                 BackgroundColor(Color::srgb_u8(255, 0, 0)),
-                bevy::ui::UiTargetCamera(camera),
+                UiTargetCamera(camera),
             ))
             .id();
 
@@ -6318,8 +6648,7 @@ fn a_boundary_transform_slide_bills_no_repair() {
                 .entity_mut(toast)
                 .get_mut::<RepaintBoundary>()
                 .unwrap()
-                .transform =
-                bevy::ui::UiTransform::from_translation(bevy::ui::Val2::px(step as f32 * 2.0, 0.0));
+                .transform = UiTransform::from_translation(Val2::px(step as f32 * 2.0, 0.0));
             step_and_wait(&mut app);
         }
         let frame = capture_fresh(&mut app, &pixels);
@@ -6336,11 +6665,15 @@ fn a_boundary_transform_slide_bills_no_repair() {
             [255, 0, 0],
             "the toast should sit 24px right of where it started"
         );
+        assert_eq!(after.paint_repairs, before.paint_repairs);
+        assert_eq!(after.paint_pixels, before.paint_pixels);
+        assert_eq!(after.paint_items, before.paint_items);
+        assert_eq!(after.paint_quads, before.paint_quads);
+        assert_eq!(after.composition_repairs - before.composition_repairs, 12);
         assert_eq!(
-            after.repair_pixels, before.repair_pixels,
-            "a transform slide must not repaint pixels (repairs {} -> {}, \
-             repair_pixels {} -> {})",
-            before.repairs, after.repairs, before.repair_pixels, after.repair_pixels
+            after.composition_pixels - before.composition_pixels,
+            12 * 22 * 10
         );
+        assert_eq!(after.composition_sources - before.composition_sources, 12);
     });
 }

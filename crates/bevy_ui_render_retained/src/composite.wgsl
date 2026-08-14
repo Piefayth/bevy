@@ -90,10 +90,24 @@ fn boundary_vertex(in: BoundaryVertexInput) -> BoundaryVertexOutput {
     return out;
 }
 
-@fragment
-fn boundary_fragment(in: BoundaryVertexOutput) -> @location(0) vec4<f32> {
+fn boundary_color(in: BoundaryVertexOutput) -> vec4<f32> {
     let size = vec2<f32>(textureDimensions(final_world));
     return textureLoad(final_world, vec2<i32>(in.uv * size), 0) * in.opacity;
+}
+
+@fragment
+fn boundary_fragment(in: BoundaryVertexOutput) -> @location(0) vec4<f32> {
+    return boundary_color(in);
+}
+
+@group(1) @binding(0) var composition_damage_mask: texture_2d<f32>;
+
+@fragment
+fn masked_boundary_fragment(in: BoundaryVertexOutput) -> @location(0) vec4<f32> {
+    if textureLoad(composition_damage_mask, vec2<i32>(in.position.xy), 0).r < 0.5 {
+        discard;
+    }
+    return boundary_color(in);
 }
 
 @group(0) @binding(1) var final_world: texture_2d<f32>;

@@ -365,7 +365,7 @@ pub fn extract_ui_material_nodes<M: UiMaterial>(
             &ComputedUiRenderTargetInfo,
         )>,
     >,
-    paint_targets: Extract<Query<&RenderEntity>>,
+    paint_targets: Extract<Query<(&RenderEntity, &ComputedNode, &UiGlobalTransform)>>,
     camera_map: Extract<UiCameraMap>,
     volatile_targets: Res<VolatileUiPaintTargets>,
     mut volatile_targets_local: Local<HashMap<Entity, UVec2>>,
@@ -396,29 +396,37 @@ pub fn extract_ui_material_nodes<M: UiMaterial>(
             continue;
         }
 
-        let (extracted_camera_entity, clip) = if let Some(paint_target) = paint_target {
-            let Ok(render_target) = paint_targets.get(paint_target.0 .0) else {
+        let transform: Affine2 = transform.into();
+        let (extracted_camera_entity, transform, clip) = if let Some(paint_target) = paint_target {
+            let Ok((render_target, target_node, target_transform)) =
+                paint_targets.get(paint_target.0 .0)
+            else {
                 continue;
             };
+            // Paint-target views use the target's top-left as their coordinate origin.
+            let target_origin = target_transform.translation - target_node.size() * 0.5;
+            let transform = Affine2::from_translation(-target_origin) * transform;
             let clip = if paint_target.0 .0 == entity {
                 Rect::from_center_size(transform.translation, computed_node.size())
             } else {
-                clip.expect("paint-contained descendants must have a surface-local clip")
-                    .paint_clip
+                let clip = clip
+                    .expect("paint-contained descendants must have a paint clip")
+                    .paint_clip;
+                Rect::from_corners(clip.min - target_origin, clip.max - target_origin)
             };
-            (render_target.id(), Some(clip))
+            (render_target.id(), transform, Some(clip))
         } else {
             let Some(camera) = camera_mapper.map(camera) else {
                 continue;
             };
-            (camera, clip.map(|clip| clip.clip))
+            (camera, transform, clip.map(|clip| clip.clip))
         };
         volatile_targets_local.insert(extracted_camera_entity, target_info.physical_size());
 
         extracted_uinodes.uinodes.push(ExtractedUiMaterialNode {
             render_entity: commands.spawn(TemporaryRenderEntity).id(),
             stack_index: stack_index.0,
-            transform: transform.into(),
+            transform,
             material: handle.id(),
             rect: Rect {
                 min: Vec2::ZERO,

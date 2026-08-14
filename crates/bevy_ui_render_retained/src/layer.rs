@@ -24,8 +24,9 @@ use crate::sampled_image::{
 use crate::scene::{
     apply_retained_paints, cleanup_retained_ui, extract_boundary_ownership,
     extract_retained_placements, replay_retained_ui, PendingGradientPaints, PendingImagePaints,
-    PendingShadowPaints, PendingViewportPaints, RetainedFullRebuilds, RetainedItems,
-    RetainedMaterialReplays, RetainedRepairPlans, RetainedUiPaintCounters, RetainedUiScene,
+    PendingShadowPaints, PendingViewportPaints, RetainedCompositorEntry, RetainedFullRebuilds,
+    RetainedItems, RetainedMaterialReplays, RetainedPaintRun, RetainedRepairPlans,
+    RetainedUiPaintCounters, RetainedUiScene,
 };
 use crate::shadow::{extract_retained_shadows, RetainedShadowDependencies};
 use crate::shadow_render::{
@@ -50,9 +51,9 @@ use bevy::{
         system::{Commands, Local, Query, Res, ResMut, SystemParamItem},
     },
     log::error,
-    math::{FloatOrd, UVec2, Vec2},
+    math::{FloatOrd, Mat4, UVec2, UVec4, Vec2},
     mesh::{VertexBufferLayout, VertexFormat},
-    prelude::{App, Plugin, Resource, World},
+    prelude::{App, GlobalTransform, Plugin, Resource, World},
     render::{
         camera::ExtractedCamera,
         render_asset::RenderAssets,
@@ -66,9 +67,10 @@ use bevy::{
             BufferUsages, CachedRenderPipelineId, ColorTargetState, ColorWrites, Extent3d,
             FragmentState, LoadOp, Operations, PipelineCache, RawBufferVec,
             RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor,
-            SamplerBindingType, ShaderStages, StoreOp, Texture, TextureDescriptor,
-            TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
-            TextureViewDescriptor, VertexAttribute, VertexState, VertexStepMode,
+            SamplerBindingType, ShaderStages, StoreOp, TexelCopyTextureInfo, Texture,
+            TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
+            TextureUsages, TextureView, TextureViewDescriptor, VertexAttribute, VertexState,
+            VertexStepMode,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
         texture::GpuImage,
@@ -82,7 +84,7 @@ use bevy::{
             UiTextureSlicerInfrastructurePlugin,
         },
         PrepareUiSystems, RenderUiSystems, TransparentUi, UiCameraView, UiMaterialBatchRange,
-        UiViewTarget,
+        UiViewTarget, UI_CAMERA_FAR, UI_CAMERA_TRANSFORM_OFFSET,
     },
 };
 use bytemuck::{Pod, Zeroable};
@@ -162,6 +164,8 @@ impl Plugin for RetainedUiRenderPlugin {
             .init_resource::<RetainedFullRebuilds>()
             .init_resource::<RetainedUiPaintCounters>()
             .init_resource::<LayerRects>()
+            .init_resource::<CompositorInstances>()
+            .init_resource::<ActiveRunViews>()
             .init_resource::<BoundaryBatches>()
             .add_systems(
                 ExtractSchedule,
@@ -268,6 +272,7 @@ impl Plugin for RetainedUiRenderPlugin {
             .add_systems(
                 ExtractSchedule,
                 replay_retained_ui
+                    .after(RenderUiSystems::ExtractCameraViews)
                     .after(prepare_boundary_views)
                     .after(propagate_boundary_damage),
             )
@@ -278,9 +283,20 @@ impl Plugin for RetainedUiRenderPlugin {
                     resolve_ready_sampled_images,
                     cleanup_layer_surfaces,
                     clear_layer_rects,
+                    clear_compositor_instances,
                 )
                     .chain()
                     .in_set(RenderSystems::PrepareResources),
+            )
+            .add_systems(
+                Render,
+                prepare_run_views
+                    .in_set(RenderSystems::Queue)
+                    .before(queue_retained_core)
+                    .before(queue_boundaries)
+                    .before(queue_retained_gradients)
+                    .before(queue_retained_shadows)
+                    .before(queue_ui_slice_items),
             )
             .add_systems(Render, queue_retained_core.in_set(RenderSystems::Queue))
             .add_systems(Render, queue_boundaries.in_set(RenderSystems::Queue))
@@ -331,18 +347,28 @@ pub struct RetainedUiLayerWork {
     pub surfaces_created: u64,
     /// Current texture payload bytes owned by persistent layer surfaces.
     pub surface_bytes: u64,
-    /// Atomic UI-layer repair transactions encoded.
-    pub repairs: u64,
-    /// Physical pixels cleared and repainted across exact repair regions.
-    pub repair_pixels: u64,
-    /// Individual paint items replayed across all repair regions.
-    pub items_replayed: u64,
-    /// Prepared quads submitted across all replayed paint items.
-    pub quads_replayed: u64,
-    /// Final blits that sampled and composited a retained UI layer.
-    pub composites: u64,
-    /// Physical output pixels that sampled the retained UI layer.
-    pub ui_sample_pixels: u64,
+    /// Physical texels copied while preserving a surface across a coordinate-space resize.
+    pub resize_copy_pixels: u64,
+    /// Atomic paint-source repair transactions encoded.
+    pub paint_repairs: u64,
+    /// Physical source pixels rasterized across exact paint damage.
+    pub paint_pixels: u64,
+    /// Individual canonical paint items replayed into retained sources.
+    pub paint_items: u64,
+    /// Prepared paint quads submitted into retained sources.
+    pub paint_quads: u64,
+    /// Atomic presentation-cache composition transactions encoded.
+    pub composition_repairs: u64,
+    /// Physical output pixels rebuilt from cached compositor sources.
+    pub composition_pixels: u64,
+    /// Source-scissor pixels admitted to masked composition before exact fragment rejection.
+    pub composition_scissor_pixels: u64,
+    /// Unique cached source quads submitted to masked composition passes.
+    pub composition_sources: u64,
+    /// Final blits that presented a retained UI texture.
+    pub presentations: u64,
+    /// Physical output pixels that sampled the presented UI texture.
+    pub presented_pixels: u64,
 }
 
 /// Atomic render-world counters for retained-layer acceptance tests and diagnostics.
@@ -350,12 +376,17 @@ pub struct RetainedUiLayerWork {
 pub struct RetainedUiLayerCounters {
     surfaces_created: AtomicU64,
     surface_bytes: AtomicU64,
-    repairs: AtomicU64,
-    repair_pixels: AtomicU64,
-    items_replayed: AtomicU64,
-    quads_replayed: AtomicU64,
-    composites: AtomicU64,
-    ui_sample_pixels: AtomicU64,
+    resize_copy_pixels: AtomicU64,
+    paint_repairs: AtomicU64,
+    paint_pixels: AtomicU64,
+    paint_items: AtomicU64,
+    paint_quads: AtomicU64,
+    composition_repairs: AtomicU64,
+    composition_pixels: AtomicU64,
+    composition_scissor_pixels: AtomicU64,
+    composition_sources: AtomicU64,
+    presentations: AtomicU64,
+    presented_pixels: AtomicU64,
 }
 
 impl RetainedUiLayerCounters {
@@ -364,12 +395,17 @@ impl RetainedUiLayerCounters {
         RetainedUiLayerWork {
             surfaces_created: self.surfaces_created.load(Ordering::Relaxed),
             surface_bytes: self.surface_bytes.load(Ordering::Relaxed),
-            repairs: self.repairs.load(Ordering::Relaxed),
-            repair_pixels: self.repair_pixels.load(Ordering::Relaxed),
-            items_replayed: self.items_replayed.load(Ordering::Relaxed),
-            quads_replayed: self.quads_replayed.load(Ordering::Relaxed),
-            composites: self.composites.load(Ordering::Relaxed),
-            ui_sample_pixels: self.ui_sample_pixels.load(Ordering::Relaxed),
+            resize_copy_pixels: self.resize_copy_pixels.load(Ordering::Relaxed),
+            paint_repairs: self.paint_repairs.load(Ordering::Relaxed),
+            paint_pixels: self.paint_pixels.load(Ordering::Relaxed),
+            paint_items: self.paint_items.load(Ordering::Relaxed),
+            paint_quads: self.paint_quads.load(Ordering::Relaxed),
+            composition_repairs: self.composition_repairs.load(Ordering::Relaxed),
+            composition_pixels: self.composition_pixels.load(Ordering::Relaxed),
+            composition_scissor_pixels: self.composition_scissor_pixels.load(Ordering::Relaxed),
+            composition_sources: self.composition_sources.load(Ordering::Relaxed),
+            presentations: self.presentations.load(Ordering::Relaxed),
+            presented_pixels: self.presented_pixels.load(Ordering::Relaxed),
         }
     }
 }
@@ -380,10 +416,12 @@ struct RetainedUiPipelines {
     mask_layout: BindGroupLayoutDescriptor,
     shader: bevy::asset::Handle<bevy::shader::Shader>,
     rect_vertex: VertexState,
+    boundary_vertex: VertexState,
     wipe_pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
     copy_pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
     mask_pipeline: Mutex<Option<CachedRenderPipelineId>>,
     boundary_pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
+    compositor_pipelines: Mutex<HashMap<TextureFormat, CachedRenderPipelineId>>,
 }
 
 impl RetainedUiPipelines {
@@ -486,25 +524,40 @@ impl RetainedUiPipelines {
                 pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
                     label: Some("retained_ui_boundary_pipeline".into()),
                     layout: vec![self.final_layout.clone()],
-                    vertex: VertexState {
-                        shader: self.shader.clone(),
-                        entry_point: Some("boundary_vertex".into()),
-                        buffers: vec![VertexBufferLayout::from_vertex_formats(
-                            VertexStepMode::Instance,
-                            vec![
-                                VertexFormat::Float32x4,
-                                VertexFormat::Float32x2,
-                                VertexFormat::Float32x2,
-                                VertexFormat::Float32x4,
-                                VertexFormat::Float32,
-                                VertexFormat::Float32x2,
-                            ],
-                        )],
-                        ..Default::default()
-                    },
+                    vertex: self.boundary_vertex.clone(),
                     fragment: Some(FragmentState {
                         shader: self.shader.clone(),
                         entry_point: Some("boundary_fragment".into()),
+                        targets: vec![Some(ColorTargetState {
+                            format,
+                            blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                            write_mask: ColorWrites::ALL,
+                        })],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            })
+    }
+
+    fn compositor_pipeline(
+        &self,
+        format: TextureFormat,
+        pipeline_cache: &PipelineCache,
+    ) -> CachedRenderPipelineId {
+        *self
+            .compositor_pipelines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(format)
+            .or_insert_with(|| {
+                pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+                    label: Some("retained_ui_compositor_pipeline".into()),
+                    layout: vec![self.final_layout.clone(), self.mask_layout.clone()],
+                    vertex: self.boundary_vertex.clone(),
+                    fragment: Some(FragmentState {
+                        shader: self.shader.clone(),
+                        entry_point: Some("masked_boundary_fragment".into()),
                         targets: vec![Some(ColorTargetState {
                             format,
                             blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
@@ -535,7 +588,7 @@ fn init_retained_ui_pipelines(mut commands: Commands, asset_server: Res<AssetSer
         mask_layout: crate::mask::layout(),
         shader: shader.clone(),
         rect_vertex: VertexState {
-            shader,
+            shader: shader.clone(),
             shader_defs: Vec::new(),
             entry_point: Some("rect_vertex".into()),
             buffers: vec![VertexBufferLayout {
@@ -548,10 +601,27 @@ fn init_retained_ui_pipelines(mut commands: Commands, asset_server: Res<AssetSer
                 }],
             }],
         },
+        boundary_vertex: VertexState {
+            shader: shader.clone(),
+            entry_point: Some("boundary_vertex".into()),
+            buffers: vec![VertexBufferLayout::from_vertex_formats(
+                VertexStepMode::Instance,
+                vec![
+                    VertexFormat::Float32x4,
+                    VertexFormat::Float32x2,
+                    VertexFormat::Float32x2,
+                    VertexFormat::Float32x4,
+                    VertexFormat::Float32,
+                    VertexFormat::Float32x2,
+                ],
+            )],
+            ..Default::default()
+        },
         wipe_pipelines: Mutex::new(HashMap::new()),
         copy_pipelines: Mutex::new(HashMap::new()),
         mask_pipeline: Mutex::new(None),
         boundary_pipelines: Mutex::new(HashMap::new()),
+        compositor_pipelines: Mutex::new(HashMap::new()),
     });
 }
 
@@ -564,6 +634,25 @@ struct BoundaryInstance {
     uv_rect: [f32; 4],
     opacity: f32,
     target_size: [f32; 2],
+}
+
+#[derive(Resource)]
+struct CompositorInstances(Mutex<RawBufferVec<BoundaryInstance>>);
+
+impl Default for CompositorInstances {
+    fn default() -> Self {
+        let mut instances = RawBufferVec::new(BufferUsages::VERTEX);
+        instances.set_label(Some("retained UI compositor instances"));
+        Self(Mutex::new(instances))
+    }
+}
+
+fn clear_compositor_instances(instances: Res<CompositorInstances>) {
+    instances
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
 }
 
 struct BoundaryBatch {
@@ -721,7 +810,7 @@ fn clear_layer_rects(layer_rects: Res<LayerRects>) {
 }
 
 struct LayerSlot {
-    _texture: Texture,
+    texture: Texture,
     view: TextureView,
     initialized: bool,
     generation: u64,
@@ -733,7 +822,7 @@ struct CommittedDamage {
 }
 
 struct LayerSurface {
-    size: UVec2,
+    bounds: PhysicalRect,
     format: TextureFormat,
     slots: [LayerSlot; 2],
     _mask_texture: Texture,
@@ -745,7 +834,11 @@ struct LayerSurface {
 }
 
 impl LayerSurface {
-    fn new(render_device: &RenderDevice, size: UVec2, format: TextureFormat) -> Self {
+    fn new(render_device: &RenderDevice, bounds: PhysicalRect, format: TextureFormat) -> Self {
+        let size = UVec2::new(
+            (bounds.max_x() - bounds.min_x()) as u32,
+            (bounds.max_y() - bounds.min_y()) as u32,
+        );
         let create_slot = || {
             let texture = render_device.create_texture(&TextureDescriptor {
                 label: Some("retained_ui_layer"),
@@ -766,7 +859,7 @@ impl LayerSurface {
             });
             let view = texture.create_view(&TextureViewDescriptor::default());
             LayerSlot {
-                _texture: texture,
+                texture,
                 view,
                 initialized: false,
                 generation: 0,
@@ -790,7 +883,7 @@ impl LayerSurface {
         let mask_view = mask_texture.create_view(&TextureViewDescriptor::default());
 
         Self {
-            size,
+            bounds,
             format,
             slots: [create_slot(), create_slot()],
             _mask_texture: mask_texture,
@@ -802,20 +895,28 @@ impl LayerSurface {
         }
     }
 
-    fn matches(&self, size: UVec2, format: TextureFormat) -> bool {
-        self.size == size && self.format == format
+    fn size(&self) -> UVec2 {
+        UVec2::new(
+            (self.bounds.max_x() - self.bounds.min_x()) as u32,
+            (self.bounds.max_y() - self.bounds.min_y()) as u32,
+        )
+    }
+
+    fn matches(&self, bounds: PhysicalRect, format: TextureFormat) -> bool {
+        self.bounds == bounds && self.format == format
     }
 
     fn payload_bytes(&self) -> u64 {
-        u64::from(self.size.x)
-            * u64::from(self.size.y)
+        let size = self.size();
+        u64::from(size.x)
+            * u64::from(size.y)
             * u64::from(
                 self.format
                     .block_copy_size(None)
                     .expect("render-attachment formats have a fixed texel size"),
             )
             * self.slots.len() as u64
-            + u64::from(self.size.x) * u64::from(self.size.y)
+            + u64::from(size.x) * u64::from(size.y)
     }
 
     fn commit(&mut self, active: usize, regions: Vec<PhysicalRect>, has_content: bool) {
@@ -842,22 +943,93 @@ impl LayerSurface {
 #[derive(Resource, Default)]
 struct LayerSurfaces(Mutex<HashMap<RetainedViewEntity, LayerSurface>>);
 
+#[derive(Resource, Default)]
+struct ActiveRunViews(Vec<Entity>);
+
+fn prepare_run_views(
+    mut commands: Commands,
+    scene: Res<RetainedUiScene>,
+    mut active: ResMut<ActiveRunViews>,
+    mut phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
+    parents: Query<(&UiCameraView, Option<&bevy::ui_render::UiAntiAlias>)>,
+    extracted_views: Query<&ExtractedView>,
+) {
+    for entity in active.0.drain(..) {
+        if let Ok(mut entity) = commands.get_entity(entity) {
+            entity.try_remove::<(ExtractedView, UiCameraView, bevy::ui_render::UiAntiAlias)>();
+        }
+    }
+    for run in scene.dirty_paint_runs() {
+        let Ok((parent_view, anti_alias)) = parents.get(run.parent) else {
+            continue;
+        };
+        let Ok(parent_view) = extracted_views.get(parent_view.0) else {
+            continue;
+        };
+        let width = (run.bounds.max_x() - run.bounds.min_x()) as u32;
+        let height = (run.bounds.max_y() - run.bounds.min_y()) as u32;
+        let projection = Mat4::orthographic_rh(
+            run.bounds.min_x() as f32,
+            run.bounds.max_x() as f32,
+            run.bounds.max_y() as f32,
+            run.bounds.min_y() as f32,
+            0.0,
+            UI_CAMERA_FAR,
+        );
+        let mut entity = commands.entity(run.view_entity);
+        entity.insert((
+            ExtractedView {
+                retained_view_entity: run.retained_view_entity,
+                clip_from_view: projection,
+                world_from_view: GlobalTransform::from_xyz(
+                    0.0,
+                    0.0,
+                    UI_CAMERA_FAR + UI_CAMERA_TRANSFORM_OFFSET,
+                ),
+                clip_from_world: None,
+                target_format: parent_view.target_format,
+                viewport: UVec4::new(0, 0, width, height),
+                color_grading: Default::default(),
+                invert_culling: false,
+            },
+            UiCameraView(run.view_entity),
+            UiViewTarget(run.view_entity),
+        ));
+        if let Some(anti_alias) = anti_alias {
+            entity.insert(*anti_alias);
+        }
+        phases.prepare_for_new_frame(run.retained_view_entity);
+        active.0.push(run.view_entity);
+    }
+}
+
 fn cleanup_layer_surfaces(
     views: Query<(Entity, &ExtractedView), With<UiViewTarget>>,
     mut boundary_views: ResMut<BoundaryViews>,
+    scene: Res<RetainedUiScene>,
     surfaces: Res<LayerSurfaces>,
     counters: Res<RetainedUiLayerCounters>,
     mut live_camera_views: Local<HashSet<RetainedViewEntity>>,
+    mut live_run_views: Local<HashSet<RetainedViewEntity>>,
 ) {
+    let (created_runs, retired_runs) = scene.take_run_view_changes();
+    live_run_views.extend(created_runs);
+    for view in &retired_runs {
+        live_run_views.remove(view);
+    }
     let current_camera_views: HashSet<_> = views
         .iter()
-        .filter(|(entity, _)| !boundary_views.views.contains_key(entity))
+        .filter(|(entity, view)| {
+            !boundary_views.views.contains_key(entity)
+                && !live_run_views.contains(&view.retained_view_entity)
+        })
         .map(|(_, view)| view.retained_view_entity)
         .collect();
     let mut surfaces = surfaces.0.lock().unwrap_or_else(PoisonError::into_inner);
     let removed_bytes = live_camera_views
         .difference(&current_camera_views)
         .copied()
+        .chain(retired_runs)
         .chain(boundary_views.take_retired())
         .filter_map(|view| surfaces.remove(&view))
         .map(|surface| surface.payload_bytes())
@@ -1070,6 +1242,15 @@ fn clipped_damage_to(plan: &RepairPlan, target: PhysicalRect) -> Vec<PhysicalRec
         .collect()
 }
 
+fn damage_covers(plan: &RepairPlan, target: PhysicalRect) -> bool {
+    plan.regions()
+        .iter()
+        .filter_map(|region| region.intersection(target))
+        .map(|region| region.area())
+        .sum::<u64>()
+        == target.area()
+}
+
 fn translate_rect(rect: PhysicalRect, x: i32, y: i32) -> PhysicalRect {
     PhysicalRect::from_min_max(
         rect.min_x() - x,
@@ -1158,8 +1339,16 @@ struct SurfaceRequest {
     retained_view_entity: RetainedViewEntity,
     paint_entity: Entity,
     bounds: PhysicalRect,
-    size: UVec2,
     format: TextureFormat,
+}
+
+impl SurfaceRequest {
+    fn size(self) -> UVec2 {
+        UVec2::new(
+            (self.bounds.max_x() - self.bounds.min_x()) as u32,
+            (self.bounds.max_y() - self.bounds.min_y()) as u32,
+        )
+    }
 }
 
 struct RepairResources<'a> {
@@ -1170,32 +1359,112 @@ struct RepairResources<'a> {
     counters: &'a RetainedUiLayerCounters,
     render_queue: &'a RenderQueue,
     layer_rects: &'a LayerRects,
+    compositor_instances: &'a CompositorInstances,
     repair_plans: &'a RetainedRepairPlans,
     boundary_views: &'a BoundaryViews,
+}
+
+struct CompositionSource {
+    view: TextureView,
+    instance: BoundaryInstance,
+    scissor: PhysicalRect,
+}
+
+fn composition_instance(
+    transform: bevy::math::Affine2,
+    size: Vec2,
+    opacity: f32,
+    target_origin: Vec2,
+    target_size: Vec2,
+) -> BoundaryInstance {
+    let transform = transform.to_cols_array();
+    BoundaryInstance {
+        transform: [transform[0], transform[1], transform[2], transform[3]],
+        translation: [
+            transform[4] - target_origin.x,
+            transform[5] - target_origin.y,
+        ],
+        size: size.to_array(),
+        uv_rect: [0.0, 0.0, 1.0, 1.0],
+        opacity,
+        target_size: target_size.to_array(),
+    }
 }
 
 fn surface_for_request<'a>(
     request: SurfaceRequest,
     counters: &RetainedUiLayerCounters,
     surfaces: &'a mut HashMap<RetainedViewEntity, LayerSurface>,
-    device: &RenderDevice,
+    ctx: &mut RenderContext,
 ) -> &'a mut LayerSurface {
     let surface = surfaces
         .entry(request.retained_view_entity)
         .or_insert_with(|| {
             counters.surfaces_created.fetch_add(1, Ordering::Relaxed);
-            let surface = LayerSurface::new(device, request.size, request.format);
+            let surface = LayerSurface::new(ctx.render_device(), request.bounds, request.format);
             counters
                 .surface_bytes
                 .fetch_add(surface.payload_bytes(), Ordering::Relaxed);
             surface
         });
-    if surface.matches(request.size, request.format) {
+    if surface.matches(request.bounds, request.format) {
         return surface;
     }
 
     let previous_bytes = surface.payload_bytes();
-    *surface = LayerSurface::new(device, request.size, request.format);
+    let mut replacement = LayerSurface::new(ctx.render_device(), request.bounds, request.format);
+    if surface.format == request.format {
+        for slot in &replacement.slots {
+            clear_layer_slot(ctx, slot);
+        }
+        if surface.has_content
+            && let Some(shared) = surface.bounds.intersection(request.bounds)
+        {
+            let source_origin = bevy::render::render_resource::Origin3d {
+                x: (shared.min_x() - surface.bounds.min_x()) as u32,
+                y: (shared.min_y() - surface.bounds.min_y()) as u32,
+                z: 0,
+            };
+            let destination_origin = bevy::render::render_resource::Origin3d {
+                x: (shared.min_x() - request.bounds.min_x()) as u32,
+                y: (shared.min_y() - request.bounds.min_y()) as u32,
+                z: 0,
+            };
+            for slot in &replacement.slots {
+                ctx.command_encoder().copy_texture_to_texture(
+                    TexelCopyTextureInfo {
+                        texture: &surface.slots[surface.active].texture,
+                        mip_level: 0,
+                        origin: source_origin,
+                        aspect: TextureAspect::All,
+                    },
+                    TexelCopyTextureInfo {
+                        texture: &slot.texture,
+                        mip_level: 0,
+                        origin: destination_origin,
+                        aspect: TextureAspect::All,
+                    },
+                    Extent3d {
+                        width: (shared.max_x() - shared.min_x()) as u32,
+                        height: (shared.max_y() - shared.min_y()) as u32,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            counters.resize_copy_pixels.fetch_add(
+                shared.area() * replacement.slots.len() as u64,
+                Ordering::Relaxed,
+            );
+        }
+        replacement.active = 0;
+        replacement.has_content = surface.has_content;
+        replacement.generation = surface.generation;
+        for slot in &mut replacement.slots {
+            slot.initialized = true;
+            slot.generation = replacement.generation;
+        }
+    }
+    *surface = replacement;
     counters.surfaces_created.fetch_add(1, Ordering::Relaxed);
     let current_bytes = surface.payload_bytes();
     if current_bytes >= previous_bytes {
@@ -1221,19 +1490,28 @@ fn repair_surface(
     surfaces: &mut HashMap<RetainedViewEntity, LayerSurface>,
     ctx: &mut RenderContext,
 ) {
+    let size = request.size();
     let phase = resources.phases.get(&request.retained_view_entity);
     let draw_functions = retained_draw_function_ids(world);
     let scene = world.resource::<RetainedUiScene>();
     let boundary_batches = world.resource::<BoundaryBatches>();
     let existing_matches = surfaces
         .get(&request.retained_view_entity)
-        .is_some_and(|surface| surface.matches(request.size, request.format));
+        .is_some_and(|surface| surface.matches(request.bounds, request.format));
     let Some(repair_plan) = resources.repair_plans.0.get(&request.paint_entity).cloned() else {
         if !existing_matches && scene.has_visible_records(request.paint_entity, request.bounds) {
             scene.invalidate(request.paint_entity, request.bounds);
         }
         return;
     };
+    if surfaces
+        .get(&request.retained_view_entity)
+        .is_some_and(|surface| surface.format != request.format)
+        && !damage_covers(&repair_plan, request.bounds)
+    {
+        scene.invalidate(request.paint_entity, request.bounds);
+        return;
+    }
     let global_damage = clipped_damage_to(&repair_plan, request.bounds);
     if global_damage.is_empty() {
         scene.acknowledge(request.paint_entity, &repair_plan);
@@ -1286,7 +1564,7 @@ fn repair_surface(
         } else {
             true
         };
-    let surface = surface_for_request(request, resources.counters, surfaces, ctx.render_device());
+    let surface = surface_for_request(request, resources.counters, surfaces, ctx);
 
     let repair_pipelines = repair_ready
         .then(|| {
@@ -1331,8 +1609,8 @@ fn repair_surface(
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let rect_start = u32::try_from(layer_rects.len()).expect("repair rectangle count exceeds u32");
-    let width = request.size.x as f32;
-    let height = request.size.y as f32;
+    let width = size.x as f32;
+    let height = size.y as f32;
     layer_rects.extend(sync_regions.iter().chain(&local_damage).map(|region| {
         [
             region.min_x() as f32 * 2.0 / width - 1.0,
@@ -1427,7 +1705,7 @@ fn repair_surface(
         occlusion_query_set: None,
         multiview_mask: None,
     });
-    pass.set_scissor_rect(0, 0, request.size.x, request.size.y);
+    pass.set_scissor_rect(0, 0, size.x, size.y);
     pass.set_vertex_buffer(0, rect_buffer.slice(..));
     if let Some(copy_bind_group) = &copy_bind_group {
         pass.set_render_pipeline(copy_pipeline);
@@ -1464,7 +1742,7 @@ fn repair_surface(
 
             if let Some(start) = full_run_start.take() {
                 let run = start..index;
-                pass.set_scissor_rect(0, 0, request.size.x, request.size.y);
+                pass.set_scissor_rect(0, 0, size.x, size.y);
                 pass.set_bind_group(1, &mask_bind_group, &[]);
                 if let Err(err) = phase.render_range(&mut pass, world, request.view_entity, run) {
                     result = Err(err);
@@ -1524,18 +1802,21 @@ fn repair_surface(
         Ok(()) => {
             let repaired_pixels = local_damage.iter().map(PhysicalRect::area).sum::<u64>();
             surface.commit(pending, local_damage, has_content);
-            resources.counters.repairs.fetch_add(1, Ordering::Relaxed);
             resources
                 .counters
-                .repair_pixels
+                .paint_repairs
+                .fetch_add(1, Ordering::Relaxed);
+            resources
+                .counters
+                .paint_pixels
                 .fetch_add(repaired_pixels, Ordering::Relaxed);
             resources
                 .counters
-                .items_replayed
+                .paint_items
                 .fetch_add(replayed, Ordering::Relaxed);
             resources
                 .counters
-                .quads_replayed
+                .paint_quads
                 .fetch_add(replayed_quads, Ordering::Relaxed);
             scene.acknowledge(request.paint_entity, &repair_plan);
         }
@@ -1547,6 +1828,327 @@ fn repair_surface(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one atomic composition keeps source preflight, synchronization, replay, and commit together"
+)]
+fn compose_surface(
+    world: &World,
+    request: SurfaceRequest,
+    compositor: &[RetainedCompositorEntry],
+    resources: &RepairResources<'_>,
+    surfaces: &mut HashMap<RetainedViewEntity, LayerSurface>,
+    ctx: &mut RenderContext,
+) {
+    let size = request.size();
+    let scene = world.resource::<RetainedUiScene>();
+    let Some(repair_plan) = resources.repair_plans.0.get(&request.paint_entity).cloned() else {
+        return;
+    };
+    if surfaces
+        .get(&request.retained_view_entity)
+        .is_some_and(|surface| surface.format != request.format)
+        && !damage_covers(&repair_plan, request.bounds)
+    {
+        scene.invalidate(request.paint_entity, request.bounds);
+        return;
+    }
+    let global_damage = clipped_damage_to(&repair_plan, request.bounds);
+    if global_damage.is_empty() {
+        scene.acknowledge(request.paint_entity, &repair_plan);
+        return;
+    }
+
+    let target_origin = Vec2::new(request.bounds.min_x() as f32, request.bounds.min_y() as f32);
+    let target_size = size.as_vec2();
+    let mut sources = Vec::with_capacity(compositor.len());
+    for entry in compositor {
+        let (retained_view_entity, instance, repair_bounds) = match entry {
+            RetainedCompositorEntry::PaintRun(run) => {
+                if scene.has_damage(run.view_entity) {
+                    return;
+                }
+                let size = Vec2::new(
+                    (run.bounds.max_x() - run.bounds.min_x()) as f32,
+                    (run.bounds.max_y() - run.bounds.min_y()) as f32,
+                );
+                let center = Vec2::new(
+                    (run.bounds.min_x() + run.bounds.max_x()) as f32 * 0.5,
+                    (run.bounds.min_y() + run.bounds.max_y()) as f32 * 0.5,
+                );
+                (
+                    run.retained_view_entity,
+                    composition_instance(
+                        bevy::math::Affine2::from_translation(center),
+                        size,
+                        1.0,
+                        target_origin,
+                        target_size,
+                    ),
+                    run.repair_bounds,
+                )
+            }
+            RetainedCompositorEntry::Boundary {
+                draw,
+                repair_bounds,
+            } => {
+                if scene.has_damage(draw.surface) {
+                    return;
+                }
+                let Some(view) = resources.boundary_views.views.get(&draw.surface) else {
+                    return;
+                };
+                (
+                    view.retained_view_entity,
+                    composition_instance(
+                        draw.transform,
+                        draw.size,
+                        draw.opacity,
+                        target_origin,
+                        target_size,
+                    ),
+                    *repair_bounds,
+                )
+            }
+        };
+        let Some(source) = surfaces.get(&retained_view_entity) else {
+            return;
+        };
+        if !source.slots[source.active].initialized {
+            return;
+        }
+        if !source.has_content {
+            continue;
+        }
+        let Some(scissor) = repair_bounds.intersection(request.bounds) else {
+            continue;
+        };
+        sources.push(CompositionSource {
+            view: source.slots[source.active].view.clone(),
+            instance,
+            scissor: translate_rect(scissor, request.bounds.min_x(), request.bounds.min_y()),
+        });
+    }
+
+    let pipeline_ids = (
+        resources
+            .pipelines
+            .wipe_pipeline(request.format, resources.pipeline_cache),
+        resources
+            .pipelines
+            .copy_pipeline(request.format, resources.pipeline_cache),
+        resources
+            .pipelines
+            .compositor_pipeline(request.format, resources.pipeline_cache),
+        resources.pipelines.mask_pipeline(resources.pipeline_cache),
+    );
+    let Some(wipe_pipeline) = resources.pipeline_cache.get_render_pipeline(pipeline_ids.0) else {
+        return;
+    };
+    let Some(copy_pipeline) = resources.pipeline_cache.get_render_pipeline(pipeline_ids.1) else {
+        return;
+    };
+    let Some(composite_pipeline) = resources.pipeline_cache.get_render_pipeline(pipeline_ids.2)
+    else {
+        return;
+    };
+    let Some(mask_pipeline) = resources.pipeline_cache.get_render_pipeline(pipeline_ids.3) else {
+        return;
+    };
+
+    let surface = surface_for_request(request, resources.counters, surfaces, ctx);
+    let local_damage: Vec<_> = global_damage
+        .iter()
+        .map(|region| translate_rect(*region, request.bounds.min_x(), request.bounds.min_y()))
+        .collect();
+    let pending = 1 - surface.active;
+    let mut sync_regions = pending_sync_regions(surface, pending, ctx);
+    if sync_regions == local_damage {
+        sync_regions.clear();
+    }
+
+    let mut layer_rects = resources
+        .layer_rects
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let rect_start = u32::try_from(layer_rects.len()).expect("repair rectangle count exceeds u32");
+    let width = size.x as f32;
+    let height = size.y as f32;
+    layer_rects.extend(sync_regions.iter().chain(&local_damage).map(|region| {
+        [
+            region.min_x() as f32 * 2.0 / width - 1.0,
+            1.0 - region.min_y() as f32 * 2.0 / height,
+            region.max_x() as f32 * 2.0 / width - 1.0,
+            1.0 - region.max_y() as f32 * 2.0 / height,
+        ]
+    }));
+    let rect_end = layer_rects.len();
+    let upload_start = if rect_end > layer_rects.capacity() {
+        layer_rects.reserve(rect_end.next_power_of_two(), ctx.render_device());
+        0
+    } else {
+        rect_start as usize
+    };
+    layer_rects
+        .write_buffer_range(resources.render_queue, upload_start..rect_end)
+        .expect("the composition rectangle arena was reserved before upload");
+    let rect_buffer = layer_rects
+        .buffer()
+        .expect("nonempty composition damage must allocate a rectangle buffer");
+    let sync_instances =
+        u32::try_from(sync_regions.len()).expect("sync rectangle count exceeds u32");
+    let damage_instances =
+        u32::try_from(local_damage.len()).expect("wipe rectangle count exceeds u32");
+    let sync_range = rect_start..rect_start + sync_instances;
+    let damage_range = sync_range.end..sync_range.end + damage_instances;
+    let copy_bind_group = (!sync_regions.is_empty()).then(|| {
+        let source = &surface.slots[surface.active].view;
+        ctx.render_device().create_bind_group(
+            "retained_ui_composition_copy_bind_group",
+            &resources
+                .pipeline_cache
+                .get_bind_group_layout(&resources.pipelines.final_layout),
+            &BindGroupEntries::sequential((source, source, &resources.blit_pipeline.sampler)),
+        )
+    });
+    let mask_bind_group = ctx.render_device().create_bind_group(
+        "retained_ui_composition_damage_mask_bind_group",
+        &resources
+            .pipeline_cache
+            .get_bind_group_layout(&resources.pipelines.mask_layout),
+        &BindGroupEntries::single(&surface.mask_view),
+    );
+
+    let mut instances = resources
+        .compositor_instances
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let instance_start =
+        u32::try_from(instances.len()).expect("retained compositor source count exceeds u32");
+    instances.extend(sources.iter().map(|source| source.instance));
+    let instance_end = instances.len();
+    let instance_buffer = if sources.is_empty() {
+        None
+    } else {
+        let instance_upload_start = if instance_end > instances.capacity() {
+            instances.reserve(instance_end.next_power_of_two(), ctx.render_device());
+            0
+        } else {
+            instance_start as usize
+        };
+        instances
+            .write_buffer_range(resources.render_queue, instance_upload_start..instance_end)
+            .expect("the compositor instance arena was reserved before upload");
+        instances.buffer()
+    };
+    let bind_groups: Vec<_> = sources
+        .iter()
+        .map(|source| {
+            ctx.render_device().create_bind_group(
+                "retained_ui_compositor_source_bind_group",
+                &resources
+                    .pipeline_cache
+                    .get_bind_group_layout(&resources.pipelines.final_layout),
+                &BindGroupEntries::sequential((
+                    &source.view,
+                    &source.view,
+                    &resources.blit_pipeline.sampler,
+                )),
+            )
+        })
+        .collect();
+
+    {
+        let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("retained_ui_composition_damage_mask"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &surface.mask_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Default::default()),
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_render_pipeline(mask_pipeline);
+        pass.set_vertex_buffer(0, rect_buffer.slice(..));
+        pass.draw(0..6, damage_range.clone());
+    }
+
+    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("retained_ui_ordered_composition"),
+        color_attachments: &[Some(RenderPassColorAttachment {
+            view: &surface.slots[pending].view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations {
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_vertex_buffer(0, rect_buffer.slice(..));
+    if let Some(copy_bind_group) = &copy_bind_group {
+        pass.set_render_pipeline(copy_pipeline);
+        pass.set_bind_group(0, copy_bind_group, &[]);
+        pass.draw(0..6, sync_range);
+    }
+    pass.set_render_pipeline(wipe_pipeline);
+    pass.draw(0..6, damage_range);
+    if !sources.is_empty() {
+        let instance_buffer =
+            instance_buffer.expect("visible compositor sources must allocate an instance buffer");
+        pass.set_render_pipeline(composite_pipeline);
+        pass.set_bind_group(1, &mask_bind_group, &[]);
+        pass.set_vertex_buffer(0, instance_buffer.slice(..));
+        for (index, (source, bind_group)) in sources.iter().zip(&bind_groups).enumerate() {
+            pass.set_scissor_rect(
+                source.scissor.min_x() as u32,
+                source.scissor.min_y() as u32,
+                (source.scissor.max_x() - source.scissor.min_x()) as u32,
+                (source.scissor.max_y() - source.scissor.min_y()) as u32,
+            );
+            pass.set_bind_group(0, bind_group, &[]);
+            let index = instance_start
+                + u32::try_from(index).expect("retained compositor source count exceeds u32");
+            pass.draw(0..6, index..index + 1);
+        }
+    }
+    drop(pass);
+
+    let repaired_pixels = local_damage.iter().map(PhysicalRect::area).sum::<u64>();
+    let replayed = sources.len();
+    surface.commit(pending, local_damage, !sources.is_empty());
+    resources
+        .counters
+        .composition_repairs
+        .fetch_add(1, Ordering::Relaxed);
+    resources
+        .counters
+        .composition_pixels
+        .fetch_add(repaired_pixels, Ordering::Relaxed);
+    resources.counters.composition_scissor_pixels.fetch_add(
+        sources.iter().map(|source| source.scissor.area()).sum(),
+        Ordering::Relaxed,
+    );
+    resources.counters.composition_sources.fetch_add(
+        u64::try_from(replayed).expect("retained compositor replay count exceeds u64"),
+        Ordering::Relaxed,
+    );
+    scene.acknowledge(request.paint_entity, &repair_plan);
+}
+
 fn rebuild_surface(
     world: &World,
     request: SurfaceRequest,
@@ -1554,6 +2156,7 @@ fn rebuild_surface(
     surfaces: &mut HashMap<RetainedViewEntity, LayerSurface>,
     ctx: &mut RenderContext,
 ) -> bool {
+    let size = request.size();
     let Some(repair_plan) = resources.repair_plans.0.get(&request.paint_entity).cloned() else {
         return false;
     };
@@ -1574,7 +2177,7 @@ fn rebuild_surface(
     {
         return false;
     }
-    let surface = surface_for_request(request, resources.counters, surfaces, ctx.render_device());
+    let surface = surface_for_request(request, resources.counters, surfaces, ctx);
     let pending = 1 - surface.active;
     let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("retained_ui_full_rebuild"),
@@ -1614,24 +2217,67 @@ fn rebuild_surface(
         items += counts.0;
         quads += counts.1;
     }
-    let full = PhysicalRect::from_min_max(0, 0, request.size.x as i32, request.size.y as i32)
+    let full = PhysicalRect::from_min_max(0, 0, size.x as i32, size.y as i32)
         .expect("retained UI surfaces are nonempty");
     surface.commit(pending, vec![full], true);
-    resources.counters.repairs.fetch_add(1, Ordering::Relaxed);
     resources
         .counters
-        .repair_pixels
+        .paint_repairs
+        .fetch_add(1, Ordering::Relaxed);
+    resources
+        .counters
+        .paint_pixels
         .fetch_add(full.area(), Ordering::Relaxed);
     resources
         .counters
-        .items_replayed
+        .paint_items
         .fetch_add(items, Ordering::Relaxed);
     resources
         .counters
-        .quads_replayed
+        .paint_quads
         .fetch_add(quads, Ordering::Relaxed);
     scene.acknowledge(request.paint_entity, &repair_plan);
     true
+}
+
+fn repair_compositor_runs(
+    world: &World,
+    compositor: &[RetainedCompositorEntry],
+    format: TextureFormat,
+    resources: &RepairResources<'_>,
+    surfaces: &mut HashMap<RetainedViewEntity, LayerSurface>,
+    ctx: &mut RenderContext,
+) {
+    for entry in compositor {
+        let RetainedCompositorEntry::PaintRun(RetainedPaintRun {
+            view_entity,
+            retained_view_entity,
+            bounds,
+            ..
+        }) = entry
+        else {
+            continue;
+        };
+        if !resources.repair_plans.0.contains_key(view_entity) {
+            continue;
+        }
+        let request = SurfaceRequest {
+            view_entity: *view_entity,
+            retained_view_entity: *retained_view_entity,
+            paint_entity: *view_entity,
+            bounds: *bounds,
+            format,
+        };
+        if world
+            .resource::<RetainedFullRebuilds>()
+            .0
+            .contains(view_entity)
+        {
+            rebuild_surface(world, request, resources, surfaces, ctx);
+        } else {
+            repair_surface(world, request, resources, surfaces, ctx);
+        }
+    }
 }
 
 #[expect(
@@ -1656,6 +2302,7 @@ fn retained_ui_pass(
     counters: Res<RetainedUiLayerCounters>,
     render_queue: Res<RenderQueue>,
     layer_rects: Res<LayerRects>,
+    compositor_instances: Res<CompositorInstances>,
     repair_plans: Res<RetainedRepairPlans>,
     mut ctx: RenderContext,
 ) {
@@ -1695,26 +2342,45 @@ fn retained_ui_pass(
         counters: &counters,
         render_queue: &render_queue,
         layer_rects: &layer_rects,
+        compositor_instances: &compositor_instances,
         repair_plans: &repair_plans,
         boundary_views,
     };
+    let scene = world.resource::<RetainedUiScene>();
     if !boundaries.is_empty() {
         let mut surfaces = surfaces.0.lock().unwrap_or_else(PoisonError::into_inner);
         for boundary in boundaries {
-            repair_surface(
-                world,
-                SurfaceRequest {
-                    view_entity: boundary.surface,
-                    retained_view_entity: boundary.retained_view_entity,
-                    paint_entity: boundary.surface,
-                    bounds: boundary.rect,
-                    size: boundary.size(),
-                    format: boundary.format,
-                },
-                &repair_resources,
-                &mut surfaces,
-                &mut ctx,
-            );
+            let request = SurfaceRequest {
+                view_entity: boundary.surface,
+                retained_view_entity: boundary.retained_view_entity,
+                paint_entity: boundary.surface,
+                bounds: boundary.rect,
+                format: boundary.format,
+            };
+            if let Some(compositor) = repair_plans
+                .0
+                .get(&boundary.surface)
+                .and_then(|damage| scene.compositor(boundary.surface, damage))
+            {
+                repair_compositor_runs(
+                    world,
+                    &compositor.entries,
+                    boundary.format,
+                    &repair_resources,
+                    &mut surfaces,
+                    &mut ctx,
+                );
+                compose_surface(
+                    world,
+                    request,
+                    &compositor.entries,
+                    &repair_resources,
+                    &mut surfaces,
+                    &mut ctx,
+                );
+            } else {
+                repair_surface(world, request, &repair_resources, &mut surfaces, &mut ctx);
+            }
         }
     }
 
@@ -1723,18 +2389,42 @@ fn retained_ui_pass(
         retained_view_entity: extracted_view.retained_view_entity,
         paint_entity: ui_view_target.0,
         bounds: target_rect(size),
-        size,
         format: extracted_view.target_format,
     };
     let mut surfaces = surfaces.0.lock().unwrap_or_else(PoisonError::into_inner);
-    let full_rebuild = world
-        .resource::<RetainedFullRebuilds>()
-        .0
-        .contains(&request.paint_entity);
-    if full_rebuild {
-        rebuild_surface(world, request, &repair_resources, &mut surfaces, &mut ctx);
-    } else {
-        repair_surface(world, request, &repair_resources, &mut surfaces, &mut ctx);
+    if scene.has_damage(request.paint_entity) {
+        if let Some(compositor) = repair_plans
+            .0
+            .get(&request.paint_entity)
+            .and_then(|damage| scene.compositor(request.paint_entity, damage))
+        {
+            repair_compositor_runs(
+                world,
+                &compositor.entries,
+                request.format,
+                &repair_resources,
+                &mut surfaces,
+                &mut ctx,
+            );
+            compose_surface(
+                world,
+                request,
+                &compositor.entries,
+                &repair_resources,
+                &mut surfaces,
+                &mut ctx,
+            );
+        } else {
+            let full_rebuild = world
+                .resource::<RetainedFullRebuilds>()
+                .0
+                .contains(&request.paint_entity);
+            if full_rebuild {
+                rebuild_surface(world, request, &repair_resources, &mut surfaces, &mut ctx);
+            } else {
+                repair_surface(world, request, &repair_resources, &mut surfaces, &mut ctx);
+            }
+        }
     }
     let Some(surface) = surfaces.get(&extracted_view.retained_view_entity) else {
         return;
@@ -1747,9 +2437,9 @@ fn retained_ui_pass(
                 fills_target,
             }),
         );
-        counters.composites.fetch_add(1, Ordering::Relaxed);
+        counters.presentations.fetch_add(1, Ordering::Relaxed);
         counters
-            .ui_sample_pixels
+            .presented_pixels
             .fetch_add(u64::from(size.x) * u64::from(size.y), Ordering::Relaxed);
     }
 }
