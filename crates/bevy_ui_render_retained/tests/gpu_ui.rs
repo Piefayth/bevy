@@ -6985,9 +6985,21 @@ fn two_material_kinds_render_together() {
                 Camera2d,
                 Camera {
                     clear_color: ClearColorConfig::Custom(Color::BLACK),
+                    viewport: Some(Viewport {
+                        physical_position: UVec2::ZERO,
+                        physical_size: UVec2::new(WIDTH, HEIGHT / 2),
+                        depth: 0.0..1.0,
+                    }),
                     ..default()
                 },
-                RenderTarget::Image(image.clone().into()),
+                RenderTarget::Image(bevy::camera::ImageRenderTarget {
+                    handle: image.clone(),
+                    // Device scale: the game runs @3x, and slicing does
+                    // physical-pixel math everywhere. 2x here keeps the
+                    // 64px probe target while exercising the scaling.
+                    scale_factor: 2.0,
+                }),
+                bevy::ui::UiFillsTarget,
             ))
             .id();
         let white = {
@@ -7104,5 +7116,235 @@ fn two_material_kinds_render_together() {
             [0, 255, 0],
             "the OTHER material kind survives its neighbor's churn"
         );
+    });
+}
+
+/// A PANEL RACK: many nodes of ONE material type, each with its own
+/// asset, one of them easing its params every frame (a charge fill, a
+/// context-dim ease). Every sibling must survive the churn and the
+/// eased panel must keep rendering through every key change — ON A
+/// FILLS-TARGET CAMERA WITH A LETTERBOXED VIEWPORT, the shape a game
+/// window actually has (the interface owns the whole target while the
+/// world renders a band). Fills-target and the ordered compositor were
+/// developed independently and merged; this is their cross.
+#[test]
+fn many_distinct_assets_survive_one_easing() {
+    with_gpu_lock(|| {
+        let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+        configure_test_ui_material(&mut app, UiRenderer::Retained);
+
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
+            | TextureUsages::RENDER_ATTACHMENT;
+        let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                Camera {
+                    clear_color: ClearColorConfig::Custom(Color::BLACK),
+                    viewport: Some(Viewport {
+                        physical_position: UVec2::ZERO,
+                        physical_size: UVec2::new(WIDTH, HEIGHT / 2),
+                        depth: 0.0..1.0,
+                    }),
+                    ..default()
+                },
+                RenderTarget::Image(bevy::camera::ImageRenderTarget {
+                    handle: image.clone(),
+                    // Device scale: the game runs @3x, and slicing does
+                    // physical-pixel math everywhere. 2x here keeps the
+                    // 64px probe target while exercising the scaling.
+                    scale_factor: 2.0,
+                }),
+                bevy::ui::UiFillsTarget,
+            ))
+            .id();
+        let white = {
+            let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+            images.add(Image::new_fill(
+                Extent3d {
+                    width: 4,
+                    height: 4,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                &[255, 255, 255, 255],
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            ))
+        };
+        // Six panels, six ASSETS, one shared type — a module rack.
+        let mut handles = Vec::new();
+        for i in 0..6u32 {
+            let handle = app
+                .world_mut()
+                .resource_mut::<Assets<TestUiMaterial>>()
+                .add(TestUiMaterial {
+                    color: Vec4::new(1.0, 0.2 + 0.1 * i as f32, 0.0, 1.0),
+                    image: white.clone(),
+                    volatile: false,
+                    target_coverage: false,
+                });
+            app.world_mut().spawn((
+                MaterialNode(handle.clone()),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px((4 + i * 10) as i32),
+                    top: px(4),
+                    width: px(8),
+                    height: px(12),
+                    ..default()
+                },
+                bevy::ui::UiTargetCamera(camera),
+            ));
+            handles.push(handle);
+        }
+
+        let pixels = Arc::new(Mutex::new(None));
+        let observer_pixels = Arc::clone(&pixels);
+        app.world_mut().spawn(Readback::texture(image)).observe(
+            move |event: On<ReadbackComplete>| {
+                *observer_pixels
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
+            },
+        );
+        app.finish();
+        app.cleanup();
+        for _ in 0..20 {
+            step_and_wait(&mut app);
+        }
+        capture_fresh(&mut app, &pixels);
+
+        // Panel 2 eases every frame (distinct exact key per frame).
+        for step in 0..30 {
+            let g = 0.2 + 0.6 * (step as f32 / 30.0);
+            app.world_mut()
+                .resource_mut::<Assets<TestUiMaterial>>()
+                .get_mut(&handles[2])
+                .unwrap()
+                .color = Vec4::new(1.0, g, 0.0, 1.0);
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        let at = |f: &Vec<u8>, x: u32, y: u32| {
+            let i = ((y * WIDTH + x) * BYTES_PER_PIXEL as u32) as usize;
+            [f[i], f[i + 1], f[i + 2]]
+        };
+        for i in 0..3u32 {
+            let px_val = at(&frame, (8 + i * 10) * 2, 20);
+            assert!(
+                px_val[0] > 200,
+                "panel {i} vanished after a sibling's easing (got {px_val:?})"
+            );
+        }
+
+        // THE FIRST TOAST ARRIVES: a boundary spawns mid-run above the
+        // rack, forcing the compositor to re-slice the parent layer.
+        // Every panel must survive the re-slice, and keep surviving
+        // while the boundary slides and the easing continues.
+        let toast = app
+            .world_mut()
+            .spawn((
+                RepaintBoundary::IDENTITY,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(4),
+                    top: px(24),
+                    width: px(24),
+                    height: px(10),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb_u8(0, 0, 255)),
+                bevy::ui::UiTargetCamera(camera),
+            ))
+            .id();
+        for step in 0..12 {
+            let g = 0.2 + 0.6 * (step as f32 / 12.0);
+            app.world_mut()
+                .resource_mut::<Assets<TestUiMaterial>>()
+                .get_mut(&handles[2])
+                .unwrap()
+                .color = Vec4::new(1.0, g, 0.0, 1.0);
+            app.world_mut()
+                .entity_mut(toast)
+                .get_mut::<RepaintBoundary>()
+                .unwrap()
+                .transform = UiTransform::from_translation(Val2::px(step as f32 * 2.0, 0.0));
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        for i in 0..3u32 {
+            let px_val = at(&frame, (8 + i * 10) * 2, 20);
+            assert!(
+                px_val[0] > 200,
+                "panel {i} vanished after a boundary spawned and slid (got {px_val:?})"
+            );
+        }
+        assert!(
+            at(&frame, 60, 56)[2] > 200,
+            "the boundary itself should be visible over the rack region"
+        );
+
+        // THE STRIP REBUILD: server state lands and the whole rack is
+        // despawned and respawned in ONE frame with FRESH assets — the
+        // moment a live game's deck reboots. Everything must come back.
+        let world = app.world_mut();
+        let mut rack_nodes = world
+            .query_filtered::<Entity, With<MaterialNode<TestUiMaterial>>>()
+            .iter(world)
+            .collect::<Vec<_>>();
+        for e in rack_nodes.drain(..) {
+            world.entity_mut(e).despawn();
+        }
+        let mut fresh = Vec::new();
+        for i in 0..6u32 {
+            let handle = app
+                .world_mut()
+                .resource_mut::<Assets<TestUiMaterial>>()
+                .add(TestUiMaterial {
+                    color: Vec4::new(1.0, 0.8, 0.0, 1.0),
+                    image: white.clone(),
+                    volatile: false,
+                    target_coverage: false,
+                });
+            app.world_mut().spawn((
+                MaterialNode(handle.clone()),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px((4 + i * 10) as i32),
+                    top: px(4),
+                    width: px(8),
+                    height: px(12),
+                    ..default()
+                },
+                bevy::ui::UiTargetCamera(camera),
+            ));
+            fresh.push(handle);
+        }
+        for _ in 0..8 {
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        for i in 0..3u32 {
+            let px_val = at(&frame, (8 + i * 10) * 2, 20);
+            assert!(
+                px_val[0] > 200 && px_val[1] > 150,
+                "panel {i} did not survive the one-frame rack rebuild (got {px_val:?})"
+            );
+        }
     });
 }
