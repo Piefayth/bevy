@@ -6189,13 +6189,13 @@ fn a_boundary_reflow_repositions_without_repair() {
 
         let pixels = Arc::new(Mutex::new(None));
         let observer_pixels = Arc::clone(&pixels);
-        app.world_mut()
-            .spawn(Readback::texture(image))
-            .observe(move |event: On<ReadbackComplete>| {
+        app.world_mut().spawn(Readback::texture(image)).observe(
+            move |event: On<ReadbackComplete>| {
                 *observer_pixels
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
-            });
+            },
+        );
         app.finish();
         app.cleanup();
         for _ in 0..20 {
@@ -6225,11 +6225,7 @@ fn a_boundary_reflow_repositions_without_repair() {
             [0, 255, 0],
             "after the reflow the green toast should occupy the first slot"
         );
-        assert_eq!(
-            at(&frame, 8, 20),
-            [0, 0, 255],
-            "and blue the second"
-        );
+        assert_eq!(at(&frame, 8, 20), [0, 0, 255], "and blue the second");
         // ...and the move billed NO repair: cached surfaces recomposited
         // at new offsets, no pixels repainted.
         assert_eq!(
@@ -6301,13 +6297,13 @@ fn a_boundary_transform_slide_bills_no_repair() {
 
         let pixels = Arc::new(Mutex::new(None));
         let observer_pixels = Arc::clone(&pixels);
-        app.world_mut()
-            .spawn(Readback::texture(image))
-            .observe(move |event: On<ReadbackComplete>| {
+        app.world_mut().spawn(Readback::texture(image)).observe(
+            move |event: On<ReadbackComplete>| {
                 *observer_pixels
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
-            });
+            },
+        );
         app.finish();
         app.cleanup();
         for _ in 0..20 {
@@ -6322,9 +6318,8 @@ fn a_boundary_transform_slide_bills_no_repair() {
                 .entity_mut(toast)
                 .get_mut::<RepaintBoundary>()
                 .unwrap()
-                .transform = bevy::ui::UiTransform::from_translation(
-                bevy::ui::Val2::px(step as f32 * 2.0, 0.0),
-            );
+                .transform =
+                bevy::ui::UiTransform::from_translation(bevy::ui::Val2::px(step as f32 * 2.0, 0.0));
             step_and_wait(&mut app);
         }
         let frame = capture_fresh(&mut app, &pixels);
