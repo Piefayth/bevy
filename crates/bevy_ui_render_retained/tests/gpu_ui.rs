@@ -6738,13 +6738,13 @@ fn a_boundary_stowed_offscreen_appears_when_slid_in() {
 
         let pixels = Arc::new(Mutex::new(None));
         let observer_pixels = Arc::clone(&pixels);
-        app.world_mut()
-            .spawn(Readback::texture(image))
-            .observe(move |event: On<ReadbackComplete>| {
+        app.world_mut().spawn(Readback::texture(image)).observe(
+            move |event: On<ReadbackComplete>| {
                 *observer_pixels
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
-            });
+            },
+        );
         app.finish();
         app.cleanup();
         for _ in 0..20 {
@@ -6767,8 +6767,7 @@ fn a_boundary_stowed_offscreen_appears_when_slid_in() {
                 .entity_mut(toast)
                 .get_mut::<RepaintBoundary>()
                 .unwrap()
-                .transform =
-                UiTransform::from_translation(Val2::px(24.0 - step as f32 * 4.0, 0.0));
+                .transform = UiTransform::from_translation(Val2::px(24.0 - step as f32 * 4.0, 0.0));
             step_and_wait(&mut app);
         }
         let frame = capture_fresh(&mut app, &pixels);
@@ -6782,14 +6781,18 @@ fn a_boundary_stowed_offscreen_appears_when_slid_in() {
 
 /// The game-shaped toast: spawned MID-RUN into a live flex rack, born
 /// stowed via boundary transform, carrying a retained-material child
-/// (the cart's screen film) and text. On device this cart never
-/// appears; the minimal stowed case above passes — this test carries
-/// the extra ingredients to find the discriminator.
+/// (the cart's screen film). Every ingredient of a notice cart's life,
+/// end to end, on the ordered compositor.
 #[test]
 fn a_mid_run_stowed_cart_with_material_child_appears() {
     with_gpu_lock(|| {
         let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
-        app.add_plugins(RetainedUiMaterialPlugin::<SecondTestUiMaterial>::default());
+        // An earlier draft added the plugin WITHOUT the embedded shader and
+        // manufactured a permanent ShaderNotLoaded, indistinguishable on
+        // screen from a renderer defect. The pipeline's silence was the
+        // whole misdirection.
+        embedded_asset!(app, "tests", "test_ui_material.wgsl");
+        app.add_plugins(RetainedUiMaterialPlugin::<TestUiMaterial>::default());
 
         let mut image = Image::new_fill(
             Extent3d {
@@ -6837,13 +6840,13 @@ fn a_mid_run_stowed_cart_with_material_child_appears() {
 
         let pixels = Arc::new(Mutex::new(None));
         let observer_pixels = Arc::clone(&pixels);
-        app.world_mut()
-            .spawn(Readback::texture(image))
-            .observe(move |event: On<ReadbackComplete>| {
+        app.world_mut().spawn(Readback::texture(image)).observe(
+            move |event: On<ReadbackComplete>| {
                 *observer_pixels
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
-            });
+            },
+        );
         app.finish();
         app.cleanup();
         // The scene is LIVE before the toast exists.
@@ -6854,11 +6857,28 @@ fn a_mid_run_stowed_cart_with_material_child_appears() {
 
         // The event fires: a cart spawns mid-run, stowed, with a
         // material screen in its cell.
+        let screen_image = {
+            let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+            images.add(Image::new_fill(
+                Extent3d {
+                    width: 4,
+                    height: 4,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                &[0, 255, 0, 255],
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            ))
+        };
         let material = app
             .world_mut()
-            .resource_mut::<Assets<SecondTestUiMaterial>>()
-            .add(SecondTestUiMaterial {
+            .resource_mut::<Assets<TestUiMaterial>>()
+            .add(TestUiMaterial {
                 color: Vec4::new(0.0, 1.0, 0.0, 1.0),
+                image: screen_image,
+                volatile: false,
+                target_coverage: false,
             });
         let world = app.world_mut();
         let cart = world
@@ -6900,8 +6920,7 @@ fn a_mid_run_stowed_cart_with_material_child_appears() {
                 .entity_mut(cart)
                 .get_mut::<RepaintBoundary>()
                 .unwrap()
-                .transform =
-                UiTransform::from_translation(Val2::px(24.0 - step as f32 * 4.0, 0.0));
+                .transform = UiTransform::from_translation(Val2::px(24.0 - step as f32 * 4.0, 0.0));
             step_and_wait(&mut app);
         }
         // Generous settle: if the cart shows up only after MANY extra

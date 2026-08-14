@@ -1076,6 +1076,7 @@ fn phase_is_repair_ready(
     (0..phase.items.len()).all(|index| {
         let item = phase.items.get_index(index).unwrap().1;
         let boundary = item.draw_function == draw_functions.boundary;
+
         let core_image = draw_functions
             .is_core(item.draw_function)
             .then(|| core.image(item.entity()))
