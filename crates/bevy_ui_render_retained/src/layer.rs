@@ -1305,7 +1305,7 @@ fn pending_sync_regions(
     ctx: &mut RenderContext,
 ) -> Vec<PhysicalRect> {
     let pending_slot = &surface.slots[pending];
-    if !pending_slot.initialized {
+    if !pending_slot.initialized || !surface.has_content {
         clear_layer_slot(ctx, pending_slot);
     }
     if !surface.has_content {
@@ -1318,20 +1318,6 @@ fn pending_sync_regions(
         .filter(|damage| damage.generation > pending_slot.generation)
         .flat_map(|damage| damage.regions.iter().copied())
         .collect()
-}
-
-fn phase_has_drawable_items(
-    phase: Option<&bevy::render::render_phase::SortedRenderPhase<TransparentUi>>,
-    world: &World,
-    draw_functions: RetainedDrawFunctionIds,
-) -> bool {
-    let Some(phase) = phase else {
-        return false;
-    };
-    (0..phase.items.len()).any(|index| {
-        let item = phase.items.get_index(index).unwrap().1;
-        item_batch_range(world, item, draw_functions).is_some_and(|range| !range.is_empty())
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -1528,7 +1514,8 @@ fn repair_surface(
     let material_pending = world
         .resource::<RetainedPendingMaterials>()
         .contains(request.paint_entity);
-    let has_visible_records = scene.has_visible_records(request.paint_entity, request.bounds);
+    let has_content = scene.has_visible_records(request.paint_entity, request.bounds);
+    let damage_has_content = scene.has_visible_records_in(request.paint_entity, &global_damage);
     let boundary_sources: HashMap<_, _> = if boundary_batches.batches.is_empty() {
         HashMap::default()
     } else {
@@ -1557,7 +1544,7 @@ fn repair_surface(
         });
     let repair_ready = boundaries_ready
         && !material_pending
-        && if has_visible_records {
+        && if damage_has_content {
             phase.is_some_and(|phase| {
                 !phase.items.is_empty()
                     && phase_is_repair_ready(phase, resources.pipeline_cache, world, draw_functions)
@@ -1603,7 +1590,6 @@ fn repair_surface(
     let mut result = Ok(());
     let mut replayed = 0;
     let mut replayed_quads = 0;
-    let has_content = phase_has_drawable_items(phase, world, draw_functions);
     let mut layer_rects = resources
         .layer_rects
         .0
@@ -2130,7 +2116,8 @@ fn compose_surface(
 
     let repaired_pixels = local_damage.iter().map(PhysicalRect::area).sum::<u64>();
     let replayed = sources.len();
-    surface.commit(pending, local_damage, !sources.is_empty());
+    let has_content = scene.has_visible_records(request.paint_entity, request.bounds);
+    surface.commit(pending, local_damage, has_content);
     resources
         .counters
         .composition_repairs

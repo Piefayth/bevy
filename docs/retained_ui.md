@@ -1242,7 +1242,7 @@ damage is disjoint. Two disjoint changed quads are proven to stage two records,
 repair 200 pixels, report two logical items, and draw two quads from one run.
 There is no node-count, damaged-area, or region-count threshold.
 
-Four readback tests inspect animation streams rather than only final frames. One
+Four per-frame readback tests inspect animation streams rather than only final frames. One
 moves a translucent item through three disjoint positions and requires at least
 24 captured frames to cycle through three stock-rendered complete states with
 no stale repeat, ghost, partial repair, or skipped state. It was confirmed red
@@ -1257,6 +1257,17 @@ failed because a boolean "already propagated" marker suppressed every source
 epoch after the first, then exposed the shared-rectangle-buffer overwrite that
 mixed two generations within one box. These tests exercise Bevy's pipelined
 render app against an image target, not a window-system compositor.
+
+Three retained lifecycle streams cover structural changes whose states persist
+for several frames: a boundary appears and disappears, a modal paint run is
+created and retired around an existing boundary, and a surface cycles from
+content to empty to different content. Every captured image must equal a
+complete reference state. Removal-only damage is allowed to have no replay
+items; whether the complete surface still has content comes from its retained
+records, not that repair's phase. When an empty surface becomes nonempty, the
+inactive ping-pong slot is cleared before reuse so pixels from the last nonempty
+generation cannot return. The latter test was confirmed red with that clear
+removed: it produced a fourth state containing both the old and new nodes.
 
 Each layer is sized in viewport-local physical pixels. UI repair uses that
 local surface directly; only composition applies the camera viewport. A

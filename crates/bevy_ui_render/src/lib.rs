@@ -902,7 +902,7 @@ pub fn extract_ui_camera_view(
             // whole-target coordinates, and the retained composite places
             // the layer across the whole output.
             let ui_rect = if fills_target {
-                bevy_math::URect::from_corners(bevy_math::UVec2::ZERO, target_size)
+                bevy_math::URect::from_corners(UVec2::ZERO, target_size)
             } else {
                 physical_viewport_rect
             };

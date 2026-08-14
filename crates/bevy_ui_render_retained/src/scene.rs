@@ -2580,6 +2580,10 @@ impl RetainedUiScene {
     }
 
     pub(crate) fn has_visible_records(&self, camera: Entity, target: PhysicalRect) -> bool {
+        self.has_visible_records_in(camera, core::slice::from_ref(&target))
+    }
+
+    pub(crate) fn has_visible_records_in(&self, camera: Entity, targets: &[PhysicalRect]) -> bool {
         let surfaces = self.lock();
         if let Some(&(parent, key)) = surfaces.run_by_view.get(&camera)
             && let Some(run) = surfaces
@@ -2593,15 +2597,40 @@ impl RetainedUiScene {
                 .iter()
                 .filter_map(|id| surfaces.records.get(id))
                 .flat_map(|record| record.record.coverage.iter())
-                .any(|coverage| coverage.intersection(target).is_some());
+                .any(|coverage| {
+                    targets
+                        .iter()
+                        .any(|target| coverage.intersection(*target).is_some())
+                });
+        }
+        if let Some(order) = surfaces.order.get(&camera)
+            && let Some(spatial) = &order.spatial
+        {
+            for &target in targets {
+                let mut intersects = false;
+                spatial.query(target, |group| {
+                    if !intersects {
+                        intersects = group_intersects(
+                            &surfaces.records,
+                            &order.slots,
+                            order.groups[group].clone(),
+                            target,
+                        );
+                    }
+                });
+                if intersects {
+                    return true;
+                }
+            }
+            return false;
         }
         surfaces.records.iter().any(|(_, owned)| {
             owned.camera == camera
-                && owned
-                    .record
-                    .coverage
-                    .iter()
-                    .any(|coverage| coverage.intersection(target).is_some())
+                && owned.record.coverage.iter().any(|coverage| {
+                    targets
+                        .iter()
+                        .any(|target| coverage.intersection(*target).is_some())
+                })
         })
     }
 

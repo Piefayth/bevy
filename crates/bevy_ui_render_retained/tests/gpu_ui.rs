@@ -6786,7 +6786,7 @@ fn a_boundary_stowed_offscreen_appears_when_slid_in() {
                     ..default()
                 },
                 BackgroundColor(Color::srgb_u8(255, 0, 0)),
-                bevy::ui::UiTargetCamera(camera),
+                UiTargetCamera(camera),
             ))
             .id();
 
@@ -6888,7 +6888,7 @@ fn a_mid_run_stowed_cart_with_material_child_appears() {
                     align_items: AlignItems::FlexEnd,
                     ..default()
                 },
-                bevy::ui::UiTargetCamera(camera),
+                UiTargetCamera(camera),
             ))
             .id();
 
@@ -7048,7 +7048,7 @@ fn two_material_kinds_render_together() {
                     // 64px probe target while exercising the scaling.
                     scale_factor: 2.0,
                 }),
-                bevy::ui::UiFillsTarget,
+                UiFillsTarget,
             ))
             .id();
         let white = {
@@ -7091,7 +7091,7 @@ fn two_material_kinds_render_together() {
                 height: px(12),
                 ..default()
             },
-            bevy::ui::UiTargetCamera(camera),
+            UiTargetCamera(camera),
         ));
         world.spawn((
             MaterialNode(second),
@@ -7103,7 +7103,7 @@ fn two_material_kinds_render_together() {
                 height: px(12),
                 ..default()
             },
-            bevy::ui::UiTargetCamera(camera),
+            UiTargetCamera(camera),
         ));
 
         let pixels = Arc::new(Mutex::new(None));
@@ -7218,7 +7218,7 @@ fn many_distinct_assets_survive_one_easing() {
                     // 64px probe target while exercising the scaling.
                     scale_factor: 2.0,
                 }),
-                bevy::ui::UiFillsTarget,
+                UiFillsTarget,
             ))
             .id();
         let white = {
@@ -7257,7 +7257,7 @@ fn many_distinct_assets_survive_one_easing() {
                     height: px(12),
                     ..default()
                 },
-                bevy::ui::UiTargetCamera(camera),
+                UiTargetCamera(camera),
             ));
             handles.push(handle);
         }
@@ -7318,7 +7318,7 @@ fn many_distinct_assets_survive_one_easing() {
                     ..default()
                 },
                 BackgroundColor(Color::srgb_u8(0, 0, 255)),
-                bevy::ui::UiTargetCamera(camera),
+                UiTargetCamera(camera),
             ))
             .id();
         for step in 0..12 {
@@ -7380,7 +7380,7 @@ fn many_distinct_assets_survive_one_easing() {
                     height: px(12),
                     ..default()
                 },
-                bevy::ui::UiTargetCamera(camera),
+                UiTargetCamera(camera),
             ));
             fresh.push(handle);
         }
@@ -7419,7 +7419,7 @@ fn spawn_lifecycle_rack(world: &mut World, camera: Entity, with_toast: bool) {
                 column_gap: px(4),
                 ..default()
             },
-            bevy::ui::UiTargetCamera(camera),
+            UiTargetCamera(camera),
         ))
         .id();
     for (r, g, b) in [(255, 0, 0), (0, 255, 0), (255, 255, 0)] {
@@ -7446,7 +7446,7 @@ fn spawn_lifecycle_rack(world: &mut World, camera: Entity, with_toast: bool) {
                 ..default()
             },
             BackgroundColor(Color::srgb_u8(0, 0, 255)),
-            bevy::ui::UiTargetCamera(camera),
+            UiTargetCamera(camera),
         ));
     }
 }
@@ -7455,7 +7455,7 @@ fn spawn_lifecycle_rack(world: &mut World, camera: Entity, with_toast: bool) {
 /// life the game runs constantly.
 fn animate_toast_lifecycle(
     mut commands: Commands,
-    camera: Single<Entity, With<bevy::camera::Camera>>,
+    camera: Single<Entity, With<Camera>>,
     toast: Option<Single<Entity, With<LifecycleToast>>>,
     mut frame: Local<usize>,
 ) {
@@ -7475,7 +7475,7 @@ fn animate_toast_lifecycle(
                     ..default()
                 },
                 BackgroundColor(Color::srgb_u8(0, 0, 255)),
-                bevy::ui::UiTargetCamera(*camera),
+                UiTargetCamera(*camera),
             ));
         }
         (0, Some(toast)) => {
@@ -7487,23 +7487,10 @@ fn animate_toast_lifecycle(
 
 /// A boundary APPEARING or DISAPPEARING re-slices the parent layer; no
 /// frame of that transition may present anything but one of the two
-/// complete states. (Observed live: the first toast blanked the module
-/// rack; its despawn blanked the whole interface for several frames.)
+/// complete states. This guards removal-only damage: an empty repair
+/// phase wipes vacated pixels without declaring unrelated surface content
+/// empty.
 #[test]
-#[ignore = "FORK DEFECT (per-frame, reproduces the game's vanishing module \
-displays): a DESPAWNED boundary keeps presenting from the composited \
-output indefinitely — every captured frame matches the with-toast state \
-through every despawn window (animator probe-verified to run on \
-schedule). Mechanism, probed: a boundary's group never maps to a paint \
-run (only PaintRun entries fill group_runs), so remove()'s \
-note_source_damage silently no-ops; damage recorded on runs at rebuild \
-time dies with retired runs (symmetric_difference can't look up already- \
-detached records); and routing the vacated box to overlapping surviving \
-runs (tried: invalidate_compositor_sources fallback) repairs the run \
-SOURCES but never reaches the presentation cache, whose rebuild trigger \
-is the remaining unknown. In-game: toasts pop constantly, so module \
-displays 'come and go'; a despawn eventually forces a full re-slice that \
-blanks the whole UI for frames. Remove this ignore for the red repro."]
 fn boundary_lifecycle_never_presents_an_incomplete_frame() {
     with_gpu_lock(|| {
         let reference = |with_toast: bool| {
@@ -7522,7 +7509,7 @@ fn boundary_lifecycle_never_presents_an_incomplete_frame() {
             },
             |world, camera| spawn_lifecycle_rack(world, camera, false),
         );
-        assert_complete_cycle(&frames, &references);
+        assert_lifecycle_states(&frames, &references);
     });
 }
 
@@ -7546,7 +7533,7 @@ fn spawn_shop_scene(world: &mut World, camera: Entity, modal_open: bool) {
                 ..default()
             },
             BackgroundColor(Color::srgb_u8(r, g, b)),
-            bevy::ui::UiTargetCamera(camera),
+            UiTargetCamera(camera),
         ));
     }
     world.spawn((
@@ -7560,7 +7547,7 @@ fn spawn_shop_scene(world: &mut World, camera: Entity, modal_open: bool) {
             ..default()
         },
         BackgroundColor(Color::srgb_u8(0, 0, 255)),
-        bevy::ui::UiTargetCamera(camera),
+        UiTargetCamera(camera),
     ));
     if modal_open {
         spawn_shop_modal(world, camera);
@@ -7587,7 +7574,7 @@ fn spawn_shop_modal(world: &mut World, camera: Entity) {
             },
             BackgroundColor(Color::srgb_u8(30, 30, 46)),
             BorderColor::all(Color::srgb_u8(120, 120, 160)),
-            bevy::ui::UiTargetCamera(camera),
+            UiTargetCamera(camera),
         ))
         .id();
     for (r, g, b) in [(200, 200, 220), (90, 200, 120), (200, 90, 90)] {
@@ -7607,7 +7594,7 @@ fn spawn_shop_modal(world: &mut World, camera: Entity) {
 /// flow, which live produced some-or-all of the interface vanishing.
 fn animate_shop_modal(
     mut commands: Commands,
-    camera: Single<Entity, With<bevy::camera::Camera>>,
+    camera: Single<Entity, With<Camera>>,
     modal: Option<Single<Entity, With<ShopModal>>>,
     mut frame: Local<usize>,
 ) {
@@ -7629,15 +7616,9 @@ fn animate_shop_modal(
 
 /// A modal sheet opening and closing over live content is a MASS
 /// structural change; no frame of it may present anything but one of
-/// the two complete states. (Observed live ON THIS BRANCH: some-or-all
-/// of the interface vanished right after the shop's buy -> install
-/// prompts. The same repro is red on the pre-compositor branch too —
-/// the class predates the compositor; this branch amplifies it.)
+/// the two complete states. It exercises a retired paint run whose vacated
+/// area intersects no surviving compositor source.
 #[test]
-#[ignore = "FORK DEFECT: the despawned modal keeps presenting (stale) — \
-same class as boundary_lifecycle_never_presents_an_incomplete_frame. \
-The stock control (control_modal_sheet_cycle_on_stock) is green, \
-validating the method. Remove this ignore for the red repro."]
 fn a_modal_sheet_cycle_never_presents_an_incomplete_frame() {
     with_gpu_lock(|| {
         let reference = |modal_open: bool| {
@@ -7655,6 +7636,102 @@ fn a_modal_sheet_cycle_never_presents_an_incomplete_frame() {
                 app.add_systems(Update, animate_shop_modal);
             },
             |world, camera| spawn_shop_scene(world, camera, false),
+        );
+        assert_lifecycle_states(&frames, &references);
+    });
+}
+
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum SurfaceLifecycleContent {
+    Red,
+    Green,
+}
+
+fn surface_lifecycle_bundle(
+    camera: Entity,
+    content: SurfaceLifecycleContent,
+) -> (
+    SurfaceLifecycleContent,
+    Node,
+    BackgroundColor,
+    UiTargetCamera,
+) {
+    let (left, color) = match content {
+        SurfaceLifecycleContent::Red => (4, Color::srgb_u8(255, 0, 0)),
+        SurfaceLifecycleContent::Green => (40, Color::srgb_u8(0, 255, 0)),
+    };
+    (
+        content,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(left),
+            top: px(4),
+            width: px(12),
+            height: px(12),
+            ..default()
+        },
+        BackgroundColor(color),
+        UiTargetCamera(camera),
+    )
+}
+
+fn animate_surface_lifecycle(
+    mut commands: Commands,
+    camera: Single<Entity, With<Camera>>,
+    content: Query<(Entity, &SurfaceLifecycleContent)>,
+    mut frame: Local<usize>,
+) {
+    *frame += 1;
+    let desired = match (*frame / 6) % 3 {
+        0 => Some(SurfaceLifecycleContent::Red),
+        1 => None,
+        _ => Some(SurfaceLifecycleContent::Green),
+    };
+    let current = content.iter().next();
+    if current.map(|(_, content)| *content) == desired {
+        return;
+    }
+    if let Some((entity, _)) = current {
+        commands.entity(entity).despawn();
+    }
+    if let Some(desired) = desired {
+        commands.spawn(surface_lifecycle_bundle(*camera, desired));
+    }
+}
+
+/// Emptying a surface and later painting elsewhere must not resurrect
+/// pixels left in the inactive ping-pong slot.
+#[test]
+fn an_empty_surface_does_not_resurrect_stale_pixels() {
+    with_gpu_lock(|| {
+        let reference = |content| {
+            render_scene(
+                UiRenderer::Retained,
+                PaintSchedule::EveryFrame,
+                move |world, camera| {
+                    if let Some(content) = content {
+                        world.spawn(surface_lifecycle_bundle(camera, content));
+                    }
+                },
+                |_, _| {},
+            )
+            .pixels
+        };
+        let references = [
+            reference(Some(SurfaceLifecycleContent::Red)),
+            reference(None),
+            reference(Some(SurfaceLifecycleContent::Green)),
+        ];
+        let frames = capture_retained_stream(
+            |app| {
+                app.add_systems(Update, animate_surface_lifecycle);
+            },
+            |world, camera| {
+                world.spawn(surface_lifecycle_bundle(
+                    camera,
+                    SurfaceLifecycleContent::Red,
+                ));
+            },
         );
         assert_lifecycle_states(&frames, &references);
     });
