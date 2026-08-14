@@ -7348,3 +7348,131 @@ fn many_distinct_assets_survive_one_easing() {
         }
     });
 }
+
+#[derive(Component)]
+struct LifecycleRack;
+
+#[derive(Component)]
+struct LifecycleToast;
+
+/// The rack (three "module" panels) plus, on alternating phases, one
+/// boundary "toast". Two legal states; a frame matching neither — a
+/// blank, a partial slice set, mixed generations — is the bug.
+fn spawn_lifecycle_rack(world: &mut World, camera: Entity, with_toast: bool) {
+    let rack = world
+        .spawn((
+            LifecycleRack,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(4),
+                top: px(4),
+                flex_direction: FlexDirection::Row,
+                column_gap: px(4),
+                ..default()
+            },
+            bevy::ui::UiTargetCamera(camera),
+        ))
+        .id();
+    for (r, g, b) in [(255, 0, 0), (0, 255, 0), (255, 255, 0)] {
+        world.spawn((
+            Node {
+                width: px(10),
+                height: px(12),
+                ..default()
+            },
+            BackgroundColor(Color::srgb_u8(r, g, b)),
+            ChildOf(rack),
+        ));
+    }
+    if with_toast {
+        world.spawn((
+            LifecycleToast,
+            RepaintBoundary::IDENTITY,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(8),
+                top: px(28),
+                width: px(20),
+                height: px(10),
+                ..default()
+            },
+            BackgroundColor(Color::srgb_u8(0, 0, 255)),
+            bevy::ui::UiTargetCamera(camera),
+        ));
+    }
+}
+
+/// Spawns and despawns the boundary toast on a cycle — the notice-cart
+/// life the game runs constantly.
+fn animate_toast_lifecycle(
+    mut commands: Commands,
+    camera: Single<Entity, With<bevy::camera::Camera>>,
+    toast: Option<Single<Entity, With<LifecycleToast>>>,
+    mut frame: Local<usize>,
+) {
+    *frame += 1;
+    let phase = (*frame / 6) % 2;
+    match (phase, toast) {
+        (1, None) => {
+            commands.spawn((
+                LifecycleToast,
+                RepaintBoundary::IDENTITY,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(8),
+                    top: px(28),
+                    width: px(20),
+                    height: px(10),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb_u8(0, 0, 255)),
+                bevy::ui::UiTargetCamera(*camera),
+            ));
+        }
+        (0, Some(toast)) => {
+            commands.entity(*toast).despawn();
+        }
+        _ => {}
+    }
+}
+
+/// A boundary APPEARING or DISAPPEARING re-slices the parent layer; no
+/// frame of that transition may present anything but one of the two
+/// complete states. (Observed live: the first toast blanked the module
+/// rack; its despawn blanked the whole interface for several frames.)
+#[test]
+#[ignore = "FORK DEFECT (per-frame, reproduces the game's vanishing module \
+displays): a DESPAWNED boundary keeps presenting from the composited \
+output indefinitely — every captured frame matches the with-toast state \
+through every despawn window (animator probe-verified to run on \
+schedule). Mechanism, probed: a boundary's group never maps to a paint \
+run (only PaintRun entries fill group_runs), so remove()'s \
+note_source_damage silently no-ops; damage recorded on runs at rebuild \
+time dies with retired runs (symmetric_difference can't look up already- \
+detached records); and routing the vacated box to overlapping surviving \
+runs (tried: invalidate_compositor_sources fallback) repairs the run \
+SOURCES but never reaches the presentation cache, whose rebuild trigger \
+is the remaining unknown. In-game: toasts pop constantly, so module \
+displays 'come and go'; a despawn eventually forces a full re-slice that \
+blanks the whole UI for frames. Remove this ignore for the red repro."]
+fn boundary_lifecycle_never_presents_an_incomplete_frame() {
+    with_gpu_lock(|| {
+        let reference = |with_toast: bool| {
+            render_scene(
+                UiRenderer::Retained,
+                PaintSchedule::EveryFrame,
+                move |world, camera| spawn_lifecycle_rack(world, camera, with_toast),
+                |_, _| {},
+            )
+            .pixels
+        };
+        let references = [reference(false), reference(true)];
+        let frames = capture_retained_stream(
+            |app| {
+                app.add_systems(Update, animate_toast_lifecycle);
+            },
+            |world, camera| spawn_lifecycle_rack(world, camera, false),
+        );
+        assert_complete_cycle(&frames, &references);
+    });
+}
