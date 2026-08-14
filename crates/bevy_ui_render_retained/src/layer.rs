@@ -2160,21 +2160,29 @@ fn rebuild_surface(
     let Some(repair_plan) = resources.repair_plans.0.get(&request.paint_entity).cloned() else {
         return false;
     };
+    let scene = world.resource::<RetainedUiScene>();
     if world
         .resource::<RetainedPendingMaterials>()
         .contains(request.paint_entity)
     {
+        // Deferred is not dropped: the plan is rebuilt from dirtiness and
+        // dirtiness is cleared each extract, so a skipped repair must
+        // RE-OWE its damage or the surface stays stale forever (observed:
+        // a freshly-woken boundary with a material child never painted —
+        // the material pipeline wasn't ready on the wake frame).
+        scene.invalidate(request.paint_entity, request.bounds);
         return false;
     }
     let Some(phase) = resources.phases.get(&request.retained_view_entity) else {
         return false;
     };
     let draw_functions = retained_draw_function_ids(world);
-    let scene = world.resource::<RetainedUiScene>();
     if scene.has_visible_records(request.paint_entity, request.bounds)
         && (phase.items.is_empty()
             || !phase_is_repair_ready(phase, resources.pipeline_cache, world, draw_functions))
     {
+        // Same discipline: not-ready defers, deferral re-owes.
+        scene.invalidate(request.paint_entity, request.bounds);
         return false;
     }
     let surface = surface_for_request(request, resources.counters, surfaces, ctx);

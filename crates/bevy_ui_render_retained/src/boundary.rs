@@ -135,6 +135,12 @@ pub(crate) struct BoundaryView {
     pub(crate) rect: PhysicalRect,
     pub(crate) format: TextureFormat,
     visible: bool,
+    /// Whether the composite quad covered any of the parent last extract.
+    /// A boundary born STOWED (transform placing it fully outside the
+    /// target) has empty coverage; entering coverage must WAKE its
+    /// surface exactly like becoming visible does, or the surface blits
+    /// empty forever (observed as toasts that never appear).
+    covered: bool,
     anti_alias: Option<UiAntiAlias>,
 }
 
@@ -334,11 +340,16 @@ pub(crate) fn extract_boundaries(
         let visible = boundary_item.opacity() > 0.0;
         let had_view = views.views.contains_key(&surface.id());
         let was_effectively_visible = views.effectively_visible(surface.id());
+        let was_covered = views
+            .views
+            .get(&surface.id())
+            .is_some_and(|view| view.covered);
         let composite_coverage: PaintCoverage = visible
             .then(|| coverage(size, composite_transform, composite_clip))
             .flatten()
             .into_iter()
             .collect();
+        let covered = !composite_coverage.is_empty();
         surfaces.upsert_boundary(
             &mut commands,
             boundary_id(entity),
@@ -371,9 +382,15 @@ pub(crate) fn extract_boundaries(
             rect,
             format,
             visible,
+            covered,
             anti_alias,
         });
-        if had_view && !was_effectively_visible && views.effectively_visible(surface.id()) {
+        let became_visible =
+            had_view && !was_effectively_visible && views.effectively_visible(surface.id());
+        // Entering coverage is the same event as becoming visible: the
+        // surface may never have painted while it covered nothing.
+        let entered_coverage = had_view && !was_covered && covered;
+        if became_visible || entered_coverage {
             wake_surfaces.extend(views.visible_subtree(surface.id()));
         }
     }

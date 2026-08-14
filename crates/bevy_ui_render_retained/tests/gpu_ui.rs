@@ -6677,3 +6677,262 @@ fn boundary_transform_slide_rasterizes_nothing_across_every_frame() {
         assert_eq!(after.composition_sources - before.composition_sources, 12);
     });
 }
+
+/// A boundary born STOWED — its transform placing it fully outside the
+/// target — must still paint its surface and appear when the transform
+/// carries it into view. This is a toast's whole life cycle: spawn in
+/// the hull, ride out.
+#[test]
+fn a_boundary_stowed_offscreen_appears_when_slid_in() {
+    with_gpu_lock(|| {
+        let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
+            | TextureUsages::RENDER_ATTACHMENT;
+        let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                Camera {
+                    clear_color: ClearColorConfig::Custom(Color::BLACK),
+                    ..default()
+                },
+                RenderTarget::Image(image.clone().into()),
+            ))
+            .id();
+        // Born stowed: parked at the right edge, transform pushes it
+        // fully off the target.
+        let toast = app
+            .world_mut()
+            .spawn((
+                RepaintBoundary {
+                    transform: UiTransform::from_translation(Val2::px(24, 0)),
+                    opacity: 1.0,
+                },
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px((WIDTH - 24) as i32),
+                    top: px(4),
+                    width: px(24),
+                    height: px(10),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb_u8(255, 0, 0)),
+                bevy::ui::UiTargetCamera(camera),
+            ))
+            .id();
+
+        let pixels = Arc::new(Mutex::new(None));
+        let observer_pixels = Arc::clone(&pixels);
+        app.world_mut()
+            .spawn(Readback::texture(image))
+            .observe(move |event: On<ReadbackComplete>| {
+                *observer_pixels
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
+            });
+        app.finish();
+        app.cleanup();
+        for _ in 0..20 {
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        let at = |f: &Vec<u8>, x: u32, y: u32| {
+            let i = ((y * WIDTH + x) * BYTES_PER_PIXEL as u32) as usize;
+            [f[i], f[i + 1], f[i + 2]]
+        };
+        assert_eq!(
+            at(&frame, WIDTH - 12, 8),
+            [0, 0, 0],
+            "stowed: nothing should show at the parked spot yet"
+        );
+
+        // Ride out: 4px per frame until parked (translation back to zero).
+        for step in 1..=6 {
+            app.world_mut()
+                .entity_mut(toast)
+                .get_mut::<RepaintBoundary>()
+                .unwrap()
+                .transform =
+                UiTransform::from_translation(Val2::px(24.0 - step as f32 * 4.0, 0.0));
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        assert_eq!(
+            at(&frame, WIDTH - 12, 8),
+            [255, 0, 0],
+            "slid in: the toast should be visible at its parked spot"
+        );
+    });
+}
+
+/// The game-shaped toast: spawned MID-RUN into a live flex rack, born
+/// stowed via boundary transform, carrying a retained-material child
+/// (the cart's screen film) and text. On device this cart never
+/// appears; the minimal stowed case above passes — this test carries
+/// the extra ingredients to find the discriminator.
+#[test]
+#[ignore = "FORK DEFECT: a RetainedUiMaterial child INSIDE a boundary that \
+wakes from stowed (coverage empty at birth) suppresses the boundary's \
+ENTIRE surface content — the cart body never paints. Bisected: cart body \
+paints fine without the material child (coverage-wake fix); \
+mark_pending_materials never fires (probed empty), so the pending path is \
+innocent. Game symptom: notice carts with their Screened material never \
+appear. Remove this ignore for the red repro."]
+fn a_mid_run_stowed_cart_with_material_child_appears() {
+    with_gpu_lock(|| {
+        let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+        app.add_plugins(RetainedUiMaterialPlugin::<SecondTestUiMaterial>::default());
+
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
+            | TextureUsages::RENDER_ATTACHMENT;
+        let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                Camera {
+                    clear_color: ClearColorConfig::Custom(Color::BLACK),
+                    ..default()
+                },
+                RenderTarget::Image(image.clone().into()),
+            ))
+            .id();
+        // The rack: a live flex column pinned at the top-right edge.
+        let rack = app
+            .world_mut()
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    right: px(0),
+                    top: px(4),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(2),
+                    align_items: AlignItems::FlexEnd,
+                    ..default()
+                },
+                bevy::ui::UiTargetCamera(camera),
+            ))
+            .id();
+
+        let pixels = Arc::new(Mutex::new(None));
+        let observer_pixels = Arc::clone(&pixels);
+        app.world_mut()
+            .spawn(Readback::texture(image))
+            .observe(move |event: On<ReadbackComplete>| {
+                *observer_pixels
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
+            });
+        app.finish();
+        app.cleanup();
+        // The scene is LIVE before the toast exists.
+        for _ in 0..20 {
+            step_and_wait(&mut app);
+        }
+        capture_fresh(&mut app, &pixels);
+
+        // The event fires: a cart spawns mid-run, stowed, with a
+        // material screen in its cell.
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<SecondTestUiMaterial>>()
+            .add(SecondTestUiMaterial {
+                color: Vec4::new(0.0, 1.0, 0.0, 1.0),
+            });
+        let world = app.world_mut();
+        let cart = world
+            .spawn((
+                RepaintBoundary {
+                    transform: UiTransform::from_translation(Val2::px(24, 0)),
+                    opacity: 1.0,
+                },
+                Node {
+                    width: px(24),
+                    height: px(10),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb_u8(255, 0, 0)),
+                ChildOf(rack),
+            ))
+            .id();
+        world.spawn((
+            MaterialNode(material),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(2),
+                top: px(2),
+                width: px(12),
+                height: px(6),
+                ..default()
+            },
+            ChildOf(cart),
+        ));
+        for _ in 0..20 {
+            step_and_wait(&mut app);
+        }
+        capture_fresh(&mut app, &pixels);
+
+        // Ride out over several frames.
+        for step in 1..=6 {
+            app.world_mut()
+                .entity_mut(cart)
+                .get_mut::<RepaintBoundary>()
+                .unwrap()
+                .transform =
+                UiTransform::from_translation(Val2::px(24.0 - step as f32 * 4.0, 0.0));
+            step_and_wait(&mut app);
+        }
+        // Generous settle: if the cart shows up only after MANY extra
+        // frames, the wake-repair was deferred on the material pipeline
+        // and re-owed correctly; if it never shows, the deferral forgot
+        // to re-owe.
+        for _ in 0..40 {
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        let at = |f: &Vec<u8>, x: u32, y: u32| {
+            let i = ((y * WIDTH + x) * BYTES_PER_PIXEL as u32) as usize;
+            [f[i], f[i + 1], f[i + 2]]
+        };
+        // Cart body (red) parked at the right edge; material (green) inside.
+        assert_eq!(
+            at(&frame, WIDTH - 4, 9),
+            [255, 0, 0],
+            "the cart body should be parked at the right edge"
+        );
+        assert_eq!(
+            at(&frame, WIDTH - 18, 9),
+            [0, 255, 0],
+            "the cart's material screen should show inside it"
+        );
+    });
+}
