@@ -5628,7 +5628,11 @@ struct SecondTestUiMaterial {
 
 impl UiMaterial for SecondTestUiMaterial {
     fn fragment_shader() -> ShaderRef {
-        "embedded://gpu_ui/test_ui_material.wgsl".into()
+        // Its OWN shader, matching its single uniform binding — pointing
+        // it at test_ui_material.wgsl (whose layout expects a texture +
+        // sampler) makes direct rendering bind-group-invalid, which
+        // silently kills the render app in a logless harness.
+        "embedded://gpu_ui/second_test_ui_material.wgsl".into()
     }
 }
 
@@ -5646,6 +5650,7 @@ impl RetainedUiMaterial for SecondTestUiMaterial {
 
 fn configure_test_ui_material(app: &mut App, renderer: UiRenderer) {
     embedded_asset!(app, "tests", "test_ui_material.wgsl");
+    embedded_asset!(app, "tests", "second_test_ui_material.wgsl");
     match renderer {
         UiRenderer::Stock => app.add_plugins(UiMaterialPlugin::<TestUiMaterial>::default()),
         UiRenderer::Retained => app.add_plugins((
@@ -6945,6 +6950,159 @@ fn a_mid_run_stowed_cart_with_material_child_appears() {
             at(&frame, WIDTH - 18, 9),
             [0, 255, 0],
             "the cart's material screen should show inside it"
+        );
+    });
+}
+
+/// TWO material KINDS visible in one scene — the deck-plus-screen shape a
+/// real interface has. The suite's other material tests register two
+/// plugins but only ever render one kind at a time.
+#[test]
+fn two_material_kinds_render_together() {
+    with_gpu_lock(|| {
+        let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+        configure_test_ui_material(&mut app, UiRenderer::Retained);
+
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
+            | TextureUsages::RENDER_ATTACHMENT;
+        let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera2d,
+                Camera {
+                    clear_color: ClearColorConfig::Custom(Color::BLACK),
+                    ..default()
+                },
+                RenderTarget::Image(image.clone().into()),
+            ))
+            .id();
+        let white = {
+            let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+            images.add(Image::new_fill(
+                Extent3d {
+                    width: 4,
+                    height: 4,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                &[255, 255, 255, 255],
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            ))
+        };
+        let first = app
+            .world_mut()
+            .resource_mut::<Assets<TestUiMaterial>>()
+            .add(TestUiMaterial {
+                color: Vec4::new(1.0, 0.0, 0.0, 1.0),
+                image: white,
+                volatile: false,
+                target_coverage: false,
+            });
+        let second = app
+            .world_mut()
+            .resource_mut::<Assets<SecondTestUiMaterial>>()
+            .add(SecondTestUiMaterial {
+                color: Vec4::new(0.0, 1.0, 0.0, 1.0),
+            });
+        let world = app.world_mut();
+        world.spawn((
+            MaterialNode(first.clone()),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(4),
+                top: px(4),
+                width: px(16),
+                height: px(12),
+                ..default()
+            },
+            bevy::ui::UiTargetCamera(camera),
+        ));
+        world.spawn((
+            MaterialNode(second),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(30),
+                top: px(4),
+                width: px(16),
+                height: px(12),
+                ..default()
+            },
+            bevy::ui::UiTargetCamera(camera),
+        ));
+
+        let pixels = Arc::new(Mutex::new(None));
+        let observer_pixels = Arc::clone(&pixels);
+        app.world_mut().spawn(Readback::texture(image)).observe(
+            move |event: On<ReadbackComplete>| {
+                *observer_pixels
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
+            },
+        );
+        app.finish();
+        app.cleanup();
+        for _ in 0..20 {
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        let at = |f: &Vec<u8>, x: u32, y: u32| {
+            let i = ((y * WIDTH + x) * BYTES_PER_PIXEL as u32) as usize;
+            [f[i], f[i + 1], f[i + 2]]
+        };
+        assert_eq!(
+            at(&frame, 10, 10),
+            [255, 0, 0],
+            "first material kind renders"
+        );
+        assert_eq!(
+            at(&frame, 36, 10),
+            [0, 255, 0],
+            "second material kind renders"
+        );
+
+        // The deck's life: exact-keyed params mutated EVERY frame for a
+        // sustained stretch (charge fill, the 24Hz pulse). One mutation is
+        // covered elsewhere; sustained churn is the game's actual shape.
+        for step in 0..30 {
+            let level = 0.2 + 0.6 * (step as f32 / 30.0);
+            app.world_mut()
+                .resource_mut::<Assets<TestUiMaterial>>()
+                .get_mut(&first)
+                .unwrap()
+                .color = Vec4::new(level, 0.0, 0.0, 1.0);
+            step_and_wait(&mut app);
+        }
+        app.world_mut()
+            .resource_mut::<Assets<TestUiMaterial>>()
+            .get_mut(&first)
+            .unwrap()
+            .color = Vec4::new(0.0, 0.0, 1.0, 1.0);
+        let frame = capture_fresh(&mut app, &pixels);
+        assert_eq!(
+            at(&frame, 10, 10),
+            [0, 0, 255],
+            "after 30 frames of exact-key churn the material still renders \
+             and shows its latest value"
+        );
+        assert_eq!(
+            at(&frame, 36, 10),
+            [0, 255, 0],
+            "the OTHER material kind survives its neighbor's churn"
         );
     });
 }
