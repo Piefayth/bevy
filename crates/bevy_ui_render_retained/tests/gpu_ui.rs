@@ -469,7 +469,15 @@ fn capture_retained_stream(
     configure: impl FnOnce(&mut App),
     setup: impl FnOnce(&mut World, Entity),
 ) -> Vec<Vec<u8>> {
-    let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+    capture_stream(UiRenderer::Retained, configure, setup)
+}
+
+fn capture_stream(
+    renderer: UiRenderer,
+    configure: impl FnOnce(&mut App),
+    setup: impl FnOnce(&mut World, Entity),
+) -> Vec<Vec<u8>> {
+    let mut app = gpu_app(renderer, PaintSchedule::EveryFrame);
     configure(&mut app);
 
     let mut image = Image::new_fill(
@@ -529,6 +537,47 @@ fn capture_retained_stream(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone()
+}
+
+/// Lifecycle variant of [`assert_complete_cycle`]: every frame must be
+/// one of the complete reference states and every state must appear,
+/// but no cadence is imposed (spawn/despawn cycles have no fixed
+/// per-frame progression the way the animation probes do).
+fn assert_lifecycle_states(frames: &[Vec<u8>], references: &[Vec<u8>]) {
+    assert!(
+        frames.len() >= 24,
+        "readback must capture the lifecycle stream"
+    );
+    let states: Vec<_> = frames
+        .iter()
+        .map(|frame| {
+            references
+                .iter()
+                .position(|expected| frame == expected)
+                .unwrap_or_else(|| {
+                    let differences: Vec<_> = references
+                        .iter()
+                        .map(|expected| {
+                            frame
+                                .iter()
+                                .zip(expected)
+                                .filter(|(actual, expected)| actual != expected)
+                                .count()
+                        })
+                        .collect();
+                    panic!(
+                        "lifecycle produced no complete reference state \
+                         (byte differences per reference: {differences:?})"
+                    );
+                })
+        })
+        .collect();
+    for reference in 0..references.len() {
+        assert!(
+            states.contains(&reference),
+            "lifecycle omitted a complete state: {states:?}"
+        );
+    }
 }
 
 fn assert_complete_cycle(frames: &[Vec<u8>], references: &[Vec<u8>]) {
@@ -7474,5 +7523,167 @@ fn boundary_lifecycle_never_presents_an_incomplete_frame() {
             |world, camera| spawn_lifecycle_rack(world, camera, false),
         );
         assert_complete_cycle(&frames, &references);
+    });
+}
+
+#[derive(Component)]
+struct ShopModal;
+
+/// The base interface: a rack of plain panels and one boundary toast —
+/// the mix a live deck has when the shop opens.
+fn spawn_shop_scene(world: &mut World, camera: Entity, modal_open: bool) {
+    for (i, (r, g, b)) in [(255, 0, 0), (0, 255, 0), (255, 255, 0)]
+        .into_iter()
+        .enumerate()
+    {
+        world.spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(4 + (i as i32) * 14),
+                top: px(4),
+                width: px(10),
+                height: px(12),
+                ..default()
+            },
+            BackgroundColor(Color::srgb_u8(r, g, b)),
+            bevy::ui::UiTargetCamera(camera),
+        ));
+    }
+    world.spawn((
+        RepaintBoundary::IDENTITY,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(46),
+            top: px(4),
+            width: px(14),
+            height: px(12),
+            ..default()
+        },
+        BackgroundColor(Color::srgb_u8(0, 0, 255)),
+        bevy::ui::UiTargetCamera(camera),
+    ));
+    if modal_open {
+        spawn_shop_modal(world, camera);
+    }
+}
+
+/// The buy/install prompt: a sheet covering most of the target with its
+/// own content stack — a MASS of nodes arriving and leaving together.
+fn spawn_shop_modal(world: &mut World, camera: Entity) {
+    let modal = world
+        .spawn((
+            ShopModal,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(8),
+                top: px(20),
+                width: px(48),
+                height: px(38),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(2),
+                padding: UiRect::all(px(3)),
+                border: UiRect::all(px(1)),
+                ..default()
+            },
+            BackgroundColor(Color::srgb_u8(30, 30, 46)),
+            BorderColor::all(Color::srgb_u8(120, 120, 160)),
+            bevy::ui::UiTargetCamera(camera),
+        ))
+        .id();
+    for (r, g, b) in [(200, 200, 220), (90, 200, 120), (200, 90, 90)] {
+        world.spawn((
+            Node {
+                width: px(40),
+                height: px(8),
+                ..default()
+            },
+            BackgroundColor(Color::srgb_u8(r, g, b)),
+            ChildOf(modal),
+        ));
+    }
+}
+
+/// Opens and closes the prompt on a cycle — the shop's buy -> install
+/// flow, which live produced some-or-all of the interface vanishing.
+fn animate_shop_modal(
+    mut commands: Commands,
+    camera: Single<Entity, With<bevy::camera::Camera>>,
+    modal: Option<Single<Entity, With<ShopModal>>>,
+    mut frame: Local<usize>,
+) {
+    *frame += 1;
+    let phase = (*frame / 7) % 2;
+    match (phase, modal) {
+        (1, None) => {
+            let camera = *camera;
+            commands.queue(move |world: &mut World| {
+                spawn_shop_modal(world, camera);
+            });
+        }
+        (0, Some(modal)) => {
+            commands.entity(*modal).despawn();
+        }
+        _ => {}
+    }
+}
+
+/// A modal sheet opening and closing over live content is a MASS
+/// structural change; no frame of it may present anything but one of
+/// the two complete states. (Observed live ON THIS BRANCH: some-or-all
+/// of the interface vanished right after the shop's buy -> install
+/// prompts. The same repro is red on the pre-compositor branch too —
+/// the class predates the compositor; this branch amplifies it.)
+#[test]
+#[ignore = "FORK DEFECT: the despawned modal keeps presenting (stale) — \
+same class as boundary_lifecycle_never_presents_an_incomplete_frame. \
+The stock control (control_modal_sheet_cycle_on_stock) is green, \
+validating the method. Remove this ignore for the red repro."]
+fn a_modal_sheet_cycle_never_presents_an_incomplete_frame() {
+    with_gpu_lock(|| {
+        let reference = |modal_open: bool| {
+            render_scene(
+                UiRenderer::Retained,
+                PaintSchedule::EveryFrame,
+                move |world, camera| spawn_shop_scene(world, camera, modal_open),
+                |_, _| {},
+            )
+            .pixels
+        };
+        let references = [reference(false), reference(true)];
+        let frames = capture_retained_stream(
+            |app| {
+                app.add_systems(Update, animate_shop_modal);
+            },
+            |world, camera| spawn_shop_scene(world, camera, false),
+        );
+        assert_lifecycle_states(&frames, &references);
+    });
+}
+
+/// CONTROL for the modal-cycle repro: the same scene and cycle on the
+/// STOCK immediate-mode renderer, which redraws everything every frame
+/// and cannot present stale content. If this fails, the test method is
+/// broken, not the renderer.
+#[test]
+fn control_modal_sheet_cycle_on_stock() {
+    with_gpu_lock(|| {
+        let reference = |modal_open: bool| {
+            render_scene(
+                UiRenderer::Stock,
+                PaintSchedule::EveryFrame,
+                move |world, camera| spawn_shop_scene(world, camera, modal_open),
+                |_, _| {},
+            )
+            .pixels
+        };
+        let references = [reference(false), reference(true)];
+        let frames = capture_stream(
+            UiRenderer::Stock,
+            |app| {
+                app.add_systems(Update, animate_shop_modal);
+            },
+            |world, camera| spawn_shop_scene(world, camera, false),
+        );
+        assert_lifecycle_states(&frames, &references);
     });
 }
