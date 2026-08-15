@@ -1165,7 +1165,13 @@ ties without retaining four arena records. Damage comparison remains per edge:
 changing the left edge out of an equal-color group damages only that edge's
 140-pixel rounded-corner reach, while the other three retain their pixels.
 Equal-color borders, distinct-color regrouping, outlines, and component removal
-are byte-identical to stock in named GPU tests.
+are byte-identical to stock in named GPU tests. A five-state GPU stream moves
+asymmetric rounded borders through fractional layout positions, direct raster
+transforms, and ordered-compositor transforms at 1x, 2x, and 3x target scale.
+It includes anisotropic scale, rotation, an offset outline, and a legal
+zero-scale disappearance; every captured frame must equal a freshly rendered
+retained reference. Replacing rounded-corner reach with border width alone was
+confirmed to make this proof red on its first bad frame.
 
 Text retains consecutive glyphs in the same section that use the same
 font-atlas texture as one draw record. Identity uses the stable section entity
@@ -1242,36 +1248,40 @@ damage is disjoint. Two disjoint changed quads are proven to stage two records,
 repair 200 pixels, report two logical items, and draw two quads from one run.
 There is no node-count, damaged-area, or region-count threshold.
 
-Four per-frame readback tests inspect animation streams rather than only final frames. One
-moves a translucent item through three disjoint positions and requires at least
-24 captured frames to cycle through three stock-rendered complete states with
-no stale repeat, ghost, partial repair, or skipped state. It was confirmed red
-by removing inactive-slot synchronization. The other cycles a translucent
-full-surface repair through three states on the batched path and enforces the
-same generation ordering; it was confirmed red by removing the wipe, which
-immediately exposed alpha accumulation. A third moves an unchanged repaint
-boundary through three compositor positions and accepts only complete cached
-states. The fourth changes content inside a static boundary every frame and
-requires each child and parent surface generation to land atomically. It first
-failed because a boolean "already propagated" marker suppressed every source
-epoch after the first, then exposed the shared-rectangle-buffer overwrite that
-mixed two generations within one box. These tests exercise Bevy's pipelined
-render app against an image target, not a window-system compositor.
+Five per-frame readback tests inspect animation streams rather than only final
+frames. One moves a translucent item through three disjoint positions and
+requires at least 24 captured frames to cycle through three stock-rendered
+complete states with no stale repeat, ghost, partial repair, or skipped state.
+It was confirmed red by removing inactive-slot synchronization. The second
+cycles a translucent full-surface repair through three states on the batched
+path and enforces the same generation ordering; it was confirmed red by
+removing the wipe, which immediately exposed alpha accumulation. A third moves
+an unchanged repaint boundary through three compositor positions and accepts
+only complete cached states. The fourth changes content inside a static
+boundary every frame and requires each child and parent surface generation to
+land atomically. It first failed because a boolean "already propagated" marker
+suppressed every source epoch after the first, then exposed the
+shared-rectangle-buffer overwrite that mixed two generations within one box.
+These tests exercise Bevy's pipelined render app against an image target, not a
+window-system compositor. The fifth is the multi-scale rounded-border stream
+described above; it covers both raster motion and cached boundary placement,
+including complete disappearance.
 
-Three retained lifecycle streams cover structural changes whose states persist
+Four retained lifecycle streams cover structural changes whose states persist
 for several frames: a boundary appears and disappears, a modal paint run is
-created and retired around an existing boundary, and a surface cycles from
-content to empty to different content. Every captured image must equal a
-complete reference state. Removal-only damage is allowed to have no replay
-items. Complete surface content is the union of current retained records and
-prepared immediate-phase draws; neither the repair phase nor retained records
-alone can describe mixed retained/immediate targets. Retained intersection
-queries combine the settled spatial index with directly changed groups, which
-may be drawable before their spatial bounds settle. When an empty surface
-becomes nonempty, the inactive ping-pong slot is cleared before reuse so pixels
-from the last nonempty generation cannot return. The latter test was confirmed
-red with that clear removed: it produced a fourth state containing both the old
-and new nodes.
+created and retired around an existing boundary, a surface cycles from content
+to empty to different content, and a cached toast appears over a
+custom-material rack on a fills-target camera with a half-height viewport and
+2x image-target scale. Every captured image must equal a complete reference
+state. Removal-only damage is allowed to have no replay items. Complete surface
+content is the union of current retained records and prepared immediate-phase
+draws; neither the repair phase nor retained records alone can describe mixed
+retained/immediate targets. Retained intersection queries combine the settled
+spatial index with directly changed groups, which may be drawable before their
+spatial bounds settle. When an empty surface becomes nonempty, the inactive
+ping-pong slot is cleared before reuse so pixels from the last nonempty
+generation cannot return. The latter test was confirmed red with that clear
+removed: it produced a fourth state containing both the old and new nodes.
 
 Each layer is sized in viewport-local physical pixels. UI repair uses that
 local surface directly; only composition applies the camera viewport. A
