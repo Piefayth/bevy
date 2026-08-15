@@ -25,7 +25,8 @@ use bevy::{
     image::Image,
     math::{Rect, Vec2},
     render::{
-        render_asset::RenderAssets, render_resource::DefaultImageSamplerDescriptor, Extract,
+        render_asset::RenderAssets, render_phase::ViewSortedRenderPhases,
+        render_resource::DefaultImageSamplerDescriptor, view::ExtractedView, Extract,
         ExtractSchedule, Render, RenderApp, RenderSystems,
     },
     ui::{
@@ -34,8 +35,8 @@ use bevy::{
     },
     ui_render::{
         queue_ui_material_nodes, ExtractedUiMaterialNode, ExtractedUiMaterialNodes,
-        PreparedUiMaterial, RenderUiSystems, UiCameraMap, UiMaterialBatch, UiMaterialBatchRange,
-        UiMaterialInfrastructurePlugin,
+        PreparedUiMaterial, RenderUiSystems, TransparentUi, UiCameraMap, UiCameraView,
+        UiMaterialBatch, UiMaterialBatchRange, UiMaterialInfrastructurePlugin,
     },
 };
 use core::{any::TypeId, hash::Hash, marker::PhantomData};
@@ -691,11 +692,23 @@ impl RetainedPendingMaterials {
     }
 }
 
+/// Runs after the stock queue and marks every camera whose replayed
+/// materials could not have been queued this frame — an unprepared
+/// asset, or a target view the queue cannot resolve yet (a paint-run
+/// view manufactured this frame whose components are still deferred
+/// commands). The repair gates defer a pending camera's repair and
+/// RE-OWE its damage, so the miss heals next frame. Without the view
+/// check the miss was invisible: the queue's lookup failures are silent,
+/// the ready gate cannot see an item that never queued, and the repair
+/// executed anyway — wiping every material in the layer.
 fn mark_pending_materials<M: RetainedUiMaterial>(
     replays: Res<RetainedMaterialReplays>,
     dependencies: Res<RetainedMaterialDependencies<M>>,
     prepared: Res<RenderAssets<PreparedUiMaterial<M>>>,
     pending: Res<RetainedPendingMaterials>,
+    render_views: Query<&UiCameraView, With<ExtractedView>>,
+    camera_views: Query<&ExtractedView>,
+    phases: Res<ViewSortedRenderPhases<TransparentUi>>,
 ) {
     for replay in &replays.0 {
         if replay.item.material_type != TypeId::of::<M>() {
@@ -706,6 +719,15 @@ fn mark_pending_materials<M: RetainedUiMaterial>(
             .get(material)
             .is_none_or(|value| !dependencies.prepared_matches(material, &value.source))
         {
+            pending.insert(replay.draw.camera);
+            continue;
+        }
+        let queueable = render_views
+            .get(replay.draw.camera)
+            .ok()
+            .and_then(|camera_view| camera_views.get(camera_view.0).ok())
+            .is_some_and(|view| phases.contains_key(&view.retained_view_entity));
+        if !queueable {
             pending.insert(replay.draw.camera);
         }
     }

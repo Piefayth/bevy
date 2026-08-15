@@ -477,6 +477,15 @@ fn capture_stream(
     configure: impl FnOnce(&mut App),
     setup: impl FnOnce(&mut World, Entity),
 ) -> Vec<Vec<u8>> {
+    capture_stream_with_camera(renderer, configure, |_, _| {}, setup)
+}
+
+fn capture_stream_with_camera(
+    renderer: UiRenderer,
+    configure: impl FnOnce(&mut App),
+    configure_camera: impl FnOnce(&mut World, Entity),
+    setup: impl FnOnce(&mut World, Entity),
+) -> Vec<Vec<u8>> {
     let mut app = gpu_app(renderer, PaintSchedule::EveryFrame);
     configure(&mut app);
 
@@ -507,6 +516,7 @@ fn capture_stream(
             RenderTarget::Image(image.clone().into()),
         ))
         .id();
+    configure_camera(app.world_mut(), camera);
     setup(app.world_mut(), camera);
 
     let frames = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
@@ -7003,6 +7013,195 @@ fn a_mid_run_stowed_cart_with_material_child_appears() {
     });
 }
 
+/// The inverse of the mid-run cart test: the DECK holds the material and
+/// the arriving cart holds none. A plain cart spawned mid-run, stowed,
+/// then slid into view must not cost the parent layer its material
+/// draws — on any frame of the slide or after. This is the live-game
+/// failure: a toast cart docking in blanked every module screen on the
+/// deck below until the cart despawned. Runs on both camera shapes: a
+/// plain full-target camera and the game's viewport-cut `UiFillsTarget`
+/// camera with the deck below the viewport.
+#[test]
+fn a_carts_arrival_must_not_drop_the_decks_material() {
+    with_gpu_lock(|| {
+        for fills in [false, true] {
+        let mut app = gpu_app(UiRenderer::Retained, PaintSchedule::EveryFrame);
+        configure_test_ui_material(&mut app, UiRenderer::Retained);
+
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
+            | TextureUsages::RENDER_ATTACHMENT;
+        let image = app.world_mut().resource_mut::<Assets<Image>>().add(image);
+        let mut camera = app.world_mut().spawn((
+            Camera2d,
+            Camera {
+                clear_color: ClearColorConfig::Custom(Color::BLACK),
+                viewport: fills.then(|| Viewport {
+                    physical_position: UVec2::ZERO,
+                    physical_size: UVec2::new(WIDTH, HEIGHT / 2),
+                    depth: 0.0..1.0,
+                }),
+                ..default()
+            },
+            RenderTarget::Image(image.clone().into()),
+        ));
+        if fills {
+            camera.insert(UiFillsTarget);
+        }
+        let camera = camera.id();
+        // The deck: a material screen live from boot, far from the rack.
+        let screen_image = {
+            let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+            images.add(Image::new_fill(
+                Extent3d {
+                    width: 4,
+                    height: 4,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                &[0, 255, 0, 255],
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            ))
+        };
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<TestUiMaterial>>()
+            .add(TestUiMaterial {
+                color: Vec4::new(0.0, 1.0, 0.0, 1.0),
+                image: screen_image,
+                volatile: false,
+                target_coverage: false,
+            });
+        app.world_mut().spawn((
+            MaterialNode(material),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(4),
+                top: px((HEIGHT - 14) as i32),
+                width: px(24),
+                height: px(10),
+                ..default()
+            },
+            UiTargetCamera(camera),
+        ));
+        // The rack: a live flex column pinned at the top-right edge.
+        let rack = app
+            .world_mut()
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    right: px(0),
+                    top: px(4),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(2),
+                    align_items: AlignItems::FlexEnd,
+                    ..default()
+                },
+                UiTargetCamera(camera),
+            ))
+            .id();
+
+        let pixels = Arc::new(Mutex::new(None));
+        let observer_pixels = Arc::clone(&pixels);
+        app.world_mut().spawn(Readback::texture(image)).observe(
+            move |event: On<ReadbackComplete>| {
+                *observer_pixels
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(event.data.clone());
+            },
+        );
+        app.finish();
+        app.cleanup();
+        let at = |f: &Vec<u8>, x: u32, y: u32| {
+            let i = ((y * WIDTH + x) * BYTES_PER_PIXEL as u32) as usize;
+            [f[i], f[i + 1], f[i + 2]]
+        };
+        let deck_probe = (16u32, HEIGHT - 9);
+        // The scene is LIVE before the toast exists.
+        for _ in 0..20 {
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        assert_eq!(
+            at(&frame, deck_probe.0, deck_probe.1),
+            [0, 255, 0],
+            "the deck's material screen must be up before the cart exists"
+        );
+
+        // The event fires: a plain cart spawns mid-run, stowed.
+        let cart = app
+            .world_mut()
+            .spawn((
+                RepaintBoundary {
+                    transform: UiTransform::from_translation(Val2::px(24, 0)),
+                    opacity: 1.0,
+                },
+                Node {
+                    width: px(24),
+                    height: px(10),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb_u8(255, 0, 0)),
+                ChildOf(rack),
+            ))
+            .id();
+        for frame_no in 0..20 {
+            step_and_wait(&mut app);
+            let frame = capture_fresh(&mut app, &pixels);
+            assert_eq!(
+                at(&frame, deck_probe.0, deck_probe.1),
+                [0, 255, 0],
+                "deck material vanished on stowed-cart frame {frame_no} (fills={fills})"
+            );
+        }
+
+        // Ride out over several frames; the deck must hold on every one.
+        for step in 1..=6 {
+            app.world_mut()
+                .entity_mut(cart)
+                .get_mut::<RepaintBoundary>()
+                .unwrap()
+                .transform = UiTransform::from_translation(Val2::px(24.0 - step as f32 * 4.0, 0.0));
+            step_and_wait(&mut app);
+            let frame = capture_fresh(&mut app, &pixels);
+            assert_eq!(
+                at(&frame, deck_probe.0, deck_probe.1),
+                [0, 255, 0],
+                "deck material vanished on slide step {step} (fills={fills})"
+            );
+        }
+        for _ in 0..10 {
+            step_and_wait(&mut app);
+        }
+        let frame = capture_fresh(&mut app, &pixels);
+        assert_eq!(
+            at(&frame, WIDTH - 4, 9),
+            [255, 0, 0],
+            "the cart body should be parked at the right edge"
+        );
+        assert_eq!(
+            at(&frame, deck_probe.0, deck_probe.1),
+            [0, 255, 0],
+            "deck material must survive the cart's arrival (fills={fills})"
+        );
+        }
+    });
+}
+
 /// TWO material KINDS visible in one scene — the deck-plus-screen shape a
 /// real interface has. The suite's other material tests register two
 /// plugins but only ever render one kind at a time.
@@ -7765,4 +7964,166 @@ fn control_modal_sheet_cycle_on_stock() {
         );
         assert_lifecycle_states(&frames, &references);
     });
+}
+
+/// THE DEVICE'S ACTUAL SHAPE, streamed per frame: a FILLS-TARGET camera
+/// with a letterboxed viewport at 2x scale, a rack of custom-material
+/// panels (the module displays), and a boundary toast spawning and
+/// despawning over them. Every prior lifecycle repro ran on a plain
+/// image camera; every fills-target test asserted settled frames only.
+/// This is the untested cell of the cross-product — and the reported
+/// symptom: module screens vanish the moment a toast shows up.
+#[test]
+fn fills_target_lifecycle_never_disturbs_the_module_rack() {
+    with_gpu_lock(|| {
+        let spawn_scene = |world: &mut World, camera: Entity, with_toast: bool| {
+            let white = {
+                let mut images = world.resource_mut::<Assets<Image>>();
+                images.add(Image::new_fill(
+                    Extent3d {
+                        width: 4,
+                        height: 4,
+                        depth_or_array_layers: 1,
+                    },
+                    TextureDimension::D2,
+                    &[255, 255, 255, 255],
+                    TextureFormat::Rgba8UnormSrgb,
+                    RenderAssetUsages::default(),
+                ))
+            };
+            for i in 0..3u32 {
+                let handle = {
+                    let mut materials = world.resource_mut::<Assets<TestUiMaterial>>();
+                    materials.add(TestUiMaterial {
+                        color: Vec4::new(1.0, 0.2 + 0.2 * i as f32, 0.0, 1.0),
+                        image: white.clone(),
+                        volatile: false,
+                        target_coverage: false,
+                    })
+                };
+                world.spawn((
+                    MaterialNode(handle),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px((2 + i * 10) as i32),
+                        top: px(2),
+                        width: px(8),
+                        height: px(6),
+                        ..default()
+                    },
+                    bevy::ui::UiTargetCamera(camera),
+                ));
+            }
+            if with_toast {
+                world.spawn((
+                    LifecycleToast,
+                    RepaintBoundary::IDENTITY,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(4),
+                        top: px(14),
+                        width: px(20),
+                        height: px(8),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb_u8(0, 0, 255)),
+                    bevy::ui::UiTargetCamera(camera),
+                ));
+            }
+        };
+        let make_fills = |app: &mut App| {
+            // The window shape: a viewport-cut camera whose interface owns
+            // the whole 2x target.
+            let camera = app
+                .world_mut()
+                .query_filtered::<Entity, With<bevy::camera::Camera>>()
+                .single(app.world())
+                .unwrap();
+            let mut entity = app.world_mut().entity_mut(camera);
+            entity.get_mut::<bevy::camera::Camera>().unwrap().viewport = Some(Viewport {
+                physical_position: UVec2::ZERO,
+                physical_size: UVec2::new(WIDTH, HEIGHT / 2),
+                depth: 0.0..1.0,
+            });
+            entity.insert(bevy::ui::UiFillsTarget);
+            if let Some(mut target) = entity.get_mut::<bevy::camera::RenderTarget>() {
+                if let bevy::camera::RenderTarget::Image(image_target) = &mut *target {
+                    image_target.scale_factor = 2.0;
+                }
+            }
+        };
+        let fills_camera = |world: &mut World, camera: Entity| {
+            let mut entity = world.entity_mut(camera);
+            entity.get_mut::<bevy::camera::Camera>().unwrap().viewport = Some(Viewport {
+                physical_position: UVec2::ZERO,
+                physical_size: UVec2::new(WIDTH, HEIGHT / 2),
+                depth: 0.0..1.0,
+            });
+            entity.insert(bevy::ui::UiFillsTarget);
+        };
+        // References captured through the SAME fills-target stream harness,
+        // frozen (no animator).
+        let reference_stream = |with_toast: bool| {
+            let frames = capture_stream_with_camera(
+                UiRenderer::Retained,
+                move |app| {
+                    embedded_asset!(app, "tests", "test_ui_material.wgsl");
+                    app.add_plugins(RetainedUiMaterialPlugin::<TestUiMaterial>::default());
+                },
+                fills_camera,
+                move |world, camera| {
+                    spawn_scene(world, camera, with_toast);
+                },
+            );
+            frames.into_iter().last().expect("stream captured frames")
+        };
+        let _ = &make_fills;
+        let references = [reference_stream(false), reference_stream(true)];
+        let frames = capture_stream_with_camera(
+            UiRenderer::Retained,
+            |app| {
+                embedded_asset!(app, "tests", "test_ui_material.wgsl");
+                app.add_plugins(RetainedUiMaterialPlugin::<TestUiMaterial>::default());
+                app.add_systems(Update, animate_module_toast_lifecycle);
+            },
+            fills_camera,
+            |world, camera| {
+                spawn_scene(world, camera, false);
+            },
+        );
+        assert_lifecycle_states(&frames, &references);
+    });
+}
+
+/// Spawns/despawns the toast over the module rack (fills variant).
+fn animate_module_toast_lifecycle(
+    mut commands: Commands,
+    camera: Single<Entity, With<bevy::camera::Camera>>,
+    toast: Option<Single<Entity, With<LifecycleToast>>>,
+    mut frame: Local<usize>,
+) {
+    *frame += 1;
+    let phase = (*frame / 7) % 2;
+    match (phase, toast) {
+        (1, None) => {
+            commands.spawn((
+                LifecycleToast,
+                RepaintBoundary::IDENTITY,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(4),
+                    top: px(14),
+                    width: px(20),
+                    height: px(8),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb_u8(0, 0, 255)),
+                bevy::ui::UiTargetCamera(*camera),
+            ));
+        }
+        (0, Some(toast)) => {
+            commands.entity(*toast).despawn();
+        }
+        _ => {}
+    }
 }

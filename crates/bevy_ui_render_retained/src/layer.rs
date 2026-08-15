@@ -296,7 +296,14 @@ impl Plugin for RetainedUiRenderPlugin {
                     .before(queue_boundaries)
                     .before(queue_retained_gradients)
                     .before(queue_retained_shadows)
-                    .before(queue_ui_slice_items),
+                    .before(queue_ui_slice_items)
+                    // Replayed materials re-enter the STOCK queue, which
+                    // resolves the run views this system manufactures.
+                    // Without this edge the queue races the phase
+                    // creation and drops every material in a sliced
+                    // layer silently — live, the deck's module screens
+                    // blanked the frame a toast cart docked.
+                    .before(bevy::ui_render::UiMaterialQueue),
             )
             .add_systems(Render, queue_retained_core.in_set(RenderSystems::Queue))
             .add_systems(Render, queue_boundaries.in_set(RenderSystems::Queue))

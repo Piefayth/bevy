@@ -3,7 +3,7 @@ use crate::*;
 use bevy_app::Inherited;
 use bevy_asset::*;
 use bevy_ecs::{
-    prelude::{Component, With},
+    prelude::{Component, SystemSet, With},
     query::ROQueryItem,
     system::{
         lifetimeless::{Read, SRes},
@@ -89,13 +89,23 @@ where
                 .add_systems(
                     Render,
                     (
-                        queue_ui_material_nodes::<M>.in_set(RenderSystems::Queue),
+                        queue_ui_material_nodes::<M>
+                            .in_set(RenderSystems::Queue)
+                            .in_set(UiMaterialQueue),
                         prepare_uimaterial_nodes::<M>.in_set(RenderSystems::PrepareBindGroups),
                     ),
                 );
         }
     }
 }
+
+/// Every `queue_ui_material_nodes::<M>` instance, across all material
+/// kinds. Renderers that manufacture views for material nodes to land in
+/// (the retained compositor's paint runs) order their view preparation
+/// before this set; without the edge the queue races the phase creation
+/// and drops nodes silently.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+pub struct UiMaterialQueue;
 
 #[derive(Resource)]
 pub struct UiMaterialMeta<M: UiMaterial> {
