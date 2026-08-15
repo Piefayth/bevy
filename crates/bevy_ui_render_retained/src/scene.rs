@@ -2618,6 +2618,18 @@ impl RetainedUiScene {
                         );
                     }
                 });
+                if !intersects {
+                    // Direct damage can make a group drawable before its
+                    // changed bounds have settled into the spatial index.
+                    intersects = order.direct_groups.iter().any(|&group| {
+                        group_intersects(
+                            &surfaces.records,
+                            &order.slots,
+                            order.groups[group].clone(),
+                            target,
+                        )
+                    });
+                }
                 if intersects {
                     return true;
                 }

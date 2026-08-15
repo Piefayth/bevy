@@ -1263,11 +1263,15 @@ for several frames: a boundary appears and disappears, a modal paint run is
 created and retired around an existing boundary, and a surface cycles from
 content to empty to different content. Every captured image must equal a
 complete reference state. Removal-only damage is allowed to have no replay
-items; whether the complete surface still has content comes from its retained
-records, not that repair's phase. When an empty surface becomes nonempty, the
-inactive ping-pong slot is cleared before reuse so pixels from the last nonempty
-generation cannot return. The latter test was confirmed red with that clear
-removed: it produced a fourth state containing both the old and new nodes.
+items. Complete surface content is the union of current retained records and
+prepared immediate-phase draws; neither the repair phase nor retained records
+alone can describe mixed retained/immediate targets. Retained intersection
+queries combine the settled spatial index with directly changed groups, which
+may be drawable before their spatial bounds settle. When an empty surface
+becomes nonempty, the inactive ping-pong slot is cleared before reuse so pixels
+from the last nonempty generation cannot return. The latter test was confirmed
+red with that clear removed: it produced a fourth state containing both the old
+and new nodes.
 
 Each layer is sized in viewport-local physical pixels. UI repair uses that
 local surface directly; only composition applies the camera viewport. A

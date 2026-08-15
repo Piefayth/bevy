@@ -1320,6 +1320,19 @@ fn pending_sync_regions(
         .collect()
 }
 
+fn phase_has_content(
+    phase: Option<&bevy::render::render_phase::SortedRenderPhase<TransparentUi>>,
+    world: &World,
+    draw_functions: RetainedDrawFunctionIds,
+) -> bool {
+    phase.is_some_and(|phase| {
+        (0..phase.items.len()).any(|index| {
+            let item = phase.items.get_index(index).unwrap().1;
+            item_batch_range(world, item, draw_functions).is_some_and(|range| !range.is_empty())
+        })
+    })
+}
+
 #[derive(Clone, Copy)]
 struct SurfaceRequest {
     view_entity: Entity,
@@ -1514,8 +1527,13 @@ fn repair_surface(
     let material_pending = world
         .resource::<RetainedPendingMaterials>()
         .contains(request.paint_entity);
-    let has_content = scene.has_visible_records(request.paint_entity, request.bounds);
-    let damage_has_content = scene.has_visible_records_in(request.paint_entity, &global_damage);
+    // Volatile writers have phase items but no retained record; unchanged
+    // pixels have retained records but no item in this partial repair.
+    let phase_has_content = phase_has_content(phase, world, draw_functions);
+    let has_content =
+        phase_has_content || scene.has_visible_records(request.paint_entity, request.bounds);
+    let damage_has_content =
+        phase_has_content || scene.has_visible_records_in(request.paint_entity, &global_damage);
     let boundary_sources: HashMap<_, _> = if boundary_batches.batches.is_empty() {
         HashMap::default()
     } else {

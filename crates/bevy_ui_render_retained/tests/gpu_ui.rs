@@ -7081,14 +7081,16 @@ fn two_material_kinds_render_together() {
                 color: Vec4::new(0.0, 1.0, 0.0, 1.0),
             });
         let world = app.world_mut();
+        // Node geometry is logical; 2x target scaling maps these back to
+        // the physical probe rectangles asserted below.
         world.spawn((
             MaterialNode(first.clone()),
             Node {
                 position_type: PositionType::Absolute,
-                left: px(4),
-                top: px(4),
-                width: px(16),
-                height: px(12),
+                left: px(2),
+                top: px(2),
+                width: px(8),
+                height: px(6),
                 ..default()
             },
             UiTargetCamera(camera),
@@ -7097,10 +7099,10 @@ fn two_material_kinds_render_together() {
             MaterialNode(second),
             Node {
                 position_type: PositionType::Absolute,
-                left: px(30),
-                top: px(4),
-                width: px(16),
-                height: px(12),
+                left: px(15),
+                top: px(2),
+                width: px(8),
+                height: px(6),
                 ..default()
             },
             UiTargetCamera(camera),
